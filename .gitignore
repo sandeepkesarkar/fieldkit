@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+
+# Runtime data (lives on Mac Mini, never committed)
+fieldkit/data/
+fieldkit/logs/
+*.json.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment — copy from .env.example, never commit the real thing
+.env
+!.env.example
+
+# In-progress updates (promote to committed when published)
+updates/2026-05-11.md
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
