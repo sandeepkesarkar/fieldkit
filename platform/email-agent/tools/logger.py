@@ -36,14 +36,16 @@ def _append(line: str) -> None:
 def log_received(from_addr: str, subject: str, attachments: int, ref_id: str) -> None:
     """Append a RECEIVED line to the activity log."""
     event = "RECEIVED"
-    line = f'{_now()} | {event:<12} | from={from_addr} subject="{subject}" attachments={attachments} ref={ref_id}'
+    safe_subject = subject.replace('"', "'")
+    line = f'{_now()} | {event:<12} | from={from_addr} subject="{safe_subject}" attachments={attachments} ref={ref_id}'
     _append(line)
 
 
 def log_rejected(from_addr: str, subject: str) -> None:
     """Append a REJECTED line to the activity log."""
     event = "REJECTED"
-    line = f'{_now()} | {event:<12} | from={from_addr} subject="{subject}"'
+    safe_subject = subject.replace('"', "'")
+    line = f'{_now()} | {event:<12} | from={from_addr} subject="{safe_subject}"'
     _append(line)
 
 

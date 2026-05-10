@@ -85,26 +85,27 @@ def _acquire_run_lock() -> Optional[object]:
 
 def _gws(args: list) -> dict:
     """Run a gws command and return parsed JSON. Raises RuntimeError on failure."""
+    cmd_summary = " ".join(args)
     try:
         result = subprocess.run(["gws"] + args, capture_output=True, text=True)
     except FileNotFoundError:
         raise RuntimeError("gws binary not found — is it installed and on PATH?")
     if result.returncode != 0:
         raise RuntimeError(
-            f"gws {' '.join(args[:3])} failed (exit {result.returncode}): "
+            f"gws {cmd_summary} failed (exit {result.returncode}): "
             f"{result.stderr.strip()}"
         )
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"gws {' '.join(args[:3])} returned non-JSON: {result.stdout[:200]}"
+            f"gws {cmd_summary} returned non-JSON: {result.stdout[:200]}"
         ) from exc
     # Surface Gmail API-level errors returned inside a 200 response.
     if "error" in data:
         err = data["error"]
         raise RuntimeError(
-            f"gws {' '.join(args[:3])} API error {err.get('code')}: "
+            f"gws {cmd_summary} API error {err.get('code')}: "
             f"{err.get('message')}"
         )
     return data
@@ -281,6 +282,11 @@ def main() -> None:
             sys.exit(1)
 
         messages = data.get("messages", [])
+        if "nextPageToken" in data:
+            logger.warning(
+                "Gmail returned a nextPageToken — inbox has >100 unread unlabeled messages; "
+                "only the first page will be processed this cycle"
+            )
 
         # Phase 4 — Process each message
         processed = 0
