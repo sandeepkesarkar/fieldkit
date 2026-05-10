@@ -2,7 +2,7 @@
 name: check_email
 description: Check Gmail inbox for new emails and send Telegram acknowledgements for each valid email received
 user-invocable: true
-metadata: {"openclaw": {"requires": {"bins": ["gws", "python3"], "env": ["AGENT_EMAIL", "ADMIN_ALLOWLIST", "ADMIN_TELEGRAM_CHAT_ID"]}}}
+metadata: {"openclaw": {"requires": {"bins": ["gws", "python3"]}}}
 ---
 
 # check_email

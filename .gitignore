@@ -4,8 +4,8 @@
 ._*
 
 # Runtime data (lives on Mac Mini, never committed)
-fieldkit/data/
-fieldkit/logs/
+data/
+logs/
 *.json.bak
 
 # Python
