@@ -2,8 +2,8 @@
 State manager for the email agent.
 
 Manages two runtime files on the Mac Mini:
-  - ~/fieldkit/data/email-agent/state.json  — ref ID counter, processed message map, label ID cache
-  - ~/fieldkit/data/email-agent/pending.json — dead-letter queue for unconfirmed Telegram acks
+  - <repo-root>/data/email-agent/state.json  — ref ID counter, processed message map, label ID cache
+  - <repo-root>/data/email-agent/pending.json — dead-letter queue for unconfirmed Telegram acks
 
 All read-modify-write operations acquire an exclusive file lock (fcntl.LOCK_EX) before reading
 and release it after writing. This prevents ref ID collisions when a cron run and a /check-email
@@ -22,7 +22,7 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path.home() / "fieldkit" / "data" / "email-agent"
+DATA_DIR = Path(__file__).parents[3] / "data" / "email-agent"
 STATE_FILE = DATA_DIR / "state.json"
 PENDING_FILE = DATA_DIR / "pending.json"
 

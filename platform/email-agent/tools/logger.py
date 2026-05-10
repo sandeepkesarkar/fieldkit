@@ -1,7 +1,7 @@
 """
 Activity log writer for the email agent.
 
-Appends structured human-readable lines to ~/fieldkit/logs/email-agent.log.
+Appends structured human-readable lines to <repo-root>/logs/email-agent.log.
 Each function corresponds to a distinct lifecycle event in the email pipeline.
 The log directory is created on first write if it does not exist.
 
@@ -16,7 +16,7 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
-LOG_DIR = Path.home() / "fieldkit" / "logs"
+LOG_DIR = Path(__file__).parents[3] / "logs"
 LOG_FILE = LOG_DIR / "email-agent.log"
 
 
