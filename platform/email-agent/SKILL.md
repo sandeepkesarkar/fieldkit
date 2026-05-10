@@ -23,7 +23,7 @@ Load `.env` from the working directory. Required variables:
 - `AGENT_EMAIL` — Gmail address the agent monitors
 - `ADMIN_ALLOWLIST` — comma-separated permitted sender addresses
 
-Parse `ADMIN_ALLOWLIST`: split on commas, strip whitespace around each entry, lowercase. Store as a lookup set.
+Parse `ADMIN_ALLOWLIST`: split on commas, strip whitespace around each entry, lowercase. Store as a lookup set. Entries are matched by exact lowercased email address — non-email strings are allowed but will never match a sender.
 
 If the parsed set is empty, abort the run and report via OpenClaw channel: `check-email: ADMIN_ALLOWLIST is empty — add at least one permitted sender address to .env`.
 
@@ -75,7 +75,7 @@ Send an alert email (log a warning and continue if the send fails — dequeue an
 gws gmail +send \
   --to {ADMIN_ALLOWLIST[0]} \
   --subject "⚠️ FieldKit: Possible undelivered notifications" \
-  --body "These acknowledgements may not have been delivered via Telegram:\n\n{for each stale entry: Ref {ref_id} — {subject} (queued {queued_at})}\n\nCheck Telegram history or send /check-email to confirm."
+  --body "These acknowledgements may not have been delivered via Telegram:\n\n{for each stale entry: Ref {ref_id} — {subject} (queued {queued_at formatted as YYYY-MM-DD HH:MM, strip T and Z from ISO string})}\n\nCheck Telegram history or send /check-email to confirm."
 ```
 
 **Step 7 — Dequeue and log stale entries**
