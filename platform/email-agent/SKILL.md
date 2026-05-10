@@ -1,6 +1,6 @@
 ---
 name: check-email
-description: Poll the agent Gmail inbox for unread job emails and send Telegram acknowledgements for each valid message
+description: Check Gmail inbox for new emails and send Telegram acknowledgements for each valid email received
 user-invocable: true
 metadata: {"openclaw": {"requires": {"bins": ["gws"], "env": ["AGENT_EMAIL", "ADMIN_ALLOWLIST"]}}}
 ---
@@ -24,6 +24,8 @@ Load `.env` from the working directory. Required variables:
 - `ADMIN_ALLOWLIST` — comma-separated permitted sender addresses
 
 Parse `ADMIN_ALLOWLIST`: split on commas, strip whitespace around each entry, lowercase. Store as a lookup set.
+
+If the parsed set is empty, abort the run and report via OpenClaw channel: `check-email: ADMIN_ALLOWLIST is empty — add at least one permitted sender address to .env`.
 
 ---
 
@@ -68,14 +70,15 @@ If the result is empty, skip to Phase 3.
 
 **Step 6 — Alert admin**
 
-Send an alert email via:
+Send an alert email (log a warning and continue if the send fails — dequeue and log regardless):
 ```
-gws gmail users messages send \
-  --userId $AGENT_EMAIL \
+gws gmail +send \
   --to {ADMIN_ALLOWLIST[0]} \
   --subject "⚠️ FieldKit: Possible undelivered notifications" \
-  --body "The following Telegram notifications may not have been delivered:\n\n{for each stale entry: ref_id, subject}"
+  --body "These acknowledgements may not have been delivered via Telegram:\n\n{for each stale entry: Ref {ref_id} (queued {queued_at})}\n\nCheck Telegram history or send /check-email to confirm."
 ```
+
+Note: `subject` is PII — do not include it in the alert email body.
 
 **Step 7 — Dequeue and log stale entries**
 
@@ -116,7 +119,7 @@ From the response:
 - `from_addr`: parse the `From:` header. Strip display name if present (`"Name" <addr>` → `addr`). Lowercase and trim. If the header is malformed or no address can be extracted, treat `from_addr` as `"unknown"` (will be rejected).
 - `subject`: value of the `Subject:` header (empty string if absent).
 - `received_at`: value of the `Date:` header.
-- `attachment_count`: count of message parts that have a non-empty `filename` field.
+- `attachments`: count of message parts that have a non-empty `filename` field.
 
 **Step 11 — Check allowlist**
 
@@ -130,7 +133,7 @@ Lowercase `from_addr` and check membership in the parsed `ADMIN_ALLOWLIST` set.
 
 Send via OpenClaw channel:
 ```
-✗ Email rejected — sender not in allowlist
+✗ Email rejected — not in allowlist
 From: {from_addr}
 Subject: {subject}
 ```
@@ -166,7 +169,7 @@ Send via OpenClaw channel:
 From: {from_addr}
 Subject: {subject}
 Received: {received_at}
-Attachments: {attachment_count}
+Attachments: {attachments}
 Ref: {REF_ID}
 ```
 
@@ -176,7 +179,7 @@ Call `dequeue_pending(REF_ID)` from `tools/state.py`. Call this unconditionally 
 
 **Step 18 — Log and label**
 
-Call `log_received(from_addr, subject, attachment_count, REF_ID)` from `tools/logger.py`.
+Call `log_received(from_addr, subject, attachments, REF_ID)` from `tools/logger.py`.
 
 Apply label and mark read (best-effort — do not abort on failure):
 ```
@@ -213,4 +216,5 @@ If triggered by cron: no reply.
 |-----------|--------|
 | Gmail API error on a single message | Log the error, skip that message, do not increment either counter |
 | `gws modify` failure (mark read / apply label) | Log a warning and continue — these are best-effort only |
-| `RuntimeError` from `tools/state.py` (corrupt JSON) | Abort the run; report the error message via OpenClaw channel so the operator can intervene |
+| Alert email send fails (Step 6) | Log a warning and continue — dequeue stale entries and call `log_stale_alert` regardless |
+| `RuntimeError` from `tools/state.py` (corrupt `state.json` or `pending.json`) | Abort the run; report the error message via OpenClaw channel so the operator can intervene |

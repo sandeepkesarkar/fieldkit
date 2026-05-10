@@ -126,7 +126,7 @@ Log configuration (level, handlers, format) is the caller's responsibility — m
 **Functions to implement:**
 - `log_received(from_addr, subject, attachments, ref_id)` → `RECEIVED` line
 - `log_rejected(from_addr, subject)` → `REJECTED` line
-- `log_stale_alert(count, ref_ids)` → `STALE_ALERT` line
+- `log_stale_alert(ref_ids)` → `STALE_ALERT` line (count derived internally from `len(ref_ids)`)
 - `log_cycle(processed, rejected)` → `CYCLE` line
 
 **Log file location:** `~/fieldkit/logs/email-agent.log`
