@@ -113,9 +113,9 @@ sequenceDiagram
             end
         end
 
-        Script->>logger: log_cycle(processed=N, rejected=M)
     end
 
+    Script->>logger: log_cycle(processed=N, rejected=M)
     Script->>Script: release run.lock
 ```
 

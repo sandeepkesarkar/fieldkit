@@ -85,7 +85,10 @@ def _acquire_run_lock() -> Optional[object]:
 
 def _gws(args: list) -> dict:
     """Run a gws command and return parsed JSON. Raises RuntimeError on failure."""
-    result = subprocess.run(["gws"] + args, capture_output=True, text=True)
+    try:
+        result = subprocess.run(["gws"] + args, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("gws binary not found — is it installed and on PATH?")
     if result.returncode != 0:
         raise RuntimeError(
             f"gws {' '.join(args[:3])} failed (exit {result.returncode}): "
@@ -141,6 +144,8 @@ def _resolve_label_id() -> str:
         "--params", '{"userId": "me"}',
         "--json", '{"name": "fk-received"}',
     ])
+    if "id" not in data:
+        raise RuntimeError(f"gmail labels create returned no id field: {data}")
     save_label_id(data["id"])
     return data["id"]
 
@@ -220,6 +225,10 @@ def main() -> None:
 
     if not chat_id:
         logger.error("ADMIN_TELEGRAM_CHAT_ID is not set")
+        sys.exit(1)
+
+    if not agent_email:
+        _telegram(chat_id, "check_email: AGENT_EMAIL is not set — add it to .env")
         sys.exit(1)
 
     # Build an ordered list (first entry = stale alert recipient) + a set for O(1) lookup.

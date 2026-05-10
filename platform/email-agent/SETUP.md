@@ -89,26 +89,7 @@ Follow the prompts — it opens Google Cloud Console in the browser and walks yo
 
 ---
 
-## 5 — Authenticate against the agent Gmail account
-
-```bash
-source ~/src/fieldkit/platform/email-agent/.env
-gws auth login --services gmail
-```
-
-A browser window opens. **Sign in with the agent Gmail account** (`$AGENT_EMAIL`), not your personal account.
-
----
-
-## 6 — Create runtime directories
-
-```bash
-mkdir -p ~/src/fieldkit/data/email-agent ~/src/fieldkit/logs
-```
-
----
-
-## 7 — Populate `.env`
+## 5 — Populate `.env`
 
 ```bash
 cp ~/src/fieldkit/platform/email-agent/.env.example \
@@ -119,7 +100,7 @@ Edit `.env` and fill in all four variables:
 
 | Variable | Value |
 |----------|-------|
-| `AGENT_EMAIL` | The agent Gmail address you authenticated in Step 5 |
+| `AGENT_EMAIL` | The dedicated agent Gmail address (the one you will authenticate in Step 6) |
 | `ADMIN_ALLOWLIST` | Comma-separated permitted sender addresses |
 | `POLLING_INTERVAL_MINUTES` | How often to poll (e.g. `5`) |
 | `ADMIN_TELEGRAM_CHAT_ID` | Your Telegram chat ID (see note below) |
@@ -131,6 +112,25 @@ grep "sendMessage ok" ~/.openclaw/logs/gateway.log | tail -5
 ```
 
 The chat ID appears after `chat=`.
+
+---
+
+## 6 — Authenticate against the agent Gmail account
+
+```bash
+source ~/src/fieldkit/platform/email-agent/.env
+gws auth login --services gmail
+```
+
+A browser window opens. **Sign in with the agent Gmail account** (`$AGENT_EMAIL`), not your personal account.
+
+---
+
+## 7 — Create runtime directories
+
+```bash
+mkdir -p ~/src/fieldkit/data/email-agent ~/src/fieldkit/logs
+```
 
 ---
 
@@ -192,8 +192,13 @@ Once all Step 9 checks pass, add a system cron entry to poll Gmail automatically
 The `--source cron` flag suppresses the "No new emails." reply on silent runs.
 
 ```bash
-(crontab -l 2>/dev/null; echo "*/5 * * * * cd $HOME/src/fieldkit/platform/email-agent && python3 scripts/check_email.py --source cron >> $HOME/src/fieldkit/logs/cron.log 2>&1") | crontab -
+(crontab -l 2>/dev/null; echo "*/5 * * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin cd $HOME/src/fieldkit/platform/email-agent && python3 scripts/check_email.py --source cron >> $HOME/src/fieldkit/logs/cron.log 2>&1") | crontab -
 ```
+
+> The `PATH=…` prefix is required because cron does not source your shell profile, so
+> Homebrew tools like `gws` are not on its default PATH. `/opt/homebrew/bin` covers
+> Apple Silicon Macs; `/usr/local/bin` covers Intel Macs. `$HOME` is expanded by your
+> shell when you run the command above, so the crontab stores the literal path.
 
 Verify it was registered:
 
@@ -224,5 +229,7 @@ tail -f ~/src/fieldkit/logs/cron.log
 | LLM improvises instead of running the script | The skill body is not loaded. Confirm `~/.openclaw/workspace/skills/check_email/SKILL.md` exists (not a symlink), then run `openclaw gateway restart`. |
 | `check_email: ADMIN_ALLOWLIST is empty` in Telegram | `.env` is missing or `ADMIN_ALLOWLIST` is blank. Check Step 7. |
 | `check_email: ADMIN_TELEGRAM_CHAT_ID is not set` | `.env` is missing `ADMIN_TELEGRAM_CHAT_ID`. Check Step 7. |
-| `gws gmail … failed` in Telegram | gws token may have expired. Re-run Step 5. |
+| `gws gmail … failed` in Telegram | gws token may have expired. Re-run Step 6. |
+| `gws binary not found` in Telegram or cron.log | gws is not on PATH. Confirm `which gws` works, then verify Step 10's crontab entry contains `PATH=/opt/homebrew/bin:…`. |
+| `check_email: AGENT_EMAIL is not set` in Telegram | `.env` is missing `AGENT_EMAIL`. Check Step 5. |
 | Script exits with lock error | Another instance is running. Wait 30 seconds and retry. |

@@ -503,4 +503,46 @@ def test_state_error_sends_telegram_and_exits(monkeypatch, stub_state, stub_logg
     assert any("state error" in m for m in telegram_calls)
 
 
+def test_missing_agent_email_sends_error_and_exits(monkeypatch, stub_state, stub_logger):
+    """
+    A missing AGENT_EMAIL causes exit(1) with a Telegram notification before any
+    Gmail or state access.
+
+    AGENT_EMAIL is required to build the From: header in stale alert emails. An
+    empty value produces a malformed RFC 2822 message that the Gmail API rejects
+    silently (check=False), and the stale entries would be dequeued without the
+    admin ever receiving the alert. Failing fast with a clear error prevents that
+    silent data loss.
+    """
+    telegram_calls = []
+    monkeypatch.delenv("AGENT_EMAIL", raising=False)
+    monkeypatch.setattr(ce, "_telegram", lambda chat_id, msg: telegram_calls.append(msg))
+
+    with pytest.raises(SystemExit) as exc_info:
+        ce.main()
+
+    assert exc_info.value.code == 1
+    assert any("AGENT_EMAIL" in m for m in telegram_calls)
+    ce.log_cycle.assert_not_called()
+
+
+def test_gws_file_not_found_raises_runtime_error(monkeypatch):
+    """
+    A missing gws binary raises RuntimeError, not FileNotFoundError.
+
+    _gws() catches FileNotFoundError from subprocess and re-raises it as
+    RuntimeError so that all callers (which only catch RuntimeError) surface
+    the error via Telegram rather than crashing silently.
+    """
+    import subprocess as real_subprocess
+
+    def fake_run(cmd, **kwargs):
+        raise FileNotFoundError("No such file or directory: 'gws'")
+
+    monkeypatch.setattr(ce.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="gws binary not found"):
+        ce._gws(["gmail", "users", "messages", "list", "--params", "{}"])
+
+
 import os  # noqa: E402  — placed here to avoid shadowing the top-level fixture

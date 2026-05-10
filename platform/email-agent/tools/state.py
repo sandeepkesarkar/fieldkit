@@ -6,7 +6,7 @@ Manages two runtime files on the Mac Mini:
   - <repo-root>/data/email-agent/pending.json — dead-letter queue for unconfirmed Telegram acks
 
 All read-modify-write operations acquire an exclusive file lock (fcntl.LOCK_EX) before reading
-and release it after writing. This prevents ref ID collisions when a cron run and a /check-email
+and release it after writing. This prevents ref ID collisions when a cron run and a /check_email
 invocation overlap.
 
 Sensitive fields (email addresses, subjects) are never written to log output.
