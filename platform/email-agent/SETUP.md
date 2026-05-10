@@ -112,7 +112,7 @@ openclaw config set telegram-chat-id <chat-id>
 ```bash
 # gws can reach Gmail
 source ~/fieldkit/platform/email-agent/.env
-gws gmail users messages list --userId $AGENT_EMAIL --q "is:unread"
+gws gmail users messages list --params '{"userId": "me", "q": "is:unread"}'
 # Must return JSON (empty list is fine)
 
 # Runtime directories exist

@@ -42,7 +42,7 @@ Call `get_label_id()` from `tools/state.py`.
 
 Run:
 ```
-gws gmail users labels list --userId $AGENT_EMAIL
+gws gmail users labels list --params '{"userId": "me"}'
 ```
 
 Search the response for a label with `name == "fk-received"`.
@@ -50,7 +50,9 @@ Search the response for a label with `name == "fk-received"`.
 - **Found:** use its `id` as `LABEL_ID`.
 - **Not found:** create it:
   ```
-  gws gmail users labels create --name fk-received --userId $AGENT_EMAIL
+  gws gmail users labels create \
+    --params '{"userId": "me"}' \
+    --json '{"name": "fk-received"}'
   ```
   Use the `id` from the response as `LABEL_ID`.
 
@@ -70,13 +72,32 @@ If the result is empty, skip to Phase 3.
 
 **Step 6 — Alert admin**
 
-Send an alert email (log a warning and continue if the send fails — dequeue and log regardless):
+Send an alert email (log a warning and continue if the send fails — dequeue and log regardless).
+
+Build `body_text`:
 ```
-gws gmail +send \
-  --to {ADMIN_ALLOWLIST[0]} \
-  --subject "⚠️ FieldKit: Possible undelivered notifications" \
-  --body "These acknowledgements may not have been delivered via Telegram:\n\n{for each stale entry: Ref {ref_id} — {subject} (queued {queued_at formatted as YYYY-MM-DD HH:MM, strip T and Z from ISO string})}\n\nCheck Telegram history or send /check-email to confirm."
+These acknowledgements may not have been delivered via Telegram:
+
+Ref {ref_id} — {subject} (queued {queued_at[:16] with "T" replaced by " "})
+...one line per stale entry...
+
+Check Telegram history or send /check-email to confirm.
 ```
+
+Then encode and send using Python:
+```python
+import base64, email.message, subprocess, json
+msg = email.message.EmailMessage()
+msg["To"] = ADMIN_ALLOWLIST[0]
+msg["Subject"] = "⚠️ FieldKit: Possible undelivered notifications"
+msg.set_content(body_text)
+raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+subprocess.run(
+    ["gws", "gmail", "users", "messages", "send",
+     "--params", '{"userId": "me"}',
+     "--json", json.dumps({"raw": raw})],
+    check=False,
+)
 
 **Step 7 — Dequeue and log stale entries**
 
@@ -93,7 +114,7 @@ Then call `log_stale_alert(ref_ids)` from `tools/logger.py` with the list of sta
 
 Run:
 ```
-gws gmail users messages list --userId $AGENT_EMAIL --q "is:unread -label:fk-received"
+gws gmail users messages list --params '{"userId": "me", "q": "is:unread -label:fk-received"}'
 ```
 
 If the response contains no messages, go directly to Phase 5 with `processed = 0`, `rejected = 0`.
@@ -108,7 +129,7 @@ Repeat Steps 9–16 for every `messageId` in the response. Track `processed = 0`
 
 Run:
 ```
-gws gmail users messages get --userId $AGENT_EMAIL --id $MESSAGE_ID --format full
+gws gmail users messages get --params '{"userId": "me", "id": "$MESSAGE_ID", "format": "full"}'
 ```
 
 **Step 10 — Extract headers and metadata**
@@ -140,7 +161,9 @@ Subject: {subject}
 
 Run (do not abort on failure — log a warning and continue):
 ```
-gws gmail users messages modify --userId $AGENT_EMAIL --id $MESSAGE_ID --removeLabelIds UNREAD
+gws gmail users messages modify \
+  --params '{"userId": "me", "id": "$MESSAGE_ID"}' \
+  --json '{"removeLabelIds": ["UNREAD"]}'
 ```
 
 **Step 14 — Log and count**
@@ -182,10 +205,8 @@ Call `log_received(from_addr, subject, attachments, REF_ID)` from `tools/logger.
 Apply label and mark read (best-effort — do not abort on failure):
 ```
 gws gmail users messages modify \
-  --userId $AGENT_EMAIL \
-  --id $MESSAGE_ID \
-  --removeLabelIds UNREAD \
-  --addLabelIds $LABEL_ID
+  --params '{"userId": "me", "id": "$MESSAGE_ID"}' \
+  --json '{"removeLabelIds": ["UNREAD"], "addLabelIds": ["$LABEL_ID"]}'
 ```
 
 Increment `processed`. Continue to next message.
