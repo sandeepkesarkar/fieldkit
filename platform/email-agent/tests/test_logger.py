@@ -65,10 +65,11 @@ def test_log_stale_alert_format(monkeypatch):
     STALE_ALERT line includes count and a comma-separated refs list, no from/subject.
 
     STALE_ALERT is the longest event name (11 chars) — tightest fit in the 12-char
-    column. Verifies the padding still aligns correctly at the limit.
+    column. Verifies the padding still aligns correctly at the limit. count is derived
+    from len(ref_ids), not a caller-supplied argument, so it is always correct.
     """
     monkeypatch.setattr(logger_mod, "_now", lambda: "2026-05-09 14:33")
-    log_stale_alert(2, ["#0012", "#0013"])
+    log_stale_alert(["#0012", "#0013"])
     line = logger_mod.LOG_FILE.read_text().strip()
     assert line == "2026-05-09 14:33 | STALE_ALERT  | count=2 refs=#0012,#0013"
 
@@ -110,9 +111,24 @@ def test_log_stale_alert_formats_refs_as_comma_separated(monkeypatch):
     even without a join call. No trailing comma, no brackets.
     """
     monkeypatch.setattr(logger_mod, "_now", lambda: "2026-05-09 14:33")
-    log_stale_alert(3, ["#0001", "#0002", "#0003"])
+    log_stale_alert(["#0001", "#0002", "#0003"])
     line = logger_mod.LOG_FILE.read_text().strip()
     assert "refs=#0001,#0002,#0003" in line
+
+
+def test_log_stale_alert_empty_refs(monkeypatch):
+    """
+    log_stale_alert with an empty list produces count=0 and an empty refs field.
+
+    Verifies that joining an empty list does not crash and that count is derived
+    correctly from len(ref_ids). The empty-refs format (trailing nothing after refs=)
+    is intentional — it signals that the alert was triggered with no matching entries,
+    which should not happen in practice but must not raise an exception.
+    """
+    monkeypatch.setattr(logger_mod, "_now", lambda: "2026-05-09 14:35")
+    log_stale_alert([])
+    line = logger_mod.LOG_FILE.read_text().strip()
+    assert line == "2026-05-09 14:35 | STALE_ALERT  | count=0 refs="
 
 
 # --- File behaviour tests ---

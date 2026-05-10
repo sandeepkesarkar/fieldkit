@@ -2,12 +2,13 @@
 Tests for tools/state.py — the email agent's persistent state manager.
 
 Covers ref ID assignment, label ID caching, the pending queue (enqueue/dequeue/stale
-check), file auto-creation, and concurrent access safety. All file I/O is redirected
-to a tmp directory via the autouse fixture so tests never touch the real Mac Mini
-data directory.
+check), file auto-creation, corrupt-file error handling, and concurrent access safety.
+All file I/O is redirected to a tmp directory via the autouse fixture so tests never
+touch the real Mac Mini data directory.
 """
 
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -75,11 +76,11 @@ def test_known_message_returns_existing_ref_id():
 
 def test_zero_padding():
     """
-    Ref IDs are zero-padded to 4 digits at all boundary values: #0010, #0100, #1000.
+    Ref IDs are zero-padded to 4 digits at the digit-count boundaries: #0010, #0100, #1000.
 
-    The format string uses :04d, which pads to 4 digits for numbers 1–9999 and
-    produces wider strings beyond that. This test documents the expected behaviour
-    at the three 1-digit-width boundaries the spec cares about.
+    Tests the three values where the number of decimal digits increases (1→2, 2→3, 3→4).
+    The :04d format string pads correctly up to 9999; this test documents that the
+    padding holds at each real-world boundary the spec cares about.
     """
     for i in range(1, 10):
         state.get_ref_id_for_message(f"msg{i:04d}")
@@ -107,13 +108,21 @@ def test_get_label_id_returns_none_when_not_cached():
 
 def test_get_label_id_returns_value_after_save():
     """
-    A label ID saved with save_label_id() is returned by the next get_label_id() call.
+    save_label_id() is a read-modify-write — it must not clobber existing state.
 
-    Verifies the round-trip through state.json without other fields being clobbered
-    (save_label_id does a read-modify-write, not a full overwrite).
+    Populates ref ID state first (two messages), then saves a label ID, then
+    asserts that both the label ID and the ref ID counter survive. A destructive
+    implementation that overwrites state.json entirely would pass from an empty
+    file but fail here because read_last_ref_id() would reset to 0.
     """
+    state.get_ref_id_for_message("msg001")
+    state.get_ref_id_for_message("msg002")
+
     state.save_label_id("Label_99999")
+
     assert state.get_label_id() == "Label_99999"
+    # Counter must be intact — a full-overwrite bug would reset it to 0.
+    assert state.read_last_ref_id() == 2
 
 
 # --- Pending queue tests ---
@@ -155,6 +164,25 @@ def test_dequeue_removes_only_matching_ref_id():
     assert data["pending"][0]["ref_id"] == "#0002"
 
 
+def test_dequeue_pending_warns_when_ref_id_not_found(caplog):
+    """
+    dequeue_pending() emits a WARNING and makes no write when the ref_id is absent.
+
+    Enqueues one entry then tries to dequeue a different ref_id. The existing
+    entry must survive intact (no spurious write), and a WARNING must be logged
+    so the condition is visible in production logs. A DEBUG log here would be
+    invisible under the default log level and miss the unexpected condition.
+    """
+    state.enqueue_pending("#0001", "msg001", "a@example.com", "Test")
+    with caplog.at_level(logging.WARNING, logger="tools.state"):
+        state.dequeue_pending("#9999")
+    assert "not found" in caplog.text
+    # The existing entry must be untouched — no spurious write occurred.
+    data = json.loads(state.PENDING_FILE.read_text())
+    assert len(data["pending"]) == 1
+    assert data["pending"][0]["ref_id"] == "#0001"
+
+
 def test_get_stale_pending_returns_old_ignores_fresh():
     """
     get_stale_pending() returns only entries older than the threshold (default 15 min).
@@ -178,6 +206,32 @@ def test_get_stale_pending_returns_old_ignores_fresh():
     stale = state.get_stale_pending(threshold_minutes=15)
     assert len(stale) == 1
     assert stale[0]["ref_id"] == "#0012"
+
+
+def test_get_stale_pending_threshold_is_exclusive():
+    """
+    The stale threshold is exclusive (> not >=): entries just over it are returned,
+    entries just under it are not.
+
+    Uses 15 min 30 sec (just over) and 14 min 30 sec (just under) to avoid
+    a race with real clock time. Documents that an entry exactly at the threshold
+    is treated as fresh, not stale.
+    """
+    now = datetime.now(timezone.utc)
+    just_over = (now - timedelta(seconds=930)).strftime("%Y-%m-%dT%H:%M:%SZ")   # 15 min 30 sec
+    just_under = (now - timedelta(seconds=870)).strftime("%Y-%m-%dT%H:%M:%SZ")  # 14 min 30 sec
+
+    pending_data = {
+        "pending": [
+            {"ref_id": "#0020", "gmail_message_id": "over1", "from": "a@b.com", "subject": "Over", "queued_at": just_over},
+            {"ref_id": "#0021", "gmail_message_id": "under1", "from": "a@b.com", "subject": "Under", "queued_at": just_under},
+        ]
+    }
+    state.PENDING_FILE.write_text(json.dumps(pending_data))
+
+    stale = state.get_stale_pending(threshold_minutes=15)
+    assert len(stale) == 1
+    assert stale[0]["ref_id"] == "#0020"
 
 
 # --- File creation tests ---
@@ -216,6 +270,34 @@ def test_get_stale_pending_returns_empty_when_file_missing():
     """
     assert not state.PENDING_FILE.exists()
     assert state.get_stale_pending() == []
+
+
+# --- Corrupt file tests ---
+
+def test_corrupt_state_json_raises_runtime_error():
+    """
+    If state.json contains invalid JSON, a RuntimeError is raised with a clear message.
+
+    A truncated write after a power loss can leave state.json unparseable. The
+    function must not propagate a raw json.JSONDecodeError — it should wrap it in
+    a RuntimeError that tells the operator what to do. The lock is still released
+    (via the finally block) so subsequent processes are not deadlocked.
+    """
+    state.STATE_FILE.write_text("{corrupt: not valid json")
+    with pytest.raises(RuntimeError, match="corrupt"):
+        state.get_ref_id_for_message("msg001")
+
+
+def test_corrupt_pending_json_raises_runtime_error():
+    """
+    If pending.json contains invalid JSON, a RuntimeError is raised with a clear message.
+
+    Same rationale as the state.json corruption test — the operator needs a clear
+    diagnostic, not a raw JSONDecodeError buried in a traceback.
+    """
+    state.PENDING_FILE.write_text("{corrupt: not valid json")
+    with pytest.raises(RuntimeError, match="corrupt"):
+        state.enqueue_pending("#0001", "msg001", "a@example.com", "Test")
 
 
 # --- Concurrency test ---

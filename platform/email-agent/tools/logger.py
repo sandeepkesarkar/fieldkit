@@ -47,9 +47,10 @@ def log_rejected(from_addr: str, subject: str) -> None:
     _append(line)
 
 
-def log_stale_alert(count: int, ref_ids: List[str]) -> None:
+def log_stale_alert(ref_ids: List[str]) -> None:
     """Append a STALE_ALERT line to the activity log."""
     event = "STALE_ALERT"
+    count = len(ref_ids)
     refs = ",".join(ref_ids)
     line = f"{_now()} | {event:<12} | count={count} refs={refs}"
     _append(line)

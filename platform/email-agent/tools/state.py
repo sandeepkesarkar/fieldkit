@@ -15,6 +15,7 @@ Sensitive fields (email addresses, subjects) are never written to log output.
 import fcntl
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -37,7 +38,11 @@ def _read_state(fd) -> dict:
         logger.debug("state.json is empty — using defaults")
         # Return a fresh dict each time — never share a mutable default across callers.
         return {"last_ref_id": 0, "processed": {}}
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        logger.error("state.json is corrupt and cannot be parsed: %s", exc)
+        raise RuntimeError("state.json is corrupt — delete or restore it manually") from exc
 
 
 def _write_state(fd, data: dict) -> None:
@@ -46,6 +51,7 @@ def _write_state(fd, data: dict) -> None:
     fd.truncate()
     fd.write(json.dumps(data, indent=2))
     fd.flush()
+    os.fsync(fd.fileno())
 
 
 def _read_pending(fd) -> dict:
@@ -56,7 +62,11 @@ def _read_pending(fd) -> dict:
         logger.debug("pending.json is empty — using defaults")
         # Return a fresh dict each time — never share a mutable default across callers.
         return {"pending": []}
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        logger.error("pending.json is corrupt and cannot be parsed: %s", exc)
+        raise RuntimeError("pending.json is corrupt — delete or restore it manually") from exc
 
 
 def _write_pending(fd, data: dict) -> None:
@@ -65,6 +75,7 @@ def _write_pending(fd, data: dict) -> None:
     fd.truncate()
     fd.write(json.dumps(data, indent=2))
     fd.flush()
+    os.fsync(fd.fileno())
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +207,15 @@ def enqueue_pending(ref_id: str, gmail_message_id: str, from_addr: str, subject:
 
 
 def dequeue_pending(ref_id: str) -> None:
-    """Remove a pending entry after a Telegram send attempt (success or failure).
+    """Remove a pending entry after it has been acted upon.
 
-    Called unconditionally — we cannot observe OpenClaw delivery status, so the
-    pending entry is always removed after the send attempt. The stale check
-    (get_stale_pending) handles the case where the send silently failed.
+    Called after a Telegram send attempt (success or failure — OpenClaw delivery
+    cannot be observed) and after a stale-alert email is dispatched for an entry.
+    If the ref_id is not found, a warning is logged and no write occurs.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not PENDING_FILE.exists():
-        logger.debug("pending.json missing — nothing to dequeue for ref_id=%s", ref_id)
+        logger.warning("dequeue_pending: pending.json missing — nothing to dequeue for ref_id=%s", ref_id)
         return
     with open(PENDING_FILE, "a+") as fd:
         logger.debug("Acquiring exclusive lock on pending.json for dequeue ref_id=%s", ref_id)
@@ -215,10 +226,10 @@ def dequeue_pending(ref_id: str) -> None:
             # Filter out the matching entry; leave all others intact.
             data["pending"] = [e for e in data["pending"] if e["ref_id"] != ref_id]
             after = len(data["pending"])
-            _write_pending(fd, data)
             if before == after:
                 logger.warning("dequeue_pending: ref_id=%s not found in pending.json", ref_id)
             else:
+                _write_pending(fd, data)
                 logger.info("Dequeued pending entry ref_id=%s", ref_id)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
