@@ -52,7 +52,7 @@ Feature: Local Logging
     And all previous log entries remain unchanged
 
   Scenario: Log directory is created automatically if it does not exist
-    Given the log directory ~/fieldkit/logs does not exist
+    Given the log directory ~/src/fieldkit/logs does not exist
     When the first log entry is written
     Then the directory is created
     And the log entry is written successfully
