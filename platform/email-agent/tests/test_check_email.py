@@ -274,25 +274,41 @@ def test_happy_path_sends_ack_and_updates_state(monkeypatch, stub_state, stub_lo
     A valid email from an allowlisted sender produces a Telegram ack, a state update,
     and a log entry — in the correct order.
 
-    enqueue_pending must be called before _telegram (ack sent after queued) and
-    dequeue_pending must be called after _telegram (dequeued after delivery attempt).
-    log_received and log_cycle must both fire. This is the golden path that every
-    production run takes for a legitimate client email.
+    Verified order: enqueue_pending → _telegram ack → dequeue_pending. The pending
+    entry must exist before the ack is sent (so the stale-alert path can recover if
+    Telegram is down), and must be removed only after the send attempt (so a crash
+    between send and dequeue still leaves a recoverable pending entry).
     """
-    telegram_calls = []
-    monkeypatch.setattr(ce, "_telegram", lambda chat_id, msg: telegram_calls.append(msg))
+    call_log = []
+
+    monkeypatch.setattr(ce, "enqueue_pending",
+                        lambda *a, **kw: call_log.append("enqueue"))
+    monkeypatch.setattr(ce, "dequeue_pending",
+                        lambda ref_id: call_log.append(("dequeue", ref_id)))
+    monkeypatch.setattr(ce, "_telegram",
+                        lambda chat_id, msg: call_log.append(("telegram", msg)))
     monkeypatch.setattr(ce, "_gws", lambda args: (
         {"messages": [{"id": "msg001"}]} if "messages list" in " ".join(args)
         else _FULL_MSG_ALLOWED
     ))
-    monkeypatch.setattr(ce, "subprocess", MagicMock())  # best-effort modify
+    monkeypatch.setattr(ce, "subprocess", MagicMock())
 
     ce.main()
 
-    assert any("✓ Email received" in m for m in telegram_calls)
-    assert any("#0001" in m for m in telegram_calls)
-    ce.enqueue_pending.assert_called_once()
-    ce.dequeue_pending.assert_called_once_with("#0001")
+    # Verify content
+    telegram_msgs = [e[1] for e in call_log if isinstance(e, tuple) and e[0] == "telegram"]
+    assert any("✓ Email received" in m for m in telegram_msgs)
+    assert any("#0001" in m for m in telegram_msgs)
+
+    # Verify order: enqueue → telegram ack → dequeue
+    events = [e if isinstance(e, str) else e[0] for e in call_log]
+    enqueue_pos = events.index("enqueue")
+    ack_pos = next(i for i, e in enumerate(call_log)
+                   if isinstance(e, tuple) and e[0] == "telegram" and "✓ Email received" in e[1])
+    dequeue_pos = next(i for i, e in enumerate(call_log)
+                       if isinstance(e, tuple) and e[0] == "dequeue")
+    assert enqueue_pos < ack_pos < dequeue_pos
+
     ce.log_received.assert_called_once()
     ce.log_cycle.assert_called_once_with(1, 0)
 
@@ -501,6 +517,52 @@ def test_state_error_sends_telegram_and_exits(monkeypatch, stub_state, stub_logg
 
     assert exc_info.value.code == 1
     assert any("state error" in m for m in telegram_calls)
+
+
+def test_gmail_list_failure_sends_telegram_and_exits(monkeypatch, stub_state, stub_logger):
+    """
+    A RuntimeError from the Gmail messages/list call (Phase 3) causes the script
+    to send a Telegram error message and exit(1).
+
+    Phase 1 (label) and Phase 2 (stale check) both pass. The failure occurs at the
+    inbox poll — the most common point for transient API errors. The admin must be
+    notified so they know the cycle did not run, rather than assuming silence means
+    no new emails.
+    """
+    telegram_calls = []
+    monkeypatch.setattr(ce, "_telegram", lambda chat_id, msg: telegram_calls.append(msg))
+    monkeypatch.setattr(ce, "_gws",
+                        lambda args: (_ for _ in ()).throw(RuntimeError("quota exceeded")))
+
+    with pytest.raises(SystemExit) as exc_info:
+        ce.main()
+
+    assert exc_info.value.code == 1
+    assert any("Gmail list failed" in m for m in telegram_calls)
+    ce.log_cycle.assert_not_called()
+
+
+def test_resolve_label_id_failure_sends_telegram_and_exits(monkeypatch, stub_state, stub_logger):
+    """
+    A RuntimeError from the labels/list gws call (Phase 1) causes the script
+    to send a Telegram error message and exit(1).
+
+    Forces the cache-miss path by patching get_label_id to return None, then
+    makes the gws labels/list call raise. The script must not proceed to Phase 2
+    or Phase 3 — no state is read or written, and log_cycle is not called.
+    """
+    telegram_calls = []
+    monkeypatch.setattr(ce, "get_label_id", lambda: None)
+    monkeypatch.setattr(ce, "_telegram", lambda chat_id, msg: telegram_calls.append(msg))
+    monkeypatch.setattr(ce, "_gws",
+                        lambda args: (_ for _ in ()).throw(RuntimeError("labels API down")))
+
+    with pytest.raises(SystemExit) as exc_info:
+        ce.main()
+
+    assert exc_info.value.code == 1
+    assert any("fk-received label" in m for m in telegram_calls)
+    ce.log_cycle.assert_not_called()
 
 
 def test_missing_agent_email_sends_error_and_exits(monkeypatch, stub_state, stub_logger):

@@ -190,15 +190,18 @@ Then send `/check_email` in Telegram and confirm you receive either:
 
 Once all Step 9 checks pass, add a system cron entry to poll Gmail automatically.
 The `--source cron` flag suppresses the "No new emails." reply on silent runs.
+`POLLING_INTERVAL_MINUTES` from `.env` controls the schedule.
 
 ```bash
-(crontab -l 2>/dev/null; echo "*/5 * * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin cd $HOME/src/fieldkit/platform/email-agent && python3 scripts/check_email.py --source cron >> $HOME/src/fieldkit/logs/cron.log 2>&1") | crontab -
+source ~/src/fieldkit/platform/email-agent/.env
+(crontab -l 2>/dev/null; echo "*/${POLLING_INTERVAL_MINUTES} * * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin cd $HOME/src/fieldkit/platform/email-agent && python3 scripts/check_email.py --source cron >> $HOME/src/fieldkit/logs/cron.log 2>&1") | crontab -
 ```
 
 > The `PATH=…` prefix is required because cron does not source your shell profile, so
 > Homebrew tools like `gws` are not on its default PATH. `/opt/homebrew/bin` covers
-> Apple Silicon Macs; `/usr/local/bin` covers Intel Macs. `$HOME` is expanded by your
-> shell when you run the command above, so the crontab stores the literal path.
+> Apple Silicon Macs; `/usr/local/bin` covers Intel Macs. `$HOME` and
+> `$POLLING_INTERVAL_MINUTES` are expanded by your shell when you run the `echo`
+> command, so the crontab stores the literal values.
 
 Verify it was registered:
 
