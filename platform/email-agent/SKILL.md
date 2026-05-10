@@ -75,10 +75,8 @@ Send an alert email (log a warning and continue if the send fails — dequeue an
 gws gmail +send \
   --to {ADMIN_ALLOWLIST[0]} \
   --subject "⚠️ FieldKit: Possible undelivered notifications" \
-  --body "These acknowledgements may not have been delivered via Telegram:\n\n{for each stale entry: Ref {ref_id} (queued {queued_at})}\n\nCheck Telegram history or send /check-email to confirm."
+  --body "These acknowledgements may not have been delivered via Telegram:\n\n{for each stale entry: Ref {ref_id} — {subject} (queued {queued_at})}\n\nCheck Telegram history or send /check-email to confirm."
 ```
-
-Note: `subject` is PII — do not include it in the alert email body.
 
 **Step 7 — Dequeue and log stale entries**
 
