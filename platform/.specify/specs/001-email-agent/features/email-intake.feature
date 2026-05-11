@@ -39,3 +39,23 @@ Feature: Email Intake — Happy Path
     And the polling cycle runs
     Then I receive Telegram acknowledgements for the 2 emails that processed successfully
     And a CYCLE log entry records processed=2
+
+  Scenario: Subject longer than 200 characters is truncated in the Telegram acknowledgement
+    Given I send an email whose subject line is 300 characters long
+    When the polling cycle runs
+    Then I receive a Telegram acknowledgement
+    And the Subject field in the acknowledgement is no longer than 201 characters
+    And the Subject field ends with "…"
+
+  Scenario: Subject with embedded newlines does not break the Telegram message format
+    Given I send an email whose subject line contains a newline character
+    When the polling cycle runs
+    Then I receive a Telegram acknowledgement
+    And the acknowledgement contains no bare newlines inside the Subject field
+
+  Scenario: Inbox overflow triggers a Telegram warning when more than 100 unread emails are present
+    Given more than 100 unread emails without the "fk-received" label are in the agent inbox
+    When the polling cycle runs
+    Then I receive a Telegram warning containing "Gmail inbox overflow"
+    And the first 100 emails are processed and acknowledged
+    And the remaining emails are left unread for the next cycle

@@ -41,3 +41,10 @@ Feature: Reference ID Management
     Then the email is processed again
     And the Telegram acknowledgement contains "Ref: #0007"
     And the ref ID counter does not advance for this email
+
+  Scenario: Reference ID counter widens naturally beyond #9999
+    Given 9999 emails have already been processed
+    When I send a new email to the agent
+    And the polling cycle runs
+    Then the Telegram acknowledgement contains "Ref: #10000"
+    And no error occurs

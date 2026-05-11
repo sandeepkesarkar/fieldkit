@@ -23,7 +23,15 @@ Feature: Undelivered Notification Alert (Dead-Letter Queue)
     Then I receive an alert email at my admin address
     And the email subject contains "Possible undelivered notifications"
     And the email body lists the stale ref ID and subject
-    And the stale entry is removed from pending.json after the alert is sent
+    And the stale entry is removed from pending.json only after the alert email is sent successfully
+
+  Scenario: Stale alert email send failure leaves entries in pending queue
+    Given pending.json contains an entry that is more than 15 minutes old
+    And the gws send call fails (e.g. gws binary not on PATH)
+    When a polling cycle runs
+    Then the stale entry remains in pending.json
+    And a STALE_ALERT_SEND_FAILED error is logged
+    And no STALE_ALERT log entry is written
 
   Scenario: Stale alert is logged
     Given pending.json contains a stale entry
@@ -41,4 +49,4 @@ Feature: Undelivered Notification Alert (Dead-Letter Queue)
     Given pending.json contains 3 entries all older than 15 minutes
     When a polling cycle runs
     Then I receive exactly one alert email listing all 3 ref IDs
-    And all 3 entries are removed from pending.json
+    And all 3 entries are removed from pending.json after the alert is sent successfully
