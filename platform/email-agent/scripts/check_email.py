@@ -387,6 +387,7 @@ def main() -> None:
                     enqueue_pending(ref_id, msg_id, from_addr, subject)
                 except RuntimeError as exc:
                     _telegram(chat_id, f"check_email: state error — {exc}")
+                    log_cycle(processed, rejected)
                     sys.exit(1)
 
                 _telegram(

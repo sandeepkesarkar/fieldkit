@@ -50,6 +50,11 @@ Required by `gws auth setup` to create the OAuth client.
 ```bash
 # Download (ARM Mac)
 curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-arm.tar.gz
+curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-arm.tar.gz.sha256
+
+# Verify checksum before extracting
+shasum -a 256 -c google-cloud-cli-darwin-arm.tar.gz.sha256
+# Must print: google-cloud-cli-darwin-arm.tar.gz: OK
 
 # Extract
 tar -xf google-cloud-cli-darwin-arm.tar.gz
@@ -61,7 +66,7 @@ tar -xf google-cloud-cli-darwin-arm.tar.gz
 gcloud --version
 ```
 
-> If you're on an Intel Mac, replace `darwin-arm` with `darwin-x86_64` in the filename.
+> If you're on an Intel Mac, replace `darwin-arm` with `darwin-x86_64` in both filenames.
 
 ---
 
@@ -206,6 +211,7 @@ crontab /tmp/mycron && rm /tmp/mycron
 crontab -l | grep check_email
 ```
 
+> **Run this command as the user who will own the cron job** (typically your regular account, not root). The unquoted heredoc expands `$HOME`, `$PYTHON3`, and `$OPENCLAW_BIN` in your shell — if run via `sudo`, `$HOME` resolves to `/root` and the paths will be wrong.
 > Change `*/5` to `*/N` to adjust the polling interval. To update the interval later, remove the entry (`crontab -e`) and re-run this step.
 > `PYTHON3=$(which python3)` and `OPENCLAW_BIN=$(dirname $(which openclaw))` are baked in at registration time to avoid selecting the wrong interpreter or binary on a machine with multiple Python or Node versions.
 > `date` prepends a timestamp to every entry in `cron.log` so you can see when each run fired.

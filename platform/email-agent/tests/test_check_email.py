@@ -195,6 +195,42 @@ def test_parse_from_addr_returns_unparseable_for_malformed_header():
     assert ce._parse_from_addr("") == "<unparseable>"
 
 
+def test_sanitize_for_telegram_truncates_long_text():
+    """
+    _sanitize_for_telegram truncates text longer than max_len and appends '…'.
+
+    Subjects crafted to be very long (or an attacker-controlled subject) must not
+    exceed the Telegram message length limit or produce oversized ack messages.
+    """
+    long_text = "A" * 300
+    result = ce._sanitize_for_telegram(long_text)
+    assert result.endswith("…")
+    assert len(result) == 201  # 200 chars + ellipsis
+
+
+def test_sanitize_for_telegram_strips_newlines_and_tabs():
+    """
+    _sanitize_for_telegram replaces \\n, \\r, and \\t with spaces.
+
+    RFC 2822 allows folded headers — Gmail may return subjects with embedded
+    newlines. If passed through to Telegram, they break the ack message format
+    and could be used to inject fake fields (e.g. a fake 'Ref:' line).
+    """
+    result = ce._sanitize_for_telegram("line one\nline two\r\nend\ttab")
+    assert "\n" not in result
+    assert "\r" not in result
+    assert "\t" not in result
+
+
+def test_sanitize_for_telegram_passthrough_for_clean_short_text():
+    """
+    _sanitize_for_telegram returns clean short text unchanged.
+
+    Verifies the happy path does not mutate normal subjects.
+    """
+    assert ce._sanitize_for_telegram("Invoice #42 received") == "Invoice #42 received"
+
+
 def test_count_attachments_returns_zero_for_plain_text():
     """
     _count_attachments returns 0 when the message has no parts with a filename.
@@ -496,11 +532,13 @@ def test_gmail_error_on_single_message_skips_and_continues(monkeypatch, stub_sta
 def test_state_error_sends_telegram_and_exits(monkeypatch, stub_state, stub_logger):
     """
     A RuntimeError from get_ref_id_for_message (e.g. corrupt state.json) causes
-    the script to send an error message via Telegram and exit(1).
+    the script to send an error message via Telegram, call log_cycle with the
+    partial counts, and exit(1).
 
     State corruption must be surfaced to the admin immediately so they can
-    intervene before the next cron cycle silently fails. The error message
-    must contain enough detail for diagnosis.
+    intervene before the next cron cycle silently fails. log_cycle must be called
+    with the partial processed/rejected counts so the audit log has an entry even
+    for incomplete cycles.
     """
     telegram_calls = []
     monkeypatch.setattr(ce, "_telegram", lambda chat_id, msg: telegram_calls.append(msg))
@@ -517,6 +555,7 @@ def test_state_error_sends_telegram_and_exits(monkeypatch, stub_state, stub_logg
 
     assert exc_info.value.code == 1
     assert any("state error" in m for m in telegram_calls)
+    ce.log_cycle.assert_called_once_with(0, 0)
 
 
 def test_gmail_list_failure_sends_telegram_and_exits(monkeypatch, stub_state, stub_logger):
