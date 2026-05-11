@@ -94,6 +94,7 @@ Follow the prompts — it opens Google Cloud Console in the browser and walks yo
 ```bash
 cp ~/src/fieldkit/platform/email-agent/.env.example \
    ~/src/fieldkit/platform/email-agent/.env
+chmod 600 ~/src/fieldkit/platform/email-agent/.env
 ```
 
 Edit `.env` and fill in all variables:
@@ -254,4 +255,4 @@ tail -f ~/src/fieldkit/logs/cron.log
 | `openclaw: command not found` in cron.log | openclaw (nvm-managed) is not on cron PATH. Remove the entry (`crontab -e`) and re-run Step 10 — `$(dirname $(which openclaw))` captures the current nvm bin path. If you upgraded Node via nvm since registering cron, you must re-run Step 10 again. |
 | `FileNotFoundError: 'openclaw'` in cron.log | Old-style `PATH=… cmd` entry — PATH assignment only applied to the first command, not to Python's subprocesses. Remove the entry (`crontab -e`) and re-run Step 10. |
 | `check_email: AGENT_EMAIL is not set` in Telegram | `.env` is missing `AGENT_EMAIL`. Check Step 5. |
-| Script exits with lock error | Another instance is running. Wait 30 seconds and retry. |
+| Script exits with lock error | Check if another instance is still running: `pgrep -af check_email.py`. If a process is found, wait for it to finish. If no process is found but the error persists, the lock file is stale — delete it: `rm ~/src/fieldkit/data/email-agent/run.lock`. |

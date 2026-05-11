@@ -20,6 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+# Maximum number of Gmail message IDs retained in the processed map.
+# Oldest entries (by insertion order) are evicted when this limit is reached.
+# At peak volume of 100 messages/cycle every 5 minutes, 10,000 entries ≈ 8 hours
+# of history — well beyond any realistic re-delivery window.
+_PROCESSED_MAX = 10_000
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parents[3] / "data" / "email-agent"
@@ -105,6 +111,13 @@ def get_ref_id_for_message(gmail_message_id: str) -> str:
             ref_id = f"#{data['last_ref_id']:04d}"
 
             data["processed"][gmail_message_id] = ref_id
+
+            # Evict oldest entries when the map exceeds the size limit.
+            if len(data["processed"]) > _PROCESSED_MAX:
+                overflow = len(data["processed"]) - _PROCESSED_MAX
+                data["processed"] = dict(list(data["processed"].items())[overflow:])
+                logger.info("Evicted %d oldest entries from processed map", overflow)
+
             _write_state(fd, data)
             logger.info("Assigned new ref_id=%s (gmail_message_id=%s)", ref_id, gmail_message_id)
             return ref_id

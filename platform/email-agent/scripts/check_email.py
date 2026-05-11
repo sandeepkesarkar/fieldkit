@@ -85,7 +85,20 @@ def _acquire_run_lock() -> Optional[object]:
 
 def _gws(args: list) -> dict:
     """Run a gws command and return parsed JSON. Raises RuntimeError on failure."""
-    cmd_summary = " ".join(args)
+    # Build a safe summary: include subcommand path but drop --params/--json values
+    # to avoid leaking message IDs or request bodies in error strings sent to Telegram.
+    safe_parts = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("--params", "--json"):
+            skip_next = True
+            continue
+        safe_parts.append(arg)
+    cmd_summary = " ".join(safe_parts)
+
     try:
         result = subprocess.run(["gws"] + args, capture_output=True, text=True)
     except FileNotFoundError:
@@ -111,17 +124,36 @@ def _gws(args: list) -> dict:
     return data
 
 
+_TELEGRAM_MAX_LEN = 4096
+
+
+def _sanitize_for_telegram(text: str, max_len: int = 200) -> str:
+    """Truncate and strip characters that could affect Telegram message rendering."""
+    sanitized = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len] + "…"
+    return sanitized
+
+
 def _telegram(chat_id: str, message: str) -> None:
     """Send a Telegram message via the OpenClaw CLI (best-effort, no raise)."""
-    subprocess.run(
+    result = subprocess.run(
         [
             "openclaw", "message", "send",
             "--channel", "telegram",
             "--target", chat_id,
-            "--message", message,
+            "--message", message[:_TELEGRAM_MAX_LEN],
         ],
+        capture_output=True,
+        text=True,
         check=False,
     )
+    if result.returncode != 0:
+        logger.warning(
+            "_telegram: openclaw exited %d — %s",
+            result.returncode,
+            result.stderr.strip()[:200],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +230,8 @@ def _count_attachments(payload: dict) -> int:
     for part in payload.get("parts", []):
         if part.get("filename"):
             count += 1
-        count += _count_attachments(part)
+        else:
+            count += _count_attachments(part)
     return count
 
 
@@ -263,13 +296,22 @@ def main() -> None:
             sys.exit(1)
 
         if stale:
+            alert_sent = False
             try:
                 _send_stale_alert(stale, agent_email, admin_email)
+                alert_sent = True
             except Exception as exc:
                 logger.warning("Stale alert email failed: %s", exc)
-            for entry in stale:
-                dequeue_pending(entry["ref_id"])
-            log_stale_alert([e["ref_id"] for e in stale])
+            if alert_sent:
+                for entry in stale:
+                    dequeue_pending(entry["ref_id"])
+                log_stale_alert([e["ref_id"] for e in stale])
+            else:
+                logger.error(
+                    "STALE_ALERT_SEND_FAILED — %d entries remain in pending queue: %s",
+                    len(stale),
+                    [e["ref_id"] for e in stale],
+                )
 
         # Phase 3 — List unread, unlabeled messages
         try:
@@ -286,6 +328,11 @@ def main() -> None:
             logger.warning(
                 "Gmail returned a nextPageToken — inbox has >100 unread unlabeled messages; "
                 "only the first page will be processed this cycle"
+            )
+            _telegram(
+                chat_id,
+                "⚠ Gmail inbox overflow: more than 100 unread unlabeled messages. "
+                "Only the first 100 will be processed this cycle.",
             )
 
         # Phase 4 — Process each message
@@ -316,7 +363,9 @@ def main() -> None:
             if from_addr not in allowlist:
                 _telegram(
                     chat_id,
-                    f"✗ Email rejected — not in allowlist\nFrom: {from_addr}\nSubject: {subject}",
+                    f"✗ Email rejected — not in allowlist\n"
+                    f"From: {_sanitize_for_telegram(from_addr)}\n"
+                    f"Subject: {_sanitize_for_telegram(subject)}",
                 )
                 subprocess.run(
                     [
@@ -340,8 +389,8 @@ def main() -> None:
                     chat_id,
                     (
                         f"✓ Email received\n"
-                        f"From: {from_addr}\n"
-                        f"Subject: {subject}\n"
+                        f"From: {_sanitize_for_telegram(from_addr)}\n"
+                        f"Subject: {_sanitize_for_telegram(subject)}\n"
                         f"Received: {received_at}\n"
                         f"Attachments: {attachments}\n"
                         f"Ref: {ref_id}"
