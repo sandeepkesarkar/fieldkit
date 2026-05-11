@@ -63,6 +63,9 @@ def _load_env() -> None:
             key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip()
+            # Strip matching outer quotes produced by some editors (e.g. VAR="value").
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
             if key and key not in os.environ:
                 os.environ[key] = value
 
@@ -200,14 +203,13 @@ def _send_stale_alert(stale_entries: List[dict], agent_email: str, admin_email: 
     msg["Subject"] = "⚠️ FieldKit: Possible undelivered notifications"
     msg.set_content(body)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    subprocess.run(
-        [
-            "gws", "gmail", "users", "messages", "send",
-            "--params", '{"userId": "me"}',
-            "--json", json.dumps({"raw": raw}),
-        ],
-        check=False,
-    )
+    # Route through _gws() so PATH resolution, error wrapping, and FileNotFoundError
+    # handling are consistent with all other gws calls.
+    _gws([
+        "gmail", "users", "messages", "send",
+        "--params", '{"userId": "me"}',
+        "--json", json.dumps({"raw": raw}),
+    ])
 
 
 def _extract_header(headers: list, name: str) -> str:
@@ -221,7 +223,9 @@ def _extract_header(headers: list, name: str) -> str:
 def _parse_from_addr(from_header: str) -> str:
     """Extract the bare email address from a From: header value."""
     _, addr = email.utils.parseaddr(from_header)
-    return addr.lower().strip() if addr else "unknown"
+    # Use an RFC-invalid sentinel so a malformed header can never accidentally
+    # match a real allowlist entry (angle brackets make it an invalid addr-spec).
+    return addr.lower().strip() if addr else "<unparseable>"
 
 
 def _count_attachments(payload: dict) -> int:

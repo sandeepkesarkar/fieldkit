@@ -102,8 +102,7 @@ Edit `.env` and fill in all variables:
 | Variable | Value |
 |----------|-------|
 | `AGENT_EMAIL` | The dedicated agent Gmail address (the one you will authenticate in Step 6) |
-| `ADMIN_ALLOWLIST` | Comma-separated permitted sender addresses |
-| `POLLING_INTERVAL_MINUTES` | How often to poll (e.g. `5`) |
+| `ADMIN_ALLOWLIST` | Comma-separated permitted sender addresses. **The first address is also the stale-alert email recipient.** |
 | `ADMIN_TELEGRAM_CHAT_ID` | Your Telegram chat ID (see note below) |
 | `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` | Set to `file` — required for cron (macOS keychain is not accessible without a user session) |
 
@@ -195,19 +194,20 @@ Then send `/check_email` in Telegram and confirm you receive either:
 
 Once all Step 9 checks pass, add a system cron entry to poll Gmail automatically.
 The `--source cron` flag suppresses the "No new emails." reply on silent runs.
-`POLLING_INTERVAL_MINUTES` from `.env` controls the schedule.
 
 ```bash
 OPENCLAW_BIN=$(dirname $(which openclaw))
+PYTHON3=$(which python3)
 crontab -l 2>/dev/null | grep -v check_email > /tmp/mycron
 cat >> /tmp/mycron << EOF
-*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:${OPENCLAW_BIN}:/usr/bin:/bin bash -c 'date && python3 ${HOME}/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> ${HOME}/src/fieldkit/logs/cron.log 2>&1
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:${OPENCLAW_BIN}:/usr/bin:/bin bash -c 'date && ${PYTHON3} ${HOME}/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> ${HOME}/src/fieldkit/logs/cron.log 2>&1
 EOF
 crontab /tmp/mycron && rm /tmp/mycron
 crontab -l | grep check_email
 ```
 
-> Change `*/5` to `*/N` if you want a different polling interval.
+> Change `*/5` to `*/N` to adjust the polling interval. To update the interval later, remove the entry (`crontab -e`) and re-run this step.
+> `PYTHON3=$(which python3)` and `OPENCLAW_BIN=$(dirname $(which openclaw))` are baked in at registration time to avoid selecting the wrong interpreter or binary on a machine with multiple Python or Node versions.
 > `date` prepends a timestamp to every entry in `cron.log` so you can see when each run fired.
 
 > `env PATH=…` is required because cron does not source your shell profile, and

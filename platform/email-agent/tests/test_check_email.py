@@ -183,15 +183,16 @@ def test_parse_from_addr_lowercases_result():
     assert ce._parse_from_addr("Admin@Example.COM") == "admin@example.com"
 
 
-def test_parse_from_addr_returns_unknown_for_malformed_header():
+def test_parse_from_addr_returns_unparseable_for_malformed_header():
     """
-    _parse_from_addr returns 'unknown' when the header value cannot be parsed.
+    _parse_from_addr returns '<unparseable>' when the header value cannot be parsed.
 
     A malformed From header (empty string, garbage value) must not crash the
-    script. 'unknown' will never match the allowlist, so the message is rejected
-    and logged — the correct safe-fail behaviour.
+    script. '<unparseable>' uses angle brackets that make it an invalid addr-spec,
+    so it can never accidentally match a real allowlist entry. The message is
+    rejected and logged — the correct safe-fail behaviour.
     """
-    assert ce._parse_from_addr("") == "unknown"
+    assert ce._parse_from_addr("") == "<unparseable>"
 
 
 def test_count_attachments_returns_zero_for_plain_text():
@@ -300,9 +301,8 @@ def test_happy_path_sends_ack_and_updates_state(monkeypatch, stub_state, stub_lo
     assert any("✓ Email received" in m for m in telegram_msgs)
     assert any("#0001" in m for m in telegram_msgs)
 
-    # Verify order: enqueue → telegram ack → dequeue
-    events = [e if isinstance(e, str) else e[0] for e in call_log]
-    enqueue_pos = events.index("enqueue")
+    # Verify order: enqueue → telegram ack → dequeue (all indices from call_log)
+    enqueue_pos = call_log.index("enqueue")
     ack_pos = next(i for i, e in enumerate(call_log)
                    if isinstance(e, tuple) and e[0] == "telegram" and "✓ Email received" in e[1])
     dequeue_pos = next(i for i, e in enumerate(call_log)
@@ -391,8 +391,8 @@ def test_stale_entries_trigger_alert_and_are_dequeued(monkeypatch, stub_state, s
     ]
     monkeypatch.setattr(ce, "get_stale_pending", lambda **_: stale)
     monkeypatch.setattr(ce, "_telegram", MagicMock())
+    # _gws handles both the stale alert send and the Gmail list call.
     monkeypatch.setattr(ce, "_gws", lambda args: {})
-    monkeypatch.setattr(ce, "subprocess", MagicMock())  # alert email send
 
     ce.main()
 

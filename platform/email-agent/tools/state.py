@@ -105,7 +105,9 @@ def get_ref_id_for_message(gmail_message_id: str) -> str:
                 logger.info("Message already processed — reusing ref_id=%s", existing)
                 return existing
 
-            # Increment counter and zero-pad to 4 digits (e.g. 1 → #0001, 1000 → #1000).
+            # Zero-pad to 4 digits for readability (e.g. 1 → #0001). The format
+            # widens naturally beyond #9999 — this is intentional; the width is
+            # cosmetic and clamping would silently reuse ref IDs.
             data.setdefault("processed", {})
             data["last_ref_id"] = data.get("last_ref_id", 0) + 1
             ref_id = f"#{data['last_ref_id']:04d}"
