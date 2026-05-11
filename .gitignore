@@ -23,8 +23,6 @@ env/
 .env
 !.env.example
 
-# In-progress updates (promote to committed when published)
-updates/2026-05-11.md
 
 # Editor
 .vscode/
