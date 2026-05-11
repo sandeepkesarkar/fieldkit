@@ -96,7 +96,7 @@ cp ~/src/fieldkit/platform/email-agent/.env.example \
    ~/src/fieldkit/platform/email-agent/.env
 ```
 
-Edit `.env` and fill in all four variables:
+Edit `.env` and fill in all variables:
 
 | Variable | Value |
 |----------|-------|
@@ -104,6 +104,7 @@ Edit `.env` and fill in all four variables:
 | `ADMIN_ALLOWLIST` | Comma-separated permitted sender addresses |
 | `POLLING_INTERVAL_MINUTES` | How often to poll (e.g. `5`) |
 | `ADMIN_TELEGRAM_CHAT_ID` | Your Telegram chat ID (see note below) |
+| `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` | Set to `file` — required for cron (macOS keychain is not accessible without a user session) |
 
 **Finding `ADMIN_TELEGRAM_CHAT_ID`:** send any message to your OpenClaw bot in Telegram, then run:
 
@@ -118,11 +119,14 @@ The chat ID appears after `chat=`.
 ## 6 — Authenticate against the agent Gmail account
 
 ```bash
-source ~/src/fieldkit/platform/email-agent/.env
-gws auth login --services gmail
+GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file gws auth login --services gmail
 ```
 
 A browser window opens. **Sign in with the agent Gmail account** (`$AGENT_EMAIL`), not your personal account.
+
+> The `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` prefix is required at login time so gws
+> stores credentials in a plain file rather than the macOS keychain. The keychain is
+> inaccessible from cron (no user session), which would cause auth failures at runtime.
 
 ---
 
@@ -193,15 +197,27 @@ The `--source cron` flag suppresses the "No new emails." reply on silent runs.
 `POLLING_INTERVAL_MINUTES` from `.env` controls the schedule.
 
 ```bash
-source ~/src/fieldkit/platform/email-agent/.env
-(crontab -l 2>/dev/null; echo "*/${POLLING_INTERVAL_MINUTES} * * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin cd $HOME/src/fieldkit/platform/email-agent && python3 scripts/check_email.py --source cron >> $HOME/src/fieldkit/logs/cron.log 2>&1") | crontab -
+OPENCLAW_BIN=$(dirname $(which openclaw))
+crontab -l 2>/dev/null | grep -v check_email > /tmp/mycron
+cat >> /tmp/mycron << EOF
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:${OPENCLAW_BIN}:/usr/bin:/bin bash -c 'date && python3 ${HOME}/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> ${HOME}/src/fieldkit/logs/cron.log 2>&1
+EOF
+crontab /tmp/mycron && rm /tmp/mycron
+crontab -l | grep check_email
 ```
 
-> The `PATH=…` prefix is required because cron does not source your shell profile, so
-> Homebrew tools like `gws` are not on its default PATH. `/opt/homebrew/bin` covers
-> Apple Silicon Macs; `/usr/local/bin` covers Intel Macs. `$HOME` and
-> `$POLLING_INTERVAL_MINUTES` are expanded by your shell when you run the `echo`
-> command, so the crontab stores the literal values.
+> Change `*/5` to `*/N` if you want a different polling interval.
+> `date` prepends a timestamp to every entry in `cron.log` so you can see when each run fired.
+
+> `env PATH=…` is required because cron does not source your shell profile, and
+> `PATH=value cmd` only applies to that one command — subprocesses (like `openclaw`)
+> would revert to cron's minimal PATH. `env` sets the PATH for `python3` and all
+> processes it spawns.
+> `gws` lives in `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel).
+> `openclaw` is managed by nvm and lives in a version-specific path —
+> `$(dirname $(which openclaw))` captures the correct path at registration time.
+> `$HOME` and `$OPENCLAW_BIN` are expanded by your shell when you run this command,
+> so the crontab stores the literal values.
 
 Verify it was registered:
 
@@ -233,6 +249,9 @@ tail -f ~/src/fieldkit/logs/cron.log
 | `check_email: ADMIN_ALLOWLIST is empty` in Telegram | `.env` is missing or `ADMIN_ALLOWLIST` is blank. Check Step 7. |
 | `check_email: ADMIN_TELEGRAM_CHAT_ID is not set` | `.env` is missing `ADMIN_TELEGRAM_CHAT_ID`. Check Step 7. |
 | `gws gmail … failed` in Telegram | gws token may have expired. Re-run Step 6. |
-| `gws binary not found` in Telegram or cron.log | gws is not on PATH. Confirm `which gws` works, then verify Step 10's crontab entry contains `PATH=/opt/homebrew/bin:…`. |
+| `OS keyring failed` or `Decryption failed` in Telegram | gws was authenticated with the macOS keychain, which is inaccessible from cron. Run `gws auth logout` then re-run Step 6 (with `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`). Ensure `.env` contains `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`. |
+| `gws binary not found` in cron.log | gws is not on cron PATH. Remove the crontab entry (`crontab -e`) and re-run Step 10. |
+| `openclaw: command not found` in cron.log | openclaw (nvm-managed) is not on cron PATH. Remove the entry (`crontab -e`) and re-run Step 10 — `$(dirname $(which openclaw))` captures the current nvm bin path. If you upgraded Node via nvm since registering cron, you must re-run Step 10 again. |
+| `FileNotFoundError: 'openclaw'` in cron.log | Old-style `PATH=… cmd` entry — PATH assignment only applied to the first command, not to Python's subprocesses. Remove the entry (`crontab -e`) and re-run Step 10. |
 | `check_email: AGENT_EMAIL is not set` in Telegram | `.env` is missing `AGENT_EMAIL`. Check Step 5. |
 | Script exits with lock error | Another instance is running. Wait 30 seconds and retry. |
