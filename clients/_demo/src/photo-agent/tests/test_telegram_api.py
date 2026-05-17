@@ -5,6 +5,7 @@ All tests mock requests.post / requests.get so no real HTTP calls are made.
 TELEGRAM_BOT_TOKEN is set via an autouse fixture for every test.
 """
 
+import requests
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,10 +36,11 @@ def _ok_response(result) -> MagicMock:
 
 
 def _http_error_response(status_code: int = 500) -> MagicMock:
-    """Mock requests.Response with an HTTP error status."""
+    """Mock requests.Response with an HTTP error status and empty JSON body."""
     mock = MagicMock()
     mock.ok = False
     mock.status_code = status_code
+    mock.json.return_value = {}
     return mock
 
 
@@ -84,6 +86,12 @@ def test_send_message_uses_bot_token_in_url(monkeypatch):
     assert "secret_token_abc" in url
 
 
+def test_send_message_empty_buttons_raises_value_error():
+    """send_message_with_buttons() raises ValueError immediately when buttons is empty."""
+    with pytest.raises(ValueError, match="buttons must not be empty"):
+        send_message_with_buttons(_CHAT_ID, "text", [])
+
+
 # ---------------------------------------------------------------------------
 # answer_callback_query
 # ---------------------------------------------------------------------------
@@ -97,6 +105,22 @@ def test_answer_callback_query_calls_correct_endpoint():
     assert "answerCallbackQuery" in url
     body = mock_post.call_args.kwargs["json"]
     assert body["callback_query_id"] == "cq_id_xyz"
+
+
+def test_answer_callback_query_http_error_raises_runtime_error():
+    """answer_callback_query() raises RuntimeError on HTTP error."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _http_error_response(500)
+        with pytest.raises(RuntimeError, match="500"):
+            answer_callback_query("cq_id_xyz")
+
+
+def test_answer_callback_query_telegram_error_raises_runtime_error():
+    """answer_callback_query() raises RuntimeError on Telegram ok:false."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _telegram_error_response("query too old")
+        with pytest.raises(RuntimeError, match="query too old"):
+            answer_callback_query("cq_id_xyz")
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +154,24 @@ def test_get_updates_returns_empty_list_when_no_updates():
     assert result == []
 
 
+def test_get_updates_http_error_raises_runtime_error():
+    """get_updates() raises RuntimeError on HTTP error."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _http_error_response(429)
+        with pytest.raises(RuntimeError, match="429"):
+            get_updates(0)
+
+
+def test_get_updates_telegram_error_raises_runtime_error():
+    """get_updates() raises RuntimeError on Telegram ok:false."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _telegram_error_response("Unauthorized")
+        with pytest.raises(RuntimeError, match="Unauthorized"):
+            get_updates(0)
+
+
 # ---------------------------------------------------------------------------
-# Error handling
+# Error handling — shared
 # ---------------------------------------------------------------------------
 
 def test_http_error_raises_runtime_error():
@@ -150,8 +190,30 @@ def test_telegram_ok_false_raises_runtime_error():
             send_message_with_buttons(_CHAT_ID, "text", _BUTTONS)
 
 
+def test_network_error_raises_runtime_error():
+    """RuntimeError is raised when a network-level exception occurs."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.side_effect = requests.exceptions.ConnectionError("network down")
+        with pytest.raises(RuntimeError, match="Telegram request failed"):
+            send_message_with_buttons(_CHAT_ID, "text", _BUTTONS)
+
+
 def test_missing_token_raises_runtime_error(monkeypatch):
     """RuntimeError is raised when TELEGRAM_BOT_TOKEN is not set."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
         send_message_with_buttons(_CHAT_ID, "text", _BUTTONS)
+
+
+def test_missing_token_raises_for_answer_callback_query(monkeypatch):
+    """RuntimeError is raised when TELEGRAM_BOT_TOKEN is not set for answer_callback_query."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
+        answer_callback_query("cq_id")
+
+
+def test_missing_token_raises_for_get_updates(monkeypatch):
+    """RuntimeError is raised when TELEGRAM_BOT_TOKEN is not set for get_updates."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
+        get_updates(0)

@@ -1,3 +1,4 @@
 pytest
-pytest-mock
+pytest-mock  # used in test_process_photos.py and test_check_approval.py (T07/T08)
 requests
+python-dotenv

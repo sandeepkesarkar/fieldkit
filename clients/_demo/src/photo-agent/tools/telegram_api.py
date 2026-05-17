@@ -5,7 +5,13 @@ Handles operations that OpenClaw's `message send` cannot perform:
 inline keyboards (reply_markup), callback dismissal, and update polling.
 
 Bot token is read from TELEGRAM_BOT_TOKEN in the environment.
-All functions raise RuntimeError on HTTP error or non-OK Telegram response.
+All functions raise RuntimeError on HTTP error, network failure, or
+non-OK Telegram response.
+
+Security note: the Telegram Bot API embeds the token in the URL path
+(https://api.telegram.org/bot{TOKEN}/method). Never enable DEBUG-level
+logging on urllib3.connectionpool in production — it logs the full
+request line including the token.
 """
 
 import logging
@@ -31,8 +37,16 @@ def _url(method: str) -> str:
 def _check(response: requests.Response) -> dict:
     """Raise RuntimeError on HTTP error or Telegram ok:false."""
     if not response.ok:
-        raise RuntimeError(f"Telegram HTTP error {response.status_code}")
-    data = response.json()
+        try:
+            desc = response.json().get("description", "")
+        except Exception:
+            desc = ""
+        detail = f": {desc}" if desc else ""
+        raise RuntimeError(f"Telegram HTTP error {response.status_code}{detail}")
+    try:
+        data = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError(f"Telegram returned non-JSON body: {exc}") from exc
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data.get('description', 'unknown')}")
     return data
@@ -43,19 +57,27 @@ def send_message_with_buttons(chat_id: str, text: str, buttons: list[tuple[str, 
 
     buttons is a list of (label, callback_data) pairs rendered as a single keyboard row.
     """
+    if not buttons:
+        raise ValueError("send_message_with_buttons: buttons must not be empty")
     reply_markup = {
         "inline_keyboard": [
             [{"text": label, "callback_data": cb} for label, cb in buttons]
         ]
     }
     logger.debug("send_message_with_buttons: chat_id=%s", chat_id)
-    response = requests.post(
-        _url("sendMessage"),
-        json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
-        timeout=10,
-    )
+    try:
+        response = requests.post(
+            _url("sendMessage"),
+            json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Telegram request failed: {exc}") from exc
     data = _check(response)
-    message_id: int = data["result"]["message_id"]
+    try:
+        message_id: int = data["result"]["message_id"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(f"Telegram response missing message_id: {data!r}") from exc
     logger.info("send_message_with_buttons: chat_id=%s message_id=%d", chat_id, message_id)
     return message_id
 
@@ -63,23 +85,34 @@ def send_message_with_buttons(chat_id: str, text: str, buttons: list[tuple[str, 
 def answer_callback_query(callback_query_id: str) -> None:
     """Dismiss the spinner on the admin's button tap."""
     logger.debug("answer_callback_query: callback_query_id=%s", callback_query_id)
-    response = requests.post(
-        _url("answerCallbackQuery"),
-        json={"callback_query_id": callback_query_id},
-        timeout=10,
-    )
+    try:
+        response = requests.post(
+            _url("answerCallbackQuery"),
+            json={"callback_query_id": callback_query_id},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Telegram request failed: {exc}") from exc
     _check(response)
     logger.info("answer_callback_query: callback_query_id=%s", callback_query_id)
 
 
 def get_updates(offset: int) -> list[dict]:
-    """Poll getUpdates with the given offset. Returns the raw list of update objects."""
+    """Poll getUpdates with the given offset. Returns the raw list of update objects.
+
+    The Telegram timeout param is fixed at 0 (return immediately). The requests
+    socket timeout (10 s) must exceed the Telegram timeout param to avoid a
+    spurious Timeout exception.
+    """
     logger.debug("get_updates: offset=%d", offset)
-    response = requests.get(
-        _url("getUpdates"),
-        params={"offset": offset, "timeout": 0},
-        timeout=10,
-    )
+    try:
+        response = requests.get(
+            _url("getUpdates"),
+            params={"offset": offset, "timeout": 0},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Telegram request failed: {exc}") from exc
     data = _check(response)
     updates: list[dict] = data.get("result", [])
     logger.info("get_updates: offset=%d count=%d", offset, len(updates))
