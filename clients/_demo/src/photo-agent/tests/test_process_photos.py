@@ -40,6 +40,7 @@ def base(mocker, env):
     mocker.patch("scripts.process_photos._acquire_run_lock", return_value=MagicMock())
     mocker.patch("scripts.process_photos.fcntl.flock")
     mocker.patch("scripts.process_photos.state.get_pending_approval", return_value=None)
+    mocker.patch("scripts.process_photos.activity_log.log_command")
     return mocker
 
 
@@ -62,8 +63,13 @@ def happy(base, env):
     base.patch("scripts.process_photos.activity_log.log_generated")
     base.patch("scripts.process_photos.activity_log.log_uploaded")
     base.patch("scripts.process_photos.activity_log.log_approval_req")
+
+    def _fake_generate(photos, cfg, out):
+        out.write_bytes(b"\x00" * 100)
+        return out
+
     gen_cls = base.patch("scripts.process_photos.FFmpegVideoGenerator")
-    gen_cls.return_value.generate.side_effect = lambda photos, cfg, out: out
+    gen_cls.return_value.generate.side_effect = _fake_generate
     return base
 
 
@@ -82,6 +88,62 @@ def test_missing_project_arg_exits_nonzero(mocker, env):
     assert exc_info.value.code == 1
     mock_err.assert_called_once()
     assert "Usage" in mock_err.call_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# Project name validation (C3)
+# ---------------------------------------------------------------------------
+
+def test_invalid_project_name_exits(mocker, env):
+    """A project name with disallowed characters sends a Telegram error and exits."""
+    mocker.patch("scripts.process_photos._load_env")
+    mock_err = mocker.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    with pytest.raises(SystemExit):
+        main(["--project", "bad/name"])
+    mock_err.assert_called_once()
+    assert "Invalid project name" in mock_err.call_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# Missing required env vars (M7)
+# ---------------------------------------------------------------------------
+
+def test_missing_chat_id_exits(base):
+    """Missing ADMIN_TELEGRAM_CHAT_ID sends a Telegram error and exits."""
+    base._mocker.stopall if hasattr(base, "_mocker") else None
+    # Re-use base but unset the env var via a fresh monkeypatch approach:
+    # The env fixture already set it, so we patch the environ lookup result.
+    import os
+    orig = os.environ.pop("ADMIN_TELEGRAM_CHAT_ID", None)
+    mock_err = base.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    try:
+        with pytest.raises(SystemExit):
+            main(["--project", _PROJECT])
+    finally:
+        if orig is not None:
+            os.environ["ADMIN_TELEGRAM_CHAT_ID"] = orig
+    mock_err.assert_called_once()
+    assert "ADMIN_TELEGRAM_CHAT_ID" in mock_err.call_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# Invalid SECONDS_PER_PHOTO (H5)
+# ---------------------------------------------------------------------------
+
+def test_invalid_seconds_per_photo_exits(base, monkeypatch):
+    """Non-integer SECONDS_PER_PHOTO sends a Telegram error and exits."""
+    monkeypatch.setenv("SECONDS_PER_PHOTO", "fast")
+    mock_err = base.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    with pytest.raises(SystemExit):
+        main(["--project", _PROJECT])
+    mock_err.assert_called_once()
+    assert "SECONDS_PER_PHOTO" in mock_err.call_args.args[0]
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +224,28 @@ def test_more_than_30_photos_exits(base):
 
 
 # ---------------------------------------------------------------------------
+# Invalid photo filename (C4)
+# ---------------------------------------------------------------------------
+
+def test_invalid_photo_filename_exits(base):
+    """A photo with a non-image extension sends a Telegram error and exits."""
+    base.patch("scripts.process_photos.drive.find_folder", return_value="folder_id")
+    base.patch(
+        "scripts.process_photos.drive.list_photos",
+        return_value=[
+            {"id": "f1", "name": "photo01.jpg"},
+            {"id": "f2", "name": "malicious.sh"},
+        ],
+    )
+    mock_err = base.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    with pytest.raises(SystemExit):
+        main(["--project", _PROJECT])
+    mock_err.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Download failure
 # ---------------------------------------------------------------------------
 
@@ -216,8 +300,13 @@ def test_upload_failure_exits_and_does_not_set_state(base):
     base.patch("scripts.process_photos.drive.list_photos", return_value=_TWO_PHOTOS)
     base.patch("scripts.process_photos.drive.download")
     base.patch("scripts.process_photos.activity_log.log_downloaded")
+
+    def _fake_generate(photos, cfg, out):
+        out.write_bytes(b"\x00" * 100)
+        return out
+
     gen_cls = base.patch("scripts.process_photos.FFmpegVideoGenerator")
-    gen_cls.return_value.generate.side_effect = lambda photos, cfg, out: out
+    gen_cls.return_value.generate.side_effect = _fake_generate
     base.patch("scripts.process_photos.activity_log.log_generated")
     base.patch(
         "scripts.process_photos.drive.upload",
@@ -232,6 +321,48 @@ def test_upload_failure_exits_and_does_not_set_state(base):
     mock_err.assert_called_once()
     assert "upload failed" in mock_err.call_args.args[0].lower()
     mock_set_state.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Telegram send failure (M6)
+# ---------------------------------------------------------------------------
+
+def test_telegram_send_failure_exits_and_does_not_set_state(happy, env):
+    """Telegram send failure sends a Telegram error; state.set_pending_approval is not called."""
+    import scripts.process_photos as proc
+    happy.patch(
+        "scripts.process_photos.telegram_api.send_message_with_buttons",
+        side_effect=RuntimeError("chat not found"),
+    )
+    mock_set_state = happy.patch("scripts.process_photos.state.set_pending_approval")
+    mock_err = happy.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    with pytest.raises(SystemExit):
+        main(["--project", _PROJECT])
+    mock_err.assert_called_once()
+    assert "approval message" in mock_err.call_args.args[0].lower()
+    mock_set_state.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# State write failure (M8)
+# ---------------------------------------------------------------------------
+
+def test_state_write_failure_exits(happy, env):
+    """state.set_pending_approval failure sends a Telegram error and exits."""
+    happy.patch(
+        "scripts.process_photos.state.set_pending_approval",
+        side_effect=RuntimeError("disk full"),
+    )
+    mock_err = happy.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    with pytest.raises(SystemExit):
+        main(["--project", _PROJECT])
+    mock_err.assert_called_once()
+    msg = mock_err.call_args.args[0]
+    assert "state write failed" in msg.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +406,14 @@ def test_happy_path_approval_message_has_approve_reject_buttons(happy, env):
     assert "❌ Reject" in labels
 
 
+def test_happy_path_approval_message_uses_markdown_parse_mode(happy, env):
+    """send_message_with_buttons() is called with parse_mode='Markdown'."""
+    import scripts.process_photos as proc
+    main(["--project", _PROJECT])
+    kwargs = proc.telegram_api.send_message_with_buttons.call_args.kwargs
+    assert kwargs.get("parse_mode") == "Markdown"
+
+
 def test_happy_path_temp_dir_cleared_before_run(happy, env):
     """Stale project temp directory is removed and recreated at the start of each run."""
     project_tmp = env / _PROJECT
@@ -294,3 +433,15 @@ def test_happy_path_message_includes_project_name_count_and_duration(happy, env)
     assert _PROJECT in text
     assert "2" in text          # photo count
     assert "7.5" in text        # duration: 2 × 4s − 1 × 0.5s = 7.5s
+
+
+def test_happy_path_scrub_is_called(happy, env):
+    """scrub() is called on the downloaded photos before video generation."""
+    import scripts.process_photos as proc
+    mock_scrub = happy.patch(
+        "scripts.process_photos.scrub", side_effect=lambda photos: photos
+    )
+    main(["--project", _PROJECT])
+    mock_scrub.assert_called_once()
+    scrubbed = mock_scrub.call_args.args[0]
+    assert len(scrubbed) == 2

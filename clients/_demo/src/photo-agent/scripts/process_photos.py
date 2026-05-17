@@ -7,16 +7,23 @@ Usage:
 Invoked by the /process_photos OpenClaw skill. Integrates Drive, FFmpeg,
 Telegram, and state management. Exits non-zero on any failure, sending a
 Telegram error message via openclaw before doing so.
+
+Lock discipline: run.lock is held for the duration of the pipeline to prevent
+concurrent runs. state.json is separately locked inside each tools/state.py
+call. The two locks are on different files; no ordering conflict is possible.
 """
 
 import argparse
 import fcntl
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 from dotenv import load_dotenv
 
@@ -28,24 +35,34 @@ from tools import telegram_api
 from tools.drive import DriveFolderNotFoundError
 from tools.video_generator import FFmpegVideoGenerator, VideoConfig, VideoGenerationError
 
+_log = logging.getLogger(__name__)
+
 _REPO_ROOT = Path(__file__).parents[5]
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 
 _MIN_PHOTOS = 2
 _MAX_PHOTOS = 30
 _DEFAULT_SPP = 4
+_PROJECT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+_PHOTO_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 
 
 def _load_env() -> None:
     load_dotenv(_PHOTO_AGENT_DIR / ".env")
 
 
-def _telegram_error(message: str) -> None:
+def _telegram_error(message: str) -> NoReturn:
     """Send an error to the admin via openclaw Telegram and exit non-zero."""
-    subprocess.run(
-        ["openclaw", "message", "send", "--channel", "telegram", message],
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["openclaw", "message", "send", "--channel", "telegram", message],
+            check=False,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            _log.warning("openclaw exited %d while sending error message", result.returncode)
+    except subprocess.TimeoutExpired:
+        _log.warning("openclaw timed out after 30s while sending error message")
     sys.exit(1)
 
 
@@ -64,6 +81,14 @@ def _acquire_run_lock():
 def scrub(photos: list[Path]) -> list[Path]:
     """Privacy scrub placeholder — returns photos unchanged. Activate in a future phase."""
     return photos
+
+
+def _safe_filename(raw_name: str) -> str:
+    """Return just the filename component, rejecting names with non-photo extensions."""
+    name = Path(raw_name).name
+    if not name or Path(name).suffix.lower() not in _PHOTO_SUFFIXES:
+        raise ValueError(f"Unsafe or non-photo filename from Drive: {raw_name!r}")
+    return name
 
 
 def _approval_text(project_name: str, photo_count: int, duration_sec: float, folder_link: str) -> str:
@@ -85,9 +110,29 @@ def main(argv=None) -> None:
         _telegram_error("❌ Usage: /process_photos project=<name>")
 
     project_name = args.project
-    chat_id = os.environ["ADMIN_TELEGRAM_CHAT_ID"]
-    root_folder_id = os.environ["DRIVE_ROOT_FOLDER_ID"]
-    spp = int(os.environ.get("SECONDS_PER_PHOTO", str(_DEFAULT_SPP)))
+    if not _PROJECT_NAME_RE.match(project_name):
+        _telegram_error(
+            f"❌ Invalid project name: {project_name!r} — "
+            "only letters, digits, hyphens, and underscores are allowed."
+        )
+
+    activity_log.log_command(project_name)
+
+    chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID")
+    if not chat_id:
+        _telegram_error("❌ ADMIN_TELEGRAM_CHAT_ID is not set.")
+
+    root_folder_id = os.environ.get("DRIVE_ROOT_FOLDER_ID")
+    if not root_folder_id:
+        _telegram_error("❌ DRIVE_ROOT_FOLDER_ID is not set.")
+
+    try:
+        spp = int(os.environ.get("SECONDS_PER_PHOTO", str(_DEFAULT_SPP)))
+    except ValueError:
+        _telegram_error(
+            f"❌ SECONDS_PER_PHOTO must be an integer; got: "
+            f"{os.environ.get('SECONDS_PER_PHOTO')!r}"
+        )
 
     tmp_base_raw = os.environ.get("VIDEO_TMP_DIR", "")
     if tmp_base_raw:
@@ -96,10 +141,18 @@ def main(argv=None) -> None:
     else:
         tmp_base = _REPO_ROOT / "data" / "photo-agent" / "tmp"
 
-    lock_f = _acquire_run_lock()
+    try:
+        lock_f = _acquire_run_lock()
+    except OSError as exc:
+        _telegram_error(f"❌ {project_name}: failed to acquire run lock — {exc}")
+
     try:
         # Guard: reject if another approval is already pending
-        if state.get_pending_approval() is not None:
+        try:
+            pending = state.get_pending_approval()
+        except RuntimeError as exc:
+            _telegram_error(f"❌ {project_name}: failed to read state — {exc}")
+        if pending is not None:
             _telegram_error(
                 f"⚠️ {project_name}: already awaiting approval. Use /check_approval first."
             )
@@ -124,23 +177,32 @@ def main(argv=None) -> None:
 
         # Clear and recreate project temp directory
         project_tmp = tmp_base / project_name
-        if project_tmp.exists():
-            shutil.rmtree(project_tmp)
-        project_tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            if project_tmp.exists():
+                shutil.rmtree(project_tmp)
+            project_tmp.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _telegram_error(f"❌ {project_name}: failed to prepare temp directory — {exc}")
 
         # Download photos
         local_photos: list[Path] = []
         for meta in photos_meta:
-            local_path = project_tmp / meta["name"]
+            try:
+                safe_name = _safe_filename(meta["name"])
+            except ValueError as exc:
+                _telegram_error(f"❌ {project_name}: {exc}")
+            local_path = project_tmp / safe_name
             try:
                 drive.download(meta["id"], local_path)
             except RuntimeError as exc:
                 _telegram_error(f"❌ {project_name}: photo download failed — {exc}")
-            activity_log.log_downloaded(project_name, meta["name"])
             local_photos.append(local_path)
+
+        activity_log.log_downloaded(project_name, len(local_photos))
 
         # Privacy scrub (no-op placeholder)
         local_photos = scrub(local_photos)
+        n = len(local_photos)
 
         # Generate video
         cfg = VideoConfig(seconds_per_photo=spp)
@@ -152,8 +214,8 @@ def main(argv=None) -> None:
             _telegram_error(f"❌ {project_name}: video generation failed — {exc}")
 
         xfade = cfg.crossfade_duration
-        duration_sec = count * spp - (count - 1) * xfade
-        activity_log.log_generated(project_name, duration_sec)
+        duration_sec = n * spp - (n - 1) * xfade
+        activity_log.log_generated(project_name, duration_sec, output_path.stat().st_size)
 
         # Upload video to Drive; retain local file on failure for manual recovery
         try:
@@ -165,23 +227,33 @@ def main(argv=None) -> None:
 
         # Send approval message with inline keyboard
         folder_link_url = drive.folder_link(folder_id)
-        msg_id = telegram_api.send_message_with_buttons(
-            chat_id,
-            _approval_text(project_name, count, duration_sec, folder_link_url),
-            [("✅ Approve", "approve"), ("❌ Reject", "reject")],
-        )
+        try:
+            msg_id = telegram_api.send_message_with_buttons(
+                chat_id,
+                _approval_text(project_name, n, duration_sec, folder_link_url),
+                [("✅ Approve", "approve"), ("❌ Reject", "reject")],
+                parse_mode="Markdown",
+            )
+        except RuntimeError as exc:
+            _telegram_error(f"❌ {project_name}: failed to send approval message — {exc}")
 
         # Persist approval state
         triggered_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        state.set_pending_approval({
-            "project_name": project_name,
-            "drive_folder_id": folder_id,
-            "drive_video_file_id": drive_video_file_id,
-            "drive_folder_link": folder_link_url,
-            "video_local_path": str(output_path),
-            "telegram_message_id": msg_id,
-            "triggered_at": triggered_at,
-        })
+        try:
+            state.set_pending_approval({
+                "project_name": project_name,
+                "drive_folder_id": folder_id,
+                "drive_video_file_id": drive_video_file_id,
+                "drive_folder_link": folder_link_url,
+                "video_local_path": str(output_path),
+                "telegram_message_id": msg_id,
+                "triggered_at": triggered_at,
+            })
+        except RuntimeError:
+            _telegram_error(
+                f"❌ {project_name}: approval message sent (msg_id={msg_id}) but "
+                f"state write failed. Drive folder: {folder_link_url}"
+            )
         activity_log.log_approval_req(project_name, msg_id)
 
     finally:

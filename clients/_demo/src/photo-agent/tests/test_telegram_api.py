@@ -76,6 +76,24 @@ def test_send_message_returns_message_id():
     assert result == 99
 
 
+def test_send_message_includes_parse_mode_when_provided():
+    """send_message_with_buttons() includes parse_mode in the request body when given."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response({"message_id": 1})
+        send_message_with_buttons(_CHAT_ID, "text", _BUTTONS, parse_mode="Markdown")
+    body = mock_post.call_args.kwargs["json"]
+    assert body.get("parse_mode") == "Markdown"
+
+
+def test_send_message_omits_parse_mode_when_not_provided():
+    """send_message_with_buttons() omits parse_mode from the body when not explicitly passed."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response({"message_id": 1})
+        send_message_with_buttons(_CHAT_ID, "text", _BUTTONS)
+    body = mock_post.call_args.kwargs["json"]
+    assert "parse_mode" not in body
+
+
 def test_send_message_uses_bot_token_in_url(monkeypatch):
     """send_message_with_buttons() embeds TELEGRAM_BOT_TOKEN in the request URL."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "secret_token_abc")

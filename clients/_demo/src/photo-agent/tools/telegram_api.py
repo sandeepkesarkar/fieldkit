@@ -52,10 +52,16 @@ def _check(response: requests.Response) -> dict:
     return data
 
 
-def send_message_with_buttons(chat_id: str, text: str, buttons: list[tuple[str, str]]) -> int:
+def send_message_with_buttons(
+    chat_id: str,
+    text: str,
+    buttons: list[tuple[str, str]],
+    parse_mode: str | None = None,
+) -> int:
     """Send a message with an inline keyboard. Returns the Telegram message_id.
 
     buttons is a list of (label, callback_data) pairs rendered as a single keyboard row.
+    parse_mode is passed through to Telegram (e.g. "Markdown", "MarkdownV2", "HTML").
     """
     if not buttons:
         raise ValueError("send_message_with_buttons: buttons must not be empty")
@@ -64,11 +70,14 @@ def send_message_with_buttons(chat_id: str, text: str, buttons: list[tuple[str, 
             [{"text": label, "callback_data": cb} for label, cb in buttons]
         ]
     }
+    payload: dict = {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     logger.debug("send_message_with_buttons: chat_id=%s", chat_id)
     try:
         response = requests.post(
             _url("sendMessage"),
-            json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
+            json=payload,
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
