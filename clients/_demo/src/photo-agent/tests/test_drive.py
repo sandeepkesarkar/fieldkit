@@ -220,6 +220,13 @@ def test_download_raises_on_auth_export_failure(mock_gws, tmp_path):
         download("file_abc", tmp_path / "out.jpg")
 
 
+def test_download_raises_on_missing_cred_key(mock_gws, tmp_path):
+    """download() raises RuntimeError when gws auth export JSON is missing OAuth credential keys."""
+    mock_gws.return_value = _gws_ok(json.dumps({"type": "authorized_user"}))
+    with pytest.raises(RuntimeError, match="missing expected key"):
+        download("file_abc", tmp_path / "out.jpg")
+
+
 def test_download_raises_on_http_error(mock_gws, tmp_path):
     """download() raises RuntimeError when the Drive REST API returns an error."""
     mock_gws.return_value = _gws_ok(_FAKE_CREDS)

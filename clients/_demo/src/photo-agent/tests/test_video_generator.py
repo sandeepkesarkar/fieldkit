@@ -46,11 +46,13 @@ def get_filter_complex(cmd: list[str]) -> str:
 
 @pytest.fixture
 def mock_ffmpeg_ok():
-    """Patch subprocess.run to simulate a successful FFmpeg run."""
+    """Patch subprocess.run to simulate a successful FFmpeg run that writes non-empty output."""
+    def _run(cmd, **kwargs):
+        # Create a non-empty output file so the post-run size check in generate() passes.
+        Path(cmd[-1]).write_bytes(b"fake-video-content")
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with patch("tools.video_generator.subprocess.run") as mock:
-        mock.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
+        mock.side_effect = _run
         yield mock
 
 
@@ -236,7 +238,7 @@ def test_generate_returns_output_path(tmp_path, gen, mock_ffmpeg_ok):
 
 def test_generate_raises_on_nonzero_exit(tmp_path, gen, mock_ffmpeg_ok):
     """generate() raises VideoGenerationError when FFmpeg exits non-zero."""
-    mock_ffmpeg_ok.return_value = subprocess.CompletedProcess(
+    mock_ffmpeg_ok.side_effect = lambda cmd, **kw: subprocess.CompletedProcess(
         args=[], returncode=1, stdout="", stderr="some error"
     )
     with pytest.raises(VideoGenerationError):
@@ -245,8 +247,17 @@ def test_generate_raises_on_nonzero_exit(tmp_path, gen, mock_ffmpeg_ok):
 
 def test_generate_includes_stderr_in_error(tmp_path, gen, mock_ffmpeg_ok):
     """generate() includes FFmpeg stderr text in the VideoGenerationError message."""
-    mock_ffmpeg_ok.return_value = subprocess.CompletedProcess(
+    mock_ffmpeg_ok.side_effect = lambda cmd, **kw: subprocess.CompletedProcess(
         args=[], returncode=1, stdout="", stderr="codec not found"
     )
     with pytest.raises(VideoGenerationError, match="codec not found"):
+        gen.generate(make_photos(tmp_path, 2), VideoConfig(), tmp_path / "out.mp4")
+
+
+def test_generate_raises_on_empty_output(tmp_path, gen, mock_ffmpeg_ok):
+    """generate() raises VideoGenerationError when FFmpeg exits 0 but output is missing or empty."""
+    mock_ffmpeg_ok.side_effect = lambda cmd, **kw: subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Output file is empty, nothing was encoded"
+    )
+    with pytest.raises(VideoGenerationError, match="missing or empty"):
         gen.generate(make_photos(tmp_path, 2), VideoConfig(), tmp_path / "out.mp4")

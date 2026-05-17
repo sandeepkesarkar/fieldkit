@@ -65,6 +65,10 @@ class FFmpegVideoGenerator:
             logger.debug("FFmpeg stdout: %s", result.stdout)
         if result.returncode != 0:
             raise VideoGenerationError(f"FFmpeg exited {result.returncode}: {result.stderr}")
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise VideoGenerationError(
+                f"FFmpeg exited 0 but output is missing or empty — {result.stderr}"
+            )
         return output_path
 
 

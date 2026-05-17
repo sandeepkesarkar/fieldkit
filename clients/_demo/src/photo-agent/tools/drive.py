@@ -52,12 +52,18 @@ def _get_access_token() -> str:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"gws auth export returned invalid JSON: {exc}") from exc
     try:
+        client_id = creds["client_id"]
+        client_secret = creds["client_secret"]
+        refresh_token = creds["refresh_token"]
+    except KeyError as exc:
+        raise RuntimeError(f"gws auth export response missing expected key: {exc}") from exc
+    try:
         resp = requests.post(
             "https://oauth2.googleapis.com/token",
             data={
-                "client_id": creds["client_id"],
-                "client_secret": creds["client_secret"],
-                "refresh_token": creds["refresh_token"],
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
             },
             timeout=10,
@@ -136,8 +142,8 @@ def list_photos(folder_id: str) -> list[dict]:
         # Drive API returns size as a string; use "0" as default to keep types consistent.
         if int(f.get("size", "0")) == 0:
             logger.warning(
-                "Skipping zero-byte file: id=%s name=%s in folder_id=%s",
-                f.get("id"), f.get("name"), folder_id,
+                "Skipping zero-byte file: id=%s in folder_id=%s",
+                f.get("id"), folder_id,
             )
             continue
         results.append({"id": f["id"], "name": f["name"]})
@@ -154,7 +160,7 @@ def download(file_id: str, output_path: Path) -> None:
     via the CLI (files.get?alt=media is rejected by the gws CLI layer).
     """
     if output_path.exists():
-        logger.warning("download: output_path already exists and will be overwritten: %s", output_path)
+        logger.warning("download: file_id=%s — output already exists and will be overwritten", file_id)
     access_token = _get_access_token()
     try:
         resp = requests.get(
