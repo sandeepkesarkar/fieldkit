@@ -85,7 +85,7 @@ def get_pending_approval() -> dict | None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with open(STATE_FILE, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            fcntl.flock(f, fcntl.LOCK_SH)
             try:
                 data = _read(f)
                 record = data.get("pending_approval")
@@ -139,7 +139,7 @@ def get_telegram_offset() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with open(STATE_FILE, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            fcntl.flock(f, fcntl.LOCK_SH)
             try:
                 data = _read(f)
                 offset = data.get("telegram_update_offset", 0)

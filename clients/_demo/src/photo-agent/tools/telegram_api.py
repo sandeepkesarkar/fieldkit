@@ -73,7 +73,7 @@ def send_message_with_buttons(
     payload: dict = {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-    logger.debug("send_message_with_buttons: chat_id=%s", chat_id)
+    logger.debug("send_message_with_buttons: sending")
     try:
         response = requests.post(
             _url("sendMessage"),
@@ -87,7 +87,7 @@ def send_message_with_buttons(
         message_id: int = data["result"]["message_id"]
     except (KeyError, TypeError) as exc:
         raise RuntimeError(f"Telegram response missing message_id: {data!r}") from exc
-    logger.info("send_message_with_buttons: chat_id=%s message_id=%d", chat_id, message_id)
+    logger.info("send_message_with_buttons: message_id=%d", message_id)
     return message_id
 
 
@@ -103,7 +103,7 @@ def answer_callback_query(callback_query_id: str) -> None:
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"Telegram request failed: {exc}") from exc
     _check(response)
-    logger.info("answer_callback_query: callback_query_id=%s", callback_query_id)
+    logger.debug("answer_callback_query: ok")
 
 
 def get_updates(offset: int) -> list[dict]:
