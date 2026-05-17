@@ -108,10 +108,14 @@ def _build_multi_photo_cmd(photos: list[Path], config: VideoConfig, output_path:
     n = len(photos)
     spp = config.seconds_per_photo
     xfade = config.crossfade_duration
+    # Each still-image input needs -loop 1 and -t so FFmpeg generates enough
+    # frames for the xfade chain. spp + xfade gives the right-side input of
+    # each transition a sufficient buffer of frames.
+    input_duration = spp + xfade
 
     cmd = ["ffmpeg"]
     for photo in photos:
-        cmd += ["-i", str(photo)]
+        cmd += ["-loop", "1", "-t", f"{input_duration:g}", "-i", str(photo)]
 
     # Per-photo scale/crop filters
     filters = [_scale_crop_filter(i, config) for i in range(n)]

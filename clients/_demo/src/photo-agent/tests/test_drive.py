@@ -173,21 +173,65 @@ def test_list_photos_nonzero_exit_raises_runtime_error(mock_gws):
 # download
 # ---------------------------------------------------------------------------
 
-def test_download_passes_output_flag(mock_gws, tmp_path):
-    """download() passes --fileId and --output with the correct path."""
-    mock_gws.return_value = _gws_ok("")
+_FAKE_CREDS = json.dumps({
+    "client_id": "cid", "client_secret": "csecret",
+    "refresh_token": "rtoken", "type": "authorized_user",
+})
+
+
+def test_download_writes_content_to_output_path(mock_gws, tmp_path):
+    """download() fetches file content from Drive REST API and writes it to output_path."""
+    mock_gws.return_value = _gws_ok(_FAKE_CREDS)
     output = tmp_path / "photo.jpg"
-    download("file_abc", output)
-    cmd = mock_gws.call_args.args[0]
-    assert "--fileId" in cmd and cmd[cmd.index("--fileId") + 1] == "file_abc"
-    assert "--output" in cmd and cmd[cmd.index("--output") + 1] == str(output)
+    fake_bytes = b"\xff\xd8\xff" * 16
+
+    with patch("tools.drive.requests.post") as mock_post, \
+         patch("tools.drive.requests.get") as mock_get:
+        mock_post.return_value.ok = True
+        mock_post.return_value.json.return_value = {"access_token": "tok123"}
+        mock_get.return_value.ok = True
+        mock_get.return_value.iter_content.return_value = [fake_bytes]
+        download("file_abc", output)
+
+    assert output.read_bytes() == fake_bytes
 
 
-def test_download_nonzero_exit_raises_runtime_error(mock_gws, tmp_path):
-    """download() raises RuntimeError on non-zero gws exit."""
-    mock_gws.return_value = _gws_fail()
-    with pytest.raises(RuntimeError, match="gws exited"):
+def test_download_calls_drive_api_with_correct_file_id(mock_gws, tmp_path):
+    """download() calls the Drive REST API URL containing the correct file_id."""
+    mock_gws.return_value = _gws_ok(_FAKE_CREDS)
+
+    with patch("tools.drive.requests.post") as mock_post, \
+         patch("tools.drive.requests.get") as mock_get:
+        mock_post.return_value.ok = True
+        mock_post.return_value.json.return_value = {"access_token": "tok"}
+        mock_get.return_value.ok = True
+        mock_get.return_value.iter_content.return_value = [b"data"]
         download("file_abc", tmp_path / "out.jpg")
+
+    url = mock_get.call_args.args[0]
+    assert "file_abc" in url
+    assert mock_get.call_args.kwargs.get("params", {}).get("alt") == "media"
+
+
+def test_download_raises_on_auth_export_failure(mock_gws, tmp_path):
+    """download() raises RuntimeError when gws auth export fails."""
+    mock_gws.return_value = _gws_fail("keyring error")
+    with pytest.raises(RuntimeError, match="gws auth export failed"):
+        download("file_abc", tmp_path / "out.jpg")
+
+
+def test_download_raises_on_http_error(mock_gws, tmp_path):
+    """download() raises RuntimeError when the Drive REST API returns an error."""
+    mock_gws.return_value = _gws_ok(_FAKE_CREDS)
+
+    with patch("tools.drive.requests.post") as mock_post, \
+         patch("tools.drive.requests.get") as mock_get:
+        mock_post.return_value.ok = True
+        mock_post.return_value.json.return_value = {"access_token": "tok"}
+        mock_get.return_value.ok = False
+        mock_get.return_value.status_code = 403
+        with pytest.raises(RuntimeError, match="Drive download failed"):
+            download("file_abc", tmp_path / "out.jpg")
 
 
 # ---------------------------------------------------------------------------
@@ -236,11 +280,12 @@ def test_upload_nonzero_exit_raises_runtime_error(mock_gws, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_delete_passes_file_id(mock_gws):
-    """delete() passes the correct --fileId to the gws command."""
+    """delete() passes the correct fileId in --params to the gws command."""
     mock_gws.return_value = _gws_ok("")
     delete("file_to_delete")
     cmd = mock_gws.call_args.args[0]
-    assert "--fileId" in cmd and cmd[cmd.index("--fileId") + 1] == "file_to_delete"
+    params_str = cmd[cmd.index("--params") + 1]
+    assert json.loads(params_str)["fileId"] == "file_to_delete"
 
 
 def test_delete_nonzero_exit_raises_runtime_error(mock_gws):

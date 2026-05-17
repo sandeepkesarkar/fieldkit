@@ -117,6 +117,22 @@ def test_n1_maps_v0_not_xout(tmp_path, gen, mock_ffmpeg_ok):
 # N=2
 # ---------------------------------------------------------------------------
 
+def test_n2_includes_loop_and_t_flag_per_input(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2, each input has -loop 1 and -t before it (still images need looping)."""
+    cfg = VideoConfig()
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    loop_indices = [i for i, v in enumerate(cmd) if v == "-loop"]
+    assert len(loop_indices) == 2, "Expected -loop flag for each of the 2 inputs"
+    for idx in loop_indices:
+        assert cmd[idx + 1] == "1"
+    t_indices = [i for i, v in enumerate(cmd) if v == "-t"]
+    assert len(t_indices) == 2, "Expected -t flag for each of the 2 inputs"
+    expected_t = f"{cfg.seconds_per_photo + cfg.crossfade_duration:g}"
+    for idx in t_indices:
+        assert cmd[idx + 1] == expected_t
+
+
 def test_n2_one_xfade(tmp_path, gen, mock_ffmpeg_ok):
     """For N=2, the filter_complex contains exactly one xfade filter."""
     gen.generate(make_photos(tmp_path, 2), VideoConfig(), tmp_path / "out.mp4")
