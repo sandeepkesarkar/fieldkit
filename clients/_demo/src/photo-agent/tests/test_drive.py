@@ -98,6 +98,25 @@ def test_find_folder_nonzero_exit_raises_runtime_error(mock_gws):
         find_folder("project", "parent")
 
 
+def test_find_folder_rejects_unsafe_name(mock_gws):
+    """find_folder() raises ValueError when the folder name contains query-unsafe characters."""
+    with pytest.raises(ValueError, match="unsafe folder name"):
+        find_folder('bad"name', "parent")
+    mock_gws.assert_not_called()
+
+
+def test_find_folder_warns_on_multiple_results(mock_gws, caplog):
+    """find_folder() logs a warning and returns the first result when multiple folders match."""
+    import logging
+    mock_gws.return_value = _gws_ok(_folder_response([
+        {"id": "folder_a"}, {"id": "folder_b"},
+    ]))
+    with caplog.at_level(logging.WARNING, logger="tools.drive"):
+        result = find_folder("my_project", "parent")
+    assert result == "folder_a"
+    assert "folders named" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # list_photos
 # ---------------------------------------------------------------------------

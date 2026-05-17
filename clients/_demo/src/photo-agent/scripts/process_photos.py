@@ -27,6 +27,11 @@ from typing import NoReturn
 
 from dotenv import load_dotenv
 
+# Must be called before any FieldKit module import: state.py and logger.py compute
+# DATA_DIR/LOG_DIR as module-level constants at import time, so FIELDKIT_DATA_DIR
+# and FIELDKIT_LOG_DIR in .env only take effect if os.environ is populated first.
+load_dotenv(Path(__file__).parents[1] / ".env")
+
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from tools import drive, state
@@ -48,7 +53,7 @@ _PHOTO_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 
 
 def _load_env() -> None:
-    load_dotenv(_PHOTO_AGENT_DIR / ".env")
+    pass  # .env already loaded at module import time (before FieldKit module imports)
 
 
 def _telegram_error(message: str) -> NoReturn:
@@ -184,13 +189,26 @@ def main(argv=None) -> None:
         except OSError as exc:
             _telegram_error(f"❌ {project_name}: failed to prepare temp directory — {exc}")
 
-        # Download photos
-        local_photos: list[Path] = []
+        # Validate all filenames upfront before downloading — catches duplicates and
+        # unsafe names without starting any downloads.
+        safe_names: list[str] = []
+        seen_names: set[str] = set()
         for meta in photos_meta:
             try:
                 safe_name = _safe_filename(meta["name"])
             except ValueError as exc:
                 _telegram_error(f"❌ {project_name}: {exc}")
+            if safe_name in seen_names:
+                _telegram_error(
+                    f"❌ {project_name}: duplicate photo filename in Drive folder — "
+                    "rename or remove the duplicate and re-trigger."
+                )
+            seen_names.add(safe_name)
+            safe_names.append(safe_name)
+
+        # Download photos
+        local_photos: list[Path] = []
+        for meta, safe_name in zip(photos_meta, safe_names):
             local_path = project_tmp / safe_name
             try:
                 drive.download(meta["id"], local_path)

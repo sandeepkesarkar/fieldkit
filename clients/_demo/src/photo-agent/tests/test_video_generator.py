@@ -63,7 +63,7 @@ def gen():
 
 
 # ---------------------------------------------------------------------------
-# VideoConfig defaults
+# VideoConfig defaults and validation
 # ---------------------------------------------------------------------------
 
 def test_videoconfig_defaults():
@@ -75,6 +75,20 @@ def test_videoconfig_defaults():
     assert cfg.seconds_per_photo == 4
     assert cfg.crossfade_duration == 0.5
     assert cfg.bitrate == "3M"
+
+
+def test_videoconfig_rejects_negative_crossfade():
+    """VideoConfig raises ValueError when crossfade_duration is negative."""
+    with pytest.raises(ValueError, match="crossfade_duration"):
+        VideoConfig(crossfade_duration=-0.1)
+
+
+def test_videoconfig_rejects_crossfade_gte_spp():
+    """VideoConfig raises ValueError when crossfade_duration >= seconds_per_photo."""
+    with pytest.raises(ValueError, match="crossfade_duration"):
+        VideoConfig(seconds_per_photo=4, crossfade_duration=4.0)
+    with pytest.raises(ValueError, match="crossfade_duration"):
+        VideoConfig(seconds_per_photo=4, crossfade_duration=5.0)
 
 
 # ---------------------------------------------------------------------------

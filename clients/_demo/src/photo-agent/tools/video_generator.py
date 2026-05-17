@@ -29,6 +29,15 @@ class VideoConfig:
     crossfade_duration: float = 0.5
     bitrate: str = "3M"
 
+    def __post_init__(self) -> None:
+        if self.crossfade_duration < 0:
+            raise ValueError(f"crossfade_duration must be >= 0, got {self.crossfade_duration}")
+        if self.crossfade_duration >= self.seconds_per_photo:
+            raise ValueError(
+                f"crossfade_duration ({self.crossfade_duration}) must be less than "
+                f"seconds_per_photo ({self.seconds_per_photo}) — xfade offsets would be <= 0"
+            )
+
 
 class VideoGenerationError(Exception):
     """Raised when FFmpeg exits with a non-zero return code."""

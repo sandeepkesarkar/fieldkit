@@ -20,6 +20,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Must be called before any FieldKit module import: state.py and logger.py compute
+# DATA_DIR/LOG_DIR as module-level constants at import time, so FIELDKIT_DATA_DIR
+# and FIELDKIT_LOG_DIR in .env only take effect if os.environ is populated first.
+load_dotenv(Path(__file__).parents[1] / ".env")
+
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from tools import drive, state
@@ -32,8 +37,7 @@ _REPO_ROOT = Path(__file__).parents[5]
 
 
 def _load_env() -> None:
-    """Load environment variables from the .env file in the photo-agent directory."""
-    load_dotenv(_PHOTO_AGENT_DIR / ".env")
+    pass  # .env already loaded at module import time (before FieldKit module imports)
 
 
 def _openclaw_send(message: str) -> None:

@@ -29,9 +29,10 @@ If either check fails, report the error and stop. Otherwise run:
 
 ```bash
 cd ~/src/fieldkit/clients/_demo/src/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
-timeout 300 python3 scripts/process_photos.py --project "<extracted_project_name>" 2>&1
+timeout 660 python3 scripts/process_photos.py --project "<extracted_project_name>" 2>&1
 ```
 
 Do not access Drive or generate the video yourself.
-If the exit code is non-zero (including 124 for timeout), report it as an error: "Script failed (exit <code>): <output>"
+If the exit code is 124, report: "⏱️ Video generation timed out — try with fewer photos."
+If the exit code is non-zero (and not 124), report it as an error: "Script failed (exit <code>): <output>"
 Otherwise relay the output verbatim to the user. Do not summarise or paraphrase.

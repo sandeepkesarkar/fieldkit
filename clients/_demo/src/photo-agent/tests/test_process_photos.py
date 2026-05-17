@@ -245,6 +245,24 @@ def test_invalid_photo_filename_exits(base):
     mock_err.assert_called_once()
 
 
+def test_duplicate_photo_filename_exits(base):
+    """Duplicate photo filenames in Drive send a Telegram error and exit."""
+    base.patch("scripts.process_photos.drive.find_folder", return_value="folder_id")
+    base.patch(
+        "scripts.process_photos.drive.list_photos",
+        return_value=[
+            {"id": "f1", "name": "photo01.jpg"},
+            {"id": "f2", "name": "photo01.jpg"},  # duplicate
+        ],
+    )
+    mock_err = base.patch(
+        "scripts.process_photos._telegram_error", side_effect=SystemExit(1)
+    )
+    with pytest.raises(SystemExit):
+        main(["--project", _PROJECT])
+    assert "duplicate" in mock_err.call_args.args[0].lower()
+
+
 # ---------------------------------------------------------------------------
 # Download failure
 # ---------------------------------------------------------------------------

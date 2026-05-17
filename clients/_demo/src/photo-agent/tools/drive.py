@@ -12,6 +12,7 @@ Raises RuntimeError on non-zero gws exit, HTTP error, or malformed JSON.
 
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -88,11 +89,17 @@ def _run_gws(cmd: list[str]) -> str:
     return result.stdout
 
 
+_SAFE_FOLDER_NAME_RE = re.compile(r'^[A-Za-z0-9_\- ]+$')
+
+
 def find_folder(name: str, parent_id: str) -> str:
     """Return the Drive folder ID matching name under parent_id.
 
     Raises DriveFolderNotFoundError if no matching folder is found.
+    Raises ValueError if name contains characters that would corrupt the Drive query.
     """
+    if not _SAFE_FOLDER_NAME_RE.match(name):
+        raise ValueError(f"find_folder: unsafe folder name: {name!r}")
     params = json.dumps({
         "q": (
             f'name="{name}" and "{parent_id}" in parents'
@@ -111,6 +118,11 @@ def find_folder(name: str, parent_id: str) -> str:
             f"Drive folder not found: {name!r} under parent {parent_id!r}",
             name=name,
             parent_id=parent_id,
+        )
+    if len(files) > 1:
+        logger.warning(
+            "find_folder: %d folders named %r under parent %s — using first",
+            len(files), name, parent_id,
         )
     try:
         folder_id = files[0]["id"]
