@@ -1,0 +1,86 @@
+"""
+Telegram Bot API wrapper for the photo-video agent.
+
+Handles operations that OpenClaw's `message send` cannot perform:
+inline keyboards (reply_markup), callback dismissal, and update polling.
+
+Bot token is read from TELEGRAM_BOT_TOKEN in the environment.
+All functions raise RuntimeError on HTTP error or non-OK Telegram response.
+"""
+
+import logging
+import os
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+def _token() -> str:
+    """Return the bot token from the environment. Raises RuntimeError if unset."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    return token
+
+
+def _url(method: str) -> str:
+    return f"https://api.telegram.org/bot{_token()}/{method}"
+
+
+def _check(response: requests.Response) -> dict:
+    """Raise RuntimeError on HTTP error or Telegram ok:false."""
+    if not response.ok:
+        raise RuntimeError(f"Telegram HTTP error {response.status_code}")
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data.get('description', 'unknown')}")
+    return data
+
+
+def send_message_with_buttons(chat_id: str, text: str, buttons: list[tuple[str, str]]) -> int:
+    """Send a message with an inline keyboard. Returns the Telegram message_id.
+
+    buttons is a list of (label, callback_data) pairs rendered as a single keyboard row.
+    """
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": cb} for label, cb in buttons]
+        ]
+    }
+    logger.debug("send_message_with_buttons: chat_id=%s", chat_id)
+    response = requests.post(
+        _url("sendMessage"),
+        json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
+        timeout=10,
+    )
+    data = _check(response)
+    message_id: int = data["result"]["message_id"]
+    logger.info("send_message_with_buttons: chat_id=%s message_id=%d", chat_id, message_id)
+    return message_id
+
+
+def answer_callback_query(callback_query_id: str) -> None:
+    """Dismiss the spinner on the admin's button tap."""
+    logger.debug("answer_callback_query: callback_query_id=%s", callback_query_id)
+    response = requests.post(
+        _url("answerCallbackQuery"),
+        json={"callback_query_id": callback_query_id},
+        timeout=10,
+    )
+    _check(response)
+    logger.info("answer_callback_query: callback_query_id=%s", callback_query_id)
+
+
+def get_updates(offset: int) -> list[dict]:
+    """Poll getUpdates with the given offset. Returns the raw list of update objects."""
+    logger.debug("get_updates: offset=%d", offset)
+    response = requests.get(
+        _url("getUpdates"),
+        params={"offset": offset, "timeout": 0},
+        timeout=10,
+    )
+    data = _check(response)
+    updates: list[dict] = data.get("result", [])
+    logger.info("get_updates: offset=%d count=%d", offset, len(updates))
+    return updates
