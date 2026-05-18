@@ -183,26 +183,32 @@ def main(argv=None) -> None:
     agent_email = os.environ.get("AGENT_EMAIL", "")
     admin_email = os.environ.get("ADMIN_EMAIL", "")
 
-    # Direct path: OpenClaw passes callback data as CLI args, bypassing getUpdates.
-    # This is needed because OpenClaw's internal Telegram polling consumes the
-    # callback_query update before the cron's getUpdates call can see it.
-    direct = (
-        args.callback_query_id is not None
-        and args.callback_data is not None
-        and args.message_id is not None
-    )
+    # Direct path: OpenClaw passes --callback-data approve|reject, bypassing getUpdates.
+    # OpenClaw's internal Telegram polling consumes the callback_query update before the
+    # cron's getUpdates call can see it, so we rely on OpenClaw knowing the button label.
+    # --callback-query-id and --message-id are optional extras; --callback-data alone suffices.
+    direct = args.callback_data is not None
 
     if direct:
-        if args.message_id != telegram_message_id:
+        callback_data = args.callback_data
+        new_offset = None  # OpenClaw manages its own offset
+
+        # Verify message_id if provided — guards against stale direct invocations.
+        if args.message_id is not None and args.message_id != telegram_message_id:
             _log.warning(
                 "direct callback message_id=%d does not match pending approval message_id=%d — ignoring",
                 args.message_id,
                 telegram_message_id,
             )
             return
-        callback_query_id = args.callback_query_id
-        callback_data = args.callback_data
-        new_offset = None  # OpenClaw manages its own offset
+
+        # Best-effort spinner dismissal. Failure is non-fatal: Telegram auto-clears after ~10s.
+        if args.callback_query_id:
+            try:
+                telegram_api.answer_callback_query(args.callback_query_id)
+            except RuntimeError as exc:
+                _log.warning("answer_callback_query failed (non-fatal on direct path): %s", exc)
+
     else:
         # Cron path: poll getUpdates for the callback.
         offset = state.get_telegram_offset()
@@ -229,15 +235,14 @@ def main(argv=None) -> None:
         callback_query_id = cq["id"]
         callback_data = cq.get("data", "")
 
-    # Dismiss the spinner first — per spec, before any email or Telegram message.
-    # On failure: advance offset (cron path) so this callback is not reprocessed; leave state intact.
-    try:
-        telegram_api.answer_callback_query(callback_query_id)
-    except RuntimeError as exc:
-        _log.error("answer_callback_query failed: %s", exc)
-        if new_offset is not None:
+        # Dismiss the spinner before any email or Telegram message.
+        # On failure: advance offset so this callback is not reprocessed; leave state intact.
+        try:
+            telegram_api.answer_callback_query(callback_query_id)
+        except RuntimeError as exc:
+            _log.error("answer_callback_query failed: %s", exc)
             state.set_telegram_offset(new_offset)
-        return
+            return
 
     if callback_data == "approve":
         email_sent = False

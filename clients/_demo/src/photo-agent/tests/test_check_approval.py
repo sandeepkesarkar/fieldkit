@@ -617,21 +617,71 @@ def test_direct_path_wrong_message_id_returns_early(base):
     ca.state.clear_pending_approval.assert_not_called()
 
 
-def test_direct_path_answer_failure_does_not_clear_state(base):
-    """If answer_callback_query fails on direct path, state is not cleared."""
+def test_direct_path_answer_failure_is_nonfatal(base):
+    """answer_callback_query failure on direct path is a warning — approval still proceeds."""
     import scripts.check_approval as ca
     ca.telegram_api.answer_callback_query.side_effect = RuntimeError("timeout")
     main(_DIRECT_ARGS)
-    ca.state.clear_pending_approval.assert_not_called()
-    ca._send_approval_email.assert_not_called()
+    ca.state.clear_pending_approval.assert_called_once()
+    ca._send_approval_email.assert_called_once()
 
 
 def test_direct_path_answer_failure_does_not_set_offset(base):
-    """If answer_callback_query fails on direct path, offset is not touched."""
+    """Even when answer_callback_query fails, the direct path does not touch the offset."""
     import scripts.check_approval as ca
     ca.telegram_api.answer_callback_query.side_effect = RuntimeError("timeout")
     main(_DIRECT_ARGS)
     ca.state.set_telegram_offset.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Direct path — callback-data only (no callback-query-id or message-id)
+# ---------------------------------------------------------------------------
+
+_DATA_ONLY_APPROVE = ["--callback-data", "approve"]
+_DATA_ONLY_REJECT = ["--callback-data", "reject"]
+
+
+def test_data_only_does_not_call_get_updates(base):
+    """--callback-data alone bypasses getUpdates."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_APPROVE)
+    ca.telegram_api.get_updates.assert_not_called()
+
+
+def test_data_only_does_not_call_answer_callback_query(base):
+    """--callback-data alone skips answer_callback_query (no ID available; spinner auto-clears)."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_APPROVE)
+    ca.telegram_api.answer_callback_query.assert_not_called()
+
+
+def test_data_only_approve_sends_email(base):
+    """--callback-data approve sends the approval email."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_APPROVE)
+    ca._send_approval_email.assert_called_once()
+
+
+def test_data_only_approve_clears_state(base):
+    """--callback-data approve clears the pending approval."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_APPROVE)
+    ca.state.clear_pending_approval.assert_called_once()
+
+
+def test_data_only_approve_does_not_set_offset(base):
+    """--callback-data approve does not touch the Telegram offset."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_APPROVE)
+    ca.state.set_telegram_offset.assert_not_called()
+
+
+def test_data_only_reject_deletes_drive_file(base):
+    """--callback-data reject calls drive.delete."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_REJECT)
+    ca.drive.delete.assert_called_once_with(_PENDING["drive_video_file_id"])
 
 
 # ---------------------------------------------------------------------------
