@@ -48,12 +48,12 @@ def _load_env() -> None:
 
 def _openclaw_send(message: str) -> None:
     """Send a plain-text message via openclaw. Failures are logged but not raised."""
+    chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
+    cmd = ["openclaw", "message", "send", "--channel", "telegram", "-m", message]
+    if chat_id:
+        cmd.extend(["--target", chat_id])
     try:
-        result = subprocess.run(
-            ["openclaw", "message", "send", "--channel", "telegram", message],
-            check=False,
-            timeout=30,
-        )
+        result = subprocess.run(cmd, check=False, timeout=30)
         if result.returncode != 0:
             _log.warning("openclaw exited %d while sending message", result.returncode)
     except (subprocess.TimeoutExpired, OSError) as exc:
