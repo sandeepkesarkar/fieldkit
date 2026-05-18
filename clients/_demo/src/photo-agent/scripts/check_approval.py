@@ -2,21 +2,27 @@
 check_approval.py — Poll Telegram for admin approval/rejection and process it.
 
 Usage:
-    python3 scripts/check_approval.py
-    python3 scripts/check_approval.py --source cron
+    python3 scripts/check_approval.py                        # cron path
+    python3 scripts/check_approval.py --source cron          # cron with source label
+    python3 scripts/check_approval.py --callback-query-id <id> --callback-data approve --message-id <msg_id>
 
-Reads data/photo-agent/state.json for a pending approval record. If present,
-polls Telegram getUpdates for a callback_query matching the pending message ID.
-Dispatches approve (email + confirmation) or reject (Drive delete + notification).
-Exits immediately and silently if no approval is pending.
+Cron path: reads state.json for a pending approval, polls Telegram getUpdates for
+a callback_query matching the pending message_id, dispatches approve or reject.
+
+Direct path: when OpenClaw receives a button callback and passes the data as CLI
+args, getUpdates is bypassed entirely (OpenClaw already consumed the update).
 """
 
 import argparse
+import base64
+import email.mime.text
 import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import requests
 
 from dotenv import load_dotenv
 
@@ -55,31 +61,35 @@ def _openclaw_send(message: str) -> None:
 
 
 def _send_approval_email(agent_email: str, admin_email: str, project_name: str, folder_link: str) -> None:
-    """Send the approval email via gws gmail. Raises RuntimeError on failure."""
+    """Send the approval email via Gmail REST API. Raises RuntimeError on failure."""
     subject = f"FieldKit — {project_name} approved"
     body = (
         f"The video for project {project_name} has been approved.\n\n"
         f"View folder: {folder_link}"
     )
+    msg = email.mime.text.MIMEText(body)
+    msg["to"] = admin_email
+    msg["from"] = agent_email
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
     try:
-        result = subprocess.run(
-            [
-                "gws", "gmail", "+send",
-                "--from", agent_email,
-                "--to", admin_email,
-                "--subject", subject,
-                "--body", body,
-            ],
-            capture_output=True,
-            text=True,
+        access_token = drive._get_access_token()
+    except RuntimeError as exc:
+        raise RuntimeError(f"Failed to get Gmail access token: {exc}") from exc
+
+    try:
+        resp = requests.post(
+            "https://www.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"raw": raw},
             timeout=30,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("gws gmail +send timed out") from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gws gmail +send exited {result.returncode}: {result.stderr.strip()}"
-        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Gmail send request failed: {exc}") from exc
+
+    if not resp.ok:
+        raise RuntimeError(f"Gmail send failed: HTTP {resp.status_code}")
     _log.info("approval email sent: project=%s", project_name)
 
 
@@ -134,6 +144,25 @@ def main(argv=None) -> None:
         default=None,
         help="Invocation source; 'cron' is informational (logged but does not change behaviour).",
     )
+    parser.add_argument(
+        "--callback-query-id",
+        default=None,
+        dest="callback_query_id",
+        help="Telegram callback_query.id (OpenClaw direct path — bypasses getUpdates).",
+    )
+    parser.add_argument(
+        "--callback-data",
+        default=None,
+        dest="callback_data",
+        help="Telegram callback_query.data, 'approve' or 'reject' (OpenClaw direct path).",
+    )
+    parser.add_argument(
+        "--message-id",
+        type=int,
+        default=None,
+        dest="message_id",
+        help="Telegram message_id of the approval message (OpenClaw direct path).",
+    )
     args = parser.parse_args(argv)
     if args.source:
         _log.debug("invoked from source=%s", args.source)
@@ -154,37 +183,60 @@ def main(argv=None) -> None:
     agent_email = os.environ.get("AGENT_EMAIL", "")
     admin_email = os.environ.get("ADMIN_EMAIL", "")
 
-    offset = state.get_telegram_offset()
+    # Direct path: OpenClaw passes callback data as CLI args, bypassing getUpdates.
+    # This is needed because OpenClaw's internal Telegram polling consumes the
+    # callback_query update before the cron's getUpdates call can see it.
+    direct = (
+        args.callback_query_id is not None
+        and args.callback_data is not None
+        and args.message_id is not None
+    )
 
-    try:
-        updates = telegram_api.get_updates(offset)
-    except RuntimeError as exc:
-        _log.error("get_updates failed — retrying on next run: %s", exc)
-        return
+    if direct:
+        if args.message_id != telegram_message_id:
+            _log.warning(
+                "direct callback message_id=%d does not match pending approval message_id=%d — ignoring",
+                args.message_id,
+                telegram_message_id,
+            )
+            return
+        callback_query_id = args.callback_query_id
+        callback_data = args.callback_data
+        new_offset = None  # OpenClaw manages its own offset
+    else:
+        # Cron path: poll getUpdates for the callback.
+        offset = state.get_telegram_offset()
 
-    new_offset = max(u["update_id"] for u in updates) + 1 if updates else offset
+        try:
+            updates = telegram_api.get_updates(offset)
+        except RuntimeError as exc:
+            _log.error("get_updates failed — retrying on next run: %s", exc)
+            return
 
-    match = _find_matching_callback(updates, telegram_message_id)
-    if match is None:
-        _log.debug(
-            "no matching callback for message_id=%d — advancing offset to %d",
-            telegram_message_id,
-            new_offset,
-        )
-        state.set_telegram_offset(new_offset)
-        return
+        new_offset = max(u["update_id"] for u in updates) + 1 if updates else offset
 
-    cq = match["callback_query"]
-    callback_query_id = cq["id"]
-    callback_data = cq.get("data", "")
+        match = _find_matching_callback(updates, telegram_message_id)
+        if match is None:
+            _log.debug(
+                "no matching callback for message_id=%d — advancing offset to %d",
+                telegram_message_id,
+                new_offset,
+            )
+            state.set_telegram_offset(new_offset)
+            return
+
+        cq = match["callback_query"]
+        callback_query_id = cq["id"]
+        callback_data = cq.get("data", "")
 
     # Dismiss the spinner first — per spec, before any email or Telegram message.
-    # On failure: advance offset so this callback is not reprocessed; leave state intact.
+    # On failure: advance offset (cron path) so this callback is not reprocessed; leave state intact.
     try:
         telegram_api.answer_callback_query(callback_query_id)
     except RuntimeError as exc:
         _log.error("answer_callback_query failed: %s", exc)
-        state.set_telegram_offset(new_offset)
+        if new_offset is not None:
+            state.set_telegram_offset(new_offset)
         return
 
     if callback_data == "approve":
@@ -231,22 +283,24 @@ def main(argv=None) -> None:
         activity_log.log_rejected(project_name)
 
     else:
-        # Unknown callback_data: advance offset so this update is not reprocessed,
-        # but leave the pending approval intact — the admin must re-tap.
+        # Unknown callback_data: advance offset (cron path) so this update is not
+        # reprocessed, but leave the pending approval intact — the admin must re-tap.
         _log.warning(
             "unexpected callback_data=%r for project=%s — ignoring",
             callback_data,
             project_name,
         )
-        state.set_telegram_offset(new_offset)
+        if new_offset is not None:
+            state.set_telegram_offset(new_offset)
         return
 
     # Runs only on the approve/reject paths.
-    # try/finally ensures offset advances even if clear_pending_approval raises.
+    # try/finally ensures offset advances (cron path) even if clear_pending_approval raises.
     try:
         state.clear_pending_approval()
     finally:
-        state.set_telegram_offset(new_offset)
+        if new_offset is not None:
+            state.set_telegram_offset(new_offset)
 
 
 if __name__ == "__main__":
