@@ -1,19 +1,25 @@
 """
 Google Drive wrapper for the photo-video agent.
 
-Most operations are thin wrappers around `gws drive` CLI subcommands.
-Downloads call the Drive REST API directly via requests because gws 0.22.5
-does not support binary file downloads (files.get?alt=media is rejected by
-the gws CLI). _get_access_token() exchanges the gws refresh token for a
-short-lived access token using the standard OAuth2 token endpoint.
+All Drive operations call the Drive REST API directly via requests. No gws CLI
+calls are made at runtime — gws is only needed once to export credentials.
 
-Raises RuntimeError on non-zero gws exit, HTTP error, or malformed JSON.
+Credentials are read from ~/.config/gws/user_credentials.json (ADC format:
+client_id, client_secret, refresh_token). This file is created once via:
+    gws auth export 2>/dev/null | python3 -c "
+        import sys, json; raw = sys.stdin.read()
+        print(json.dumps(json.loads(raw[raw.find('{'):]), indent=2))
+    " > ~/.config/gws/user_credentials.json
+
+_get_access_token() exchanges the stored refresh_token for a short-lived
+access_token via the OAuth2 token endpoint on every call.
+
+Raises RuntimeError on HTTP error, missing credentials, or malformed JSON.
 """
 
 import json
 import logging
 import re
-import subprocess
 from pathlib import Path
 
 import requests
@@ -21,6 +27,11 @@ import requests
 logger = logging.getLogger(__name__)
 
 _PHOTO_MIME_TYPES = frozenset({"image/jpeg", "image/png"})
+_SAFE_FOLDER_NAME_RE = re.compile(r'^[A-Za-z0-9_\- ]+$')
+_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
+_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_DEFAULT_CREDS_FILE = Path("~/.config/gws/user_credentials.json").expanduser()
 
 
 class DriveFolderNotFoundError(RuntimeError):
@@ -32,35 +43,45 @@ class DriveFolderNotFoundError(RuntimeError):
         self.parent_id = parent_id
 
 
-def _get_access_token() -> str:
-    """Exchange the gws refresh token for a fresh Drive access token.
+def _load_credentials() -> dict:
+    """Load OAuth credentials from the user credentials file (ADC format).
 
-    Calls `gws auth export` to read stored credentials, then POSTs to the
-    Google OAuth2 token endpoint. Raises RuntimeError on any failure.
+    Reads from ~/.config/gws/user_credentials.json by default. Override the
+    path with the GOOGLE_USER_CREDENTIALS_FILE environment variable.
     """
-    result = subprocess.run(
-        ["gws", "auth", "export"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gws auth export failed: {result.stderr.strip()}")
-    raw = result.stdout
-    json_start = raw.find("{")
-    if json_start == -1:
-        raise RuntimeError("gws auth export returned no JSON")
+    import os
+    creds_path_raw = os.environ.get("GOOGLE_USER_CREDENTIALS_FILE", "")
+    creds_path = Path(creds_path_raw).expanduser() if creds_path_raw else _DEFAULT_CREDS_FILE
+    if not creds_path.exists():
+        raise RuntimeError(
+            f"Drive credentials file not found: {creds_path}\n"
+            "Run: gws auth login -s drive,gmail && gws auth export 2>/dev/null | "
+            "python3 -c \"import sys,json; raw=sys.stdin.read(); "
+            "print(json.dumps(json.loads(raw[raw.find('{'):]), indent=2))\" "
+            f"> {creds_path}"
+        )
     try:
-        creds = json.loads(raw[json_start:])
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"gws auth export returned invalid JSON: {exc}") from exc
+        return json.loads(creds_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"Failed to read credentials file {creds_path}: {exc}") from exc
+
+
+def _get_access_token() -> str:
+    """Exchange the stored refresh token for a fresh Drive access token.
+
+    Reads credentials from the user credentials file — no gws process is spawned.
+    Raises RuntimeError on any failure.
+    """
+    creds = _load_credentials()
     try:
         client_id = creds["client_id"]
         client_secret = creds["client_secret"]
         refresh_token = creds["refresh_token"]
     except KeyError as exc:
-        raise RuntimeError(f"gws auth export response missing expected key: {exc}") from exc
+        raise RuntimeError(f"Credentials file missing expected key: {exc}") from exc
     try:
         resp = requests.post(
-            "https://oauth2.googleapis.com/token",
+            _TOKEN_URL,
             data={
                 "client_id": client_id,
                 "client_secret": client_secret,
@@ -79,17 +100,21 @@ def _get_access_token() -> str:
         raise RuntimeError(f"Token refresh response missing access_token: {exc}") from exc
 
 
-def _run_gws(cmd: list[str]) -> str:
-    """Run a gws command and return stdout. Raises RuntimeError on non-zero exit."""
-    logger.debug("Running gws command: %s", cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.debug("gws stderr: %s", result.stderr)
-        raise RuntimeError(f"gws exited {result.returncode}")
-    return result.stdout
-
-
-_SAFE_FOLDER_NAME_RE = re.compile(r'^[A-Za-z0-9_\- ]+$')
+def _drive_get(endpoint: str, params: dict) -> dict:
+    """GET request to the Drive v3 API. Raises RuntimeError on failure."""
+    access_token = _get_access_token()
+    try:
+        resp = requests.get(
+            endpoint,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive GET request failed: {exc}") from exc
+    if not resp.ok:
+        raise RuntimeError(f"Drive GET failed: HTTP {resp.status_code}")
+    return resp.json()
 
 
 def find_folder(name: str, parent_id: str) -> str:
@@ -100,7 +125,7 @@ def find_folder(name: str, parent_id: str) -> str:
     """
     if not _SAFE_FOLDER_NAME_RE.match(name):
         raise ValueError(f"find_folder: unsafe folder name: {name!r}")
-    params = json.dumps({
+    data = _drive_get(_DRIVE_FILES_URL, {
         "q": (
             f'name="{name}" and "{parent_id}" in parents'
             ' and mimeType="application/vnd.google-apps.folder"'
@@ -108,11 +133,7 @@ def find_folder(name: str, parent_id: str) -> str:
         ),
         "fields": "files(id)",
     })
-    output = _run_gws(["gws", "drive", "files", "list", "--params", params])
-    try:
-        files = json.loads(output).get("files", [])
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"gws returned invalid JSON: {e}") from e
+    files = data.get("files", [])
     if not files:
         raise DriveFolderNotFoundError(
             f"Drive folder not found: {name!r} under parent {parent_id!r}",
@@ -126,8 +147,8 @@ def find_folder(name: str, parent_id: str) -> str:
         )
     try:
         folder_id = files[0]["id"]
-    except KeyError as e:
-        raise RuntimeError(f"gws response missing expected key: {e}") from e
+    except KeyError as exc:
+        raise RuntimeError(f"Drive response missing expected key: {exc}") from exc
     logger.info("find_folder: name=%s folder_id=%s", name, folder_id)
     return folder_id
 
@@ -137,21 +158,16 @@ def list_photos(folder_id: str) -> list[dict]:
 
     Each entry is {"id": ..., "name": ...}. Only image/jpeg and image/png are returned.
     """
-    params = json.dumps({
+    data = _drive_get(_DRIVE_FILES_URL, {
         "q": f'"{folder_id}" in parents and trashed=false',
         "fields": "files(id,name,mimeType,size)",
     })
-    output = _run_gws(["gws", "drive", "files", "list", "--params", params])
-    try:
-        files = json.loads(output).get("files", [])
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"gws returned invalid JSON: {e}") from e
+    files = data.get("files", [])
 
     results = []
     for f in files:
         if f.get("mimeType") not in _PHOTO_MIME_TYPES:
             continue
-        # Drive API returns size as a string; use "0" as default to keep types consistent.
         if int(f.get("size", "0")) == 0:
             logger.warning(
                 "Skipping zero-byte file: id=%s in folder_id=%s",
@@ -166,17 +182,13 @@ def list_photos(folder_id: str) -> list[dict]:
 
 
 def download(file_id: str, output_path: Path) -> None:
-    """Download a Drive file by ID to output_path via the Drive REST API.
-
-    Uses requests directly because gws 0.22.5 does not support binary downloads
-    via the CLI (files.get?alt=media is rejected by the gws CLI layer).
-    """
+    """Download a Drive file by ID to output_path via the Drive REST API."""
     if output_path.exists():
         logger.warning("download: file_id=%s — output already exists and will be overwritten", file_id)
     access_token = _get_access_token()
     try:
         resp = requests.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            f"{_DRIVE_FILES_URL}/{file_id}",
             headers={"Authorization": f"Bearer {access_token}"},
             params={"alt": "media"},
             timeout=60,
@@ -194,27 +206,76 @@ def download(file_id: str, output_path: Path) -> None:
 
 
 def upload(local_path: Path, parent_id: str, name: str) -> str:
-    """Upload local_path to Drive under parent_id. Returns the new Drive file ID."""
+    """Upload local_path to Drive under parent_id using resumable upload.
+
+    Returns the new Drive file ID. Resumable upload handles files of any size.
+    """
     if not local_path.exists():
         raise FileNotFoundError(f"upload: local file not found: {local_path}")
-    output = _run_gws([
-        "gws", "drive", "+upload", str(local_path),
-        "--parent", parent_id,
-        "--name", name,
-    ])
+
+    access_token = _get_access_token()
+    metadata = json.dumps({"name": name, "parents": [parent_id]})
+
+    # Initiate the resumable upload session.
     try:
-        file_id = json.loads(output)["id"]
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"gws returned invalid JSON: {e}") from e
-    except KeyError as e:
-        raise RuntimeError(f"gws response missing expected key: {e}") from e
+        init_resp = requests.post(
+            f"{_DRIVE_UPLOAD_URL}?uploadType=resumable",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": "video/mp4",
+                "X-Upload-Content-Length": str(local_path.stat().st_size),
+            },
+            data=metadata,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive upload initiation failed: {exc}") from exc
+    if not init_resp.ok:
+        raise RuntimeError(f"Drive upload initiation failed: HTTP {init_resp.status_code}")
+
+    session_uri = init_resp.headers.get("Location")
+    if not session_uri:
+        raise RuntimeError("Drive upload initiation response missing Location header")
+
+    # Upload the file content.
+    try:
+        with open(local_path, "rb") as f:
+            upload_resp = requests.put(
+                session_uri,
+                headers={
+                    "Content-Length": str(local_path.stat().st_size),
+                },
+                data=f,
+                timeout=600,
+            )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive upload content transfer failed: {exc}") from exc
+    if not upload_resp.ok:
+        raise RuntimeError(f"Drive upload failed: HTTP {upload_resp.status_code}")
+
+    try:
+        file_id = upload_resp.json()["id"]
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"Drive upload response missing file id: {exc}") from exc
     logger.info("upload: name=%s file_id=%s", name, file_id)
     return file_id
 
 
 def delete(file_id: str) -> None:
     """Delete a Drive file by ID."""
-    _run_gws(["gws", "drive", "files", "delete", "--params", json.dumps({"fileId": file_id})])
+    access_token = _get_access_token()
+    try:
+        resp = requests.delete(
+            f"{_DRIVE_FILES_URL}/{file_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive delete request failed: {exc}") from exc
+    # 204 No Content is the success response for delete
+    if not resp.ok and resp.status_code != 204:
+        raise RuntimeError(f"Drive delete failed: HTTP {resp.status_code}")
     logger.info("delete: file_id=%s", file_id)
 
 
