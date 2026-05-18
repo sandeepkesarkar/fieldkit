@@ -293,9 +293,12 @@ def main(argv=None) -> None:
                 )
         else:
             _log.error("AGENT_EMAIL or ADMIN_EMAIL not set — approval email skipped")
-            activity_log.log_error(
-                project_name, "approve-email-config", "AGENT_EMAIL or ADMIN_EMAIL not set"
-            )
+            try:
+                activity_log.log_error(
+                    project_name, "approve-email-config", "AGENT_EMAIL or ADMIN_EMAIL not set"
+                )
+            except (ValueError, OSError) as exc:
+                _log.error("activity log failed: %s", exc)
             _openclaw_send(
                 f"⚠️ {project_name}: approved, but email not configured.\n"
                 f"View folder: {drive_folder_link}"
@@ -305,7 +308,10 @@ def main(argv=None) -> None:
             _openclaw_send(f"✅ Approved: {project_name}\nView folder: {drive_folder_link}")
 
         _delete_local_file(video_local_path, project_name)
-        activity_log.log_approved(project_name)
+        try:
+            activity_log.log_approved(project_name)
+        except (ValueError, OSError) as exc:
+            _log.error("activity log failed after approval: %s", exc)
 
     elif callback_data == "reject":
         # Drive delete is best-effort — failure is logged but does not block the rejection.
@@ -313,14 +319,20 @@ def main(argv=None) -> None:
             drive.delete(drive_video_file_id)
         except RuntimeError as exc:
             _log.error("Drive delete failed for file_id=%s: %s", drive_video_file_id, exc)
-            activity_log.log_error(project_name, "drive-delete", str(exc))
+            try:
+                activity_log.log_error(project_name, "drive-delete", str(exc))
+            except (ValueError, OSError) as log_exc:
+                _log.error("activity log failed after drive-delete error: %s", log_exc)
 
         _delete_local_file(video_local_path, project_name)
         _openclaw_send(
             f"❌ Rejected: {project_name}\n"
             "Update the photos in Drive and re-trigger /process_photos."
         )
-        activity_log.log_rejected(project_name)
+        try:
+            activity_log.log_rejected(project_name)
+        except (ValueError, OSError) as exc:
+            _log.error("activity log failed after rejection: %s", exc)
 
     else:
         # Unknown callback_data: advance offset (cron path) so this update is not

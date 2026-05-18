@@ -717,6 +717,61 @@ def test_send_approval_email_raises_on_http_error(mocker):
         _send_approval_email("agent@x.com", "admin@x.com", "proj", "https://drive.google.com/x")
 
 
+def test_send_approval_email_raises_on_token_failure(mocker):
+    """_send_approval_email raises RuntimeError when _get_access_token fails."""
+    from scripts.check_approval import _send_approval_email
+    mocker.patch(
+        "scripts.check_approval.drive._get_access_token",
+        side_effect=RuntimeError("token refresh failed"),
+    )
+    with pytest.raises(RuntimeError, match="Gmail access token"):
+        _send_approval_email("agent@x.com", "admin@x.com", "proj", "https://drive.google.com/x")
+
+
+# ---------------------------------------------------------------------------
+# Activity log failure guard — clear_pending_approval must run even if log raises
+# ---------------------------------------------------------------------------
+
+def test_activity_log_error_on_approve_does_not_block_state_clear(base, mocker):
+    """ValueError from activity_log.log_approved is caught — state is still cleared."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    ca.activity_log.log_approved.side_effect = ValueError("bad project_name")
+    main([])
+    ca.state.clear_pending_approval.assert_called_once()
+
+
+def test_activity_log_oserror_on_approve_does_not_block_state_clear(base, mocker):
+    """OSError from activity_log.log_approved is caught — state is still cleared."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    ca.activity_log.log_approved.side_effect = OSError("disk full")
+    main([])
+    ca.state.clear_pending_approval.assert_called_once()
+
+
+def test_activity_log_error_on_reject_does_not_block_state_clear(base, mocker):
+    """ValueError from activity_log.log_rejected is caught — state is still cleared."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_REJECT_UPDATE]
+    ca.activity_log.log_rejected.side_effect = ValueError("bad project_name")
+    main([])
+    ca.state.clear_pending_approval.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Direct path — answer_callback_query failure on reject (L5)
+# ---------------------------------------------------------------------------
+
+def test_direct_reject_answer_failure_is_nonfatal(base):
+    """answer_callback_query failure on direct reject path is a warning — rejection still proceeds."""
+    import scripts.check_approval as ca
+    ca.telegram_api.answer_callback_query.side_effect = RuntimeError("timeout")
+    main(_DIRECT_REJECT_ARGS)
+    ca.state.clear_pending_approval.assert_called_once()
+    ca.drive.delete.assert_called_once_with(_PENDING["drive_video_file_id"])
+
+
 # ---------------------------------------------------------------------------
 # Button removal (edit_message_reply_markup)
 # ---------------------------------------------------------------------------

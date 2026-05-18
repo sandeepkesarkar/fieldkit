@@ -116,7 +116,7 @@ def edit_message_reply_markup(chat_id: str, message_id: int) -> None:
     while approval processing is in progress.
     Raises RuntimeError on failure.
     """
-    logger.debug("edit_message_reply_markup: chat_id=%s message_id=%d", chat_id, message_id)
+    logger.debug("edit_message_reply_markup: message_id=%d", message_id)
     try:
         response = requests.post(
             _url("editMessageReplyMarkup"),
