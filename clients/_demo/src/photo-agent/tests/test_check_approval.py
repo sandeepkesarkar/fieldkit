@@ -10,6 +10,7 @@ import pytest
 from scripts.check_approval import main
 
 _PROJECT = "test_project"
+_CHAT_ID = "123456789"  # matches ADMIN_TELEGRAM_CHAT_ID in env fixture
 _PENDING = {
     "project_name": _PROJECT,
     "drive_folder_id": "folder_id",
@@ -45,6 +46,7 @@ def env(monkeypatch):
     monkeypatch.setenv("AGENT_EMAIL", "agent@example.com")
     monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
+    monkeypatch.setenv("ADMIN_TELEGRAM_CHAT_ID", _CHAT_ID)
 
 
 @pytest.fixture
@@ -57,6 +59,7 @@ def base(mocker, env):
     mocker.patch("scripts.check_approval.state.clear_pending_approval")
     mocker.patch("scripts.check_approval.telegram_api.get_updates", return_value=[])
     mocker.patch("scripts.check_approval.telegram_api.answer_callback_query")
+    mocker.patch("scripts.check_approval.telegram_api.edit_message_reply_markup")
     mocker.patch("scripts.check_approval.drive.delete")
     mocker.patch("scripts.check_approval._send_approval_email")
     mocker.patch("scripts.check_approval._openclaw_send")
@@ -561,10 +564,10 @@ def test_direct_path_does_not_call_get_updates(base):
 
 
 def test_direct_path_approve_calls_answer_callback_query(base):
-    """Direct approve path still calls answer_callback_query with the provided ID."""
+    """Direct approve path calls answer_callback_query with the provided ID and toast text."""
     import scripts.check_approval as ca
     main(_DIRECT_ARGS)
-    ca.telegram_api.answer_callback_query.assert_called_once_with("cq_direct")
+    ca.telegram_api.answer_callback_query.assert_called_once_with("cq_direct", text="✅ Approving...")
 
 
 def test_direct_path_approve_sends_email(base):
@@ -712,3 +715,82 @@ def test_send_approval_email_raises_on_http_error(mocker):
 
     with pytest.raises(RuntimeError, match="Gmail send failed"):
         _send_approval_email("agent@x.com", "admin@x.com", "proj", "https://drive.google.com/x")
+
+
+# ---------------------------------------------------------------------------
+# Button removal (edit_message_reply_markup)
+# ---------------------------------------------------------------------------
+
+def test_cron_approve_removes_buttons(base):
+    """Cron approve path removes the inline keyboard immediately after acknowledging the tap."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    main([])
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )
+
+
+def test_cron_reject_removes_buttons(base):
+    """Cron reject path removes the inline keyboard immediately after acknowledging the tap."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_REJECT_UPDATE]
+    main([])
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )
+
+
+def test_direct_approve_removes_buttons(base):
+    """Direct approve path removes the inline keyboard via _acknowledge_tap."""
+    import scripts.check_approval as ca
+    main(_DIRECT_ARGS)
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )
+
+
+def test_direct_reject_removes_buttons(base):
+    """Direct reject path removes the inline keyboard via _acknowledge_tap."""
+    import scripts.check_approval as ca
+    main(_DIRECT_REJECT_ARGS)
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )
+
+
+def test_data_only_approve_removes_buttons(base):
+    """--callback-data alone (no ID) still removes the inline keyboard."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_APPROVE)
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )
+
+
+def test_data_only_reject_removes_buttons(base):
+    """--callback-data reject still removes the inline keyboard."""
+    import scripts.check_approval as ca
+    main(_DATA_ONLY_REJECT)
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )
+
+
+def test_cron_answer_failure_does_not_remove_buttons(base):
+    """Cron path early-exits on answer_callback_query failure — buttons are not removed."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    ca.telegram_api.answer_callback_query.side_effect = RuntimeError("timeout")
+    main([])
+    ca.telegram_api.edit_message_reply_markup.assert_not_called()
+
+
+def test_direct_answer_failure_still_removes_buttons(base):
+    """Direct path answer_callback_query failure is non-fatal — buttons are still removed."""
+    import scripts.check_approval as ca
+    ca.telegram_api.answer_callback_query.side_effect = RuntimeError("timeout")
+    main(_DIRECT_ARGS)
+    ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
+        _CHAT_ID, _PENDING["telegram_message_id"]
+    )

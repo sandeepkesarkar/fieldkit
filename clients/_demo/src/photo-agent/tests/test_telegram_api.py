@@ -12,6 +12,7 @@ import pytest
 
 from tools.telegram_api import (
     answer_callback_query,
+    edit_message_reply_markup,
     get_updates,
     send_message_with_buttons,
 )
@@ -125,6 +126,24 @@ def test_answer_callback_query_calls_correct_endpoint():
     assert body["callback_query_id"] == "cq_id_xyz"
 
 
+def test_answer_callback_query_includes_text_when_provided():
+    """answer_callback_query() includes 'text' in the body when given."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response(True)
+        answer_callback_query("cq_id_xyz", text="✅ Approving...")
+    body = mock_post.call_args.kwargs["json"]
+    assert body.get("text") == "✅ Approving..."
+
+
+def test_answer_callback_query_omits_text_when_not_provided():
+    """answer_callback_query() omits 'text' from the body when not passed."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response(True)
+        answer_callback_query("cq_id_xyz")
+    body = mock_post.call_args.kwargs["json"]
+    assert "text" not in body
+
+
 def test_answer_callback_query_http_error_raises_runtime_error():
     """answer_callback_query() raises RuntimeError on HTTP error."""
     with patch("tools.telegram_api.requests.post") as mock_post:
@@ -139,6 +158,46 @@ def test_answer_callback_query_telegram_error_raises_runtime_error():
         mock_post.return_value = _telegram_error_response("query too old")
         with pytest.raises(RuntimeError, match="query too old"):
             answer_callback_query("cq_id_xyz")
+
+
+# ---------------------------------------------------------------------------
+# edit_message_reply_markup
+# ---------------------------------------------------------------------------
+
+def test_edit_message_reply_markup_calls_correct_endpoint():
+    """edit_message_reply_markup() POSTs to editMessageReplyMarkup with empty inline_keyboard."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response(True)
+        edit_message_reply_markup(_CHAT_ID, 42)
+    url = mock_post.call_args.args[0]
+    assert "editMessageReplyMarkup" in url
+    body = mock_post.call_args.kwargs["json"]
+    assert body["chat_id"] == _CHAT_ID
+    assert body["message_id"] == 42
+    assert body["reply_markup"] == {"inline_keyboard": []}
+
+
+def test_edit_message_reply_markup_http_error_raises_runtime_error():
+    """edit_message_reply_markup() raises RuntimeError on HTTP error."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _http_error_response(400)
+        with pytest.raises(RuntimeError, match="400"):
+            edit_message_reply_markup(_CHAT_ID, 42)
+
+
+def test_edit_message_reply_markup_telegram_error_raises_runtime_error():
+    """edit_message_reply_markup() raises RuntimeError on Telegram ok:false."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _telegram_error_response("message not modified")
+        with pytest.raises(RuntimeError, match="message not modified"):
+            edit_message_reply_markup(_CHAT_ID, 42)
+
+
+def test_edit_message_reply_markup_missing_token_raises_runtime_error(monkeypatch):
+    """edit_message_reply_markup() raises RuntimeError when TELEGRAM_BOT_TOKEN is not set."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
+        edit_message_reply_markup(_CHAT_ID, 42)
 
 
 # ---------------------------------------------------------------------------

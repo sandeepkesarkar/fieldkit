@@ -91,19 +91,42 @@ def send_message_with_buttons(
     return message_id
 
 
-def answer_callback_query(callback_query_id: str) -> None:
-    """Dismiss the spinner on the admin's button tap."""
+def answer_callback_query(callback_query_id: str, text: str = "") -> None:
+    """Dismiss the spinner on the admin's button tap.
+
+    If text is given (max ~200 chars), Telegram shows a brief toast notification
+    on the user's device acknowledging the tap.
+    """
     logger.debug("answer_callback_query: callback_query_id=%s", callback_query_id)
+    payload: dict = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        response = requests.post(_url("answerCallbackQuery"), json=payload, timeout=10)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Telegram request failed: {exc}") from exc
+    _check(response)
+    logger.debug("answer_callback_query: ok")
+
+
+def edit_message_reply_markup(chat_id: str, message_id: int) -> None:
+    """Remove all inline keyboard buttons from a message.
+
+    Called immediately after a button tap to prevent the admin from tapping again
+    while approval processing is in progress.
+    Raises RuntimeError on failure.
+    """
+    logger.debug("edit_message_reply_markup: chat_id=%s message_id=%d", chat_id, message_id)
     try:
         response = requests.post(
-            _url("answerCallbackQuery"),
-            json={"callback_query_id": callback_query_id},
+            _url("editMessageReplyMarkup"),
+            json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"Telegram request failed: {exc}") from exc
     _check(response)
-    logger.debug("answer_callback_query: ok")
+    logger.debug("edit_message_reply_markup: ok")
 
 
 def get_updates(offset: int) -> list[dict]:

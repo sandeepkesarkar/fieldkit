@@ -124,6 +124,42 @@ def _delete_local_file(video_local_path: str, project_name: str) -> None:
         _log.warning("failed to delete local video file: project=%s error=%s", project_name, exc)
 
 
+def _tap_toast(callback_data: str) -> str:
+    """Return the brief toast text shown to the admin after tapping Approve or Reject."""
+    return "✅ Approving..." if callback_data == "approve" else "❌ Rejecting..."
+
+
+def _acknowledge_tap(
+    callback_query_id: str | None,
+    callback_data: str,
+    chat_id: str,
+    message_id: int,
+) -> None:
+    """Answer the callback query (best-effort) and remove the inline buttons.
+
+    Used on the direct path where OpenClaw may or may not supply the callback_query_id.
+    Both operations are best-effort: failures are logged as warnings and do not abort
+    the approval — the spinner auto-clears after ~10s and button removal is cosmetic.
+    """
+    if callback_query_id:
+        try:
+            telegram_api.answer_callback_query(callback_query_id, text=_tap_toast(callback_data))
+        except RuntimeError as exc:
+            _log.warning("answer_callback_query failed (non-fatal): %s", exc)
+    _remove_buttons(chat_id, message_id)
+
+
+def _remove_buttons(chat_id: str, message_id: int) -> None:
+    """Edit the approval message to remove its inline keyboard. Best-effort."""
+    if not chat_id:
+        _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot remove approval buttons")
+        return
+    try:
+        telegram_api.edit_message_reply_markup(chat_id, message_id)
+    except RuntimeError as exc:
+        _log.warning("edit_message_reply_markup failed (non-fatal): %s", exc)
+
+
 def _find_matching_callback(updates: list[dict], message_id: int) -> dict | None:
     """Return the first update whose callback_query.message.message_id matches, or None."""
     for update in updates:
@@ -182,6 +218,7 @@ def main(argv=None) -> None:
 
     agent_email = os.environ.get("AGENT_EMAIL", "")
     admin_email = os.environ.get("ADMIN_EMAIL", "")
+    chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
 
     # Direct path: OpenClaw passes --callback-data approve|reject, bypassing getUpdates.
     # OpenClaw's internal Telegram polling consumes the callback_query update before the
@@ -202,12 +239,7 @@ def main(argv=None) -> None:
             )
             return
 
-        # Best-effort spinner dismissal. Failure is non-fatal: Telegram auto-clears after ~10s.
-        if args.callback_query_id:
-            try:
-                telegram_api.answer_callback_query(args.callback_query_id)
-            except RuntimeError as exc:
-                _log.warning("answer_callback_query failed (non-fatal on direct path): %s", exc)
+        _acknowledge_tap(args.callback_query_id, callback_data, chat_id, telegram_message_id)
 
     else:
         # Cron path: poll getUpdates for the callback.
@@ -235,14 +267,17 @@ def main(argv=None) -> None:
         callback_query_id = cq["id"]
         callback_data = cq.get("data", "")
 
-        # Dismiss the spinner before any email or Telegram message.
-        # On failure: advance offset so this callback is not reprocessed; leave state intact.
+        # Dismiss the spinner and remove buttons before any email or Telegram message.
+        # answer_callback_query failure on the cron path → advance offset and bail
+        # (leave state intact so the admin can re-tap the next approval message).
         try:
-            telegram_api.answer_callback_query(callback_query_id)
+            _toast = _tap_toast(callback_data)
+            telegram_api.answer_callback_query(callback_query_id, text=_toast)
         except RuntimeError as exc:
             _log.error("answer_callback_query failed: %s", exc)
             state.set_telegram_offset(new_offset)
             return
+        _remove_buttons(chat_id, telegram_message_id)
 
     if callback_data == "approve":
         email_sent = False
