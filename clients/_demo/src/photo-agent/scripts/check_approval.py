@@ -309,5 +309,5 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
     main()
