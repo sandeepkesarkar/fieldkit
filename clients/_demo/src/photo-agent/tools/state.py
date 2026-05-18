@@ -61,10 +61,15 @@ def _read(file_obj) -> dict:
 
 
 def _write(file_obj, data: dict) -> None:
-    """Overwrite state.json via an open, locked file object."""
+    """Overwrite state.json via an open, locked file object.
+
+    Writes before truncating so a crash mid-write leaves new content intact
+    rather than an empty file (truncate-then-write would zero the file first).
+    """
+    content = json.dumps(data, indent=2)
     file_obj.seek(0)
-    file_obj.truncate()
-    file_obj.write(json.dumps(data, indent=2))
+    file_obj.write(content)
+    file_obj.truncate()  # remove any trailing bytes from a previously longer file
     file_obj.flush()
     os.fsync(file_obj.fileno())
 

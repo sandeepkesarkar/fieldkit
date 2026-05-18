@@ -16,6 +16,7 @@ args, getUpdates is bypassed entirely (OpenClaw already consumed the update).
 import argparse
 import base64
 import email.mime.text
+import fcntl
 import logging
 import os
 import subprocess
@@ -40,6 +41,28 @@ from tools import telegram_api
 _log = logging.getLogger(__name__)
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 _REPO_ROOT = Path(__file__).parents[5]
+
+
+def _try_acquire_check_lock() -> "IO | None":
+    """Try to acquire check_approval.lock exclusively (non-blocking).
+
+    Returns the open lock file object on success, or None if another
+    check_approval instance is already running. The caller must close
+    the returned file object to release the lock.
+    """
+    data_dir = (
+        Path(os.environ.get("FIELDKIT_DATA_DIR", str(_REPO_ROOT / "data")))
+        / "photo-agent"
+    )
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / "check_approval.lock"
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
 
 
 def _load_env() -> None:
@@ -124,9 +147,12 @@ def _delete_local_file(video_local_path: str, project_name: str) -> None:
         _log.warning("failed to delete local video file: project=%s error=%s", project_name, exc)
 
 
+_TAP_TOASTS = {"approve": "✅ Approving...", "reject": "❌ Rejecting..."}
+
+
 def _tap_toast(callback_data: str) -> str:
     """Return the brief toast text shown to the admin after tapping Approve or Reject."""
-    return "✅ Approving..." if callback_data == "approve" else "❌ Rejecting..."
+    return _TAP_TOASTS.get(callback_data, "⚠️ Unknown action")
 
 
 def _acknowledge_tap(
@@ -160,14 +186,18 @@ def _remove_buttons(chat_id: str, message_id: int) -> None:
         _log.warning("edit_message_reply_markup failed (non-fatal): %s", exc)
 
 
-def _find_matching_callback(updates: list[dict], message_id: int) -> dict | None:
-    """Return the first update whose callback_query.message.message_id matches, or None."""
+def _find_matching_callback(updates: list[dict], message_id: int, chat_id: str) -> dict | None:
+    """Return the first update whose callback_query matches message_id and chat_id, or None."""
     for update in updates:
         cq = update.get("callback_query")
         if not cq:
             continue
-        if cq.get("message", {}).get("message_id") == message_id:
-            return update
+        msg = cq.get("message", {})
+        if msg.get("message_id") != message_id:
+            continue
+        if chat_id and str(msg.get("chat", {}).get("id", "")) != chat_id:
+            continue
+        return update
     return None
 
 
@@ -188,6 +218,7 @@ def main(argv=None) -> None:
     )
     parser.add_argument(
         "--callback-data",
+        choices=["approve", "reject"],
         default=None,
         dest="callback_data",
         help="Telegram callback_query.data, 'approve' or 'reject' (OpenClaw direct path).",
@@ -205,6 +236,20 @@ def main(argv=None) -> None:
 
     _load_env()
 
+    lock_f = _try_acquire_check_lock()
+    if lock_f is None:
+        _log.debug("another check_approval instance is running — exiting")
+        return
+
+    try:
+        return _run(args)
+    finally:
+        fcntl.flock(lock_f, fcntl.LOCK_UN)
+        lock_f.close()
+
+
+def _run(args) -> None:
+    """Core logic, called after the check_approval.lock is held."""
     record = state.get_pending_approval()
     if record is None:
         _log.debug("no pending approval — exiting")
@@ -253,7 +298,7 @@ def main(argv=None) -> None:
 
         new_offset = max(u["update_id"] for u in updates) + 1 if updates else offset
 
-        match = _find_matching_callback(updates, telegram_message_id)
+        match = _find_matching_callback(updates, telegram_message_id, chat_id)
         if match is None:
             _log.debug(
                 "no matching callback for message_id=%d — advancing offset to %d",

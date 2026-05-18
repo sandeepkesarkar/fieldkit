@@ -27,7 +27,7 @@ _APPROVE_UPDATE = {
     "callback_query": {
         "id": "cq_approve",
         "data": "approve",
-        "message": {"message_id": 42},
+        "message": {"message_id": 42, "chat": {"id": int(_CHAT_ID)}},
     },
 }
 
@@ -36,7 +36,7 @@ _REJECT_UPDATE = {
     "callback_query": {
         "id": "cq_reject",
         "data": "reject",
-        "message": {"message_id": 42},
+        "message": {"message_id": 42, "chat": {"id": int(_CHAT_ID)}},
     },
 }
 
@@ -50,9 +50,23 @@ def env(monkeypatch):
 
 
 @pytest.fixture
+def lock_mock(mocker):
+    """Patch check_approval lock acquisition so tests don't create real lock files."""
+    mock = mocker.MagicMock()
+    mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=mock)
+    mocker.patch("scripts.check_approval.fcntl.flock")
+    return mock
+
+
+@pytest.fixture
 def base(mocker, env):
     """Mocks common to all tests: env loading, state, and all external calls."""
     mocker.patch("scripts.check_approval._load_env")
+    # Simulate successfully acquiring the check_approval.lock.
+    # MagicMock for the file obj; patch fcntl.flock so the release in main() finally block is a no-op.
+    mock_lock = mocker.MagicMock()
+    mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=mock_lock)
+    mocker.patch("scripts.check_approval.fcntl.flock")
     mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=_PENDING)
     mocker.patch("scripts.check_approval.state.get_telegram_offset", return_value=50)
     mocker.patch("scripts.check_approval.state.set_telegram_offset")
@@ -73,7 +87,7 @@ def base(mocker, env):
 # No pending approval
 # ---------------------------------------------------------------------------
 
-def test_no_pending_approval_exits_immediately(mocker, env):
+def test_no_pending_approval_exits_immediately(mocker, env, lock_mock):
     """When no approval is pending, the script returns without calling Telegram or Drive."""
     mocker.patch("scripts.check_approval._load_env")
     mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
@@ -84,7 +98,7 @@ def test_no_pending_approval_exits_immediately(mocker, env):
     mock_drive_delete.assert_not_called()
 
 
-def test_no_pending_approval_does_not_modify_state(mocker, env):
+def test_no_pending_approval_does_not_modify_state(mocker, env, lock_mock):
     """When no approval is pending, set_telegram_offset and clear_pending_approval are not called."""
     mocker.patch("scripts.check_approval._load_env")
     mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
@@ -95,7 +109,7 @@ def test_no_pending_approval_does_not_modify_state(mocker, env):
     mock_clear.assert_not_called()
 
 
-def test_source_cron_no_pending_exits_silently(mocker, env):
+def test_source_cron_no_pending_exits_silently(mocker, env, lock_mock):
     """With --source cron and no pending approval, the script exits without error."""
     mocker.patch("scripts.check_approval._load_env")
     mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
@@ -849,3 +863,72 @@ def test_direct_answer_failure_still_removes_buttons(base):
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
         _CHAT_ID, _PENDING["telegram_message_id"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Cron re-entrancy lock
+# ---------------------------------------------------------------------------
+
+def test_cron_lock_contention_exits_silently(mocker, env):
+    """If check_approval.lock is held by another instance, main() exits without taking action."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=None)
+    mock_get_pending = mocker.patch("scripts.check_approval.state.get_pending_approval")
+    main([])
+    mock_get_pending.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Callback chat_id guard (_find_matching_callback)
+# ---------------------------------------------------------------------------
+
+def test_callback_wrong_chat_id_is_not_matched(base):
+    """A callback_query from a different chat is not matched even if message_id is correct."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [
+        {
+            "update_id": 100,
+            "callback_query": {
+                "id": "cq_wrong_chat",
+                "data": "approve",
+                "message": {
+                    "message_id": 42,          # matches pending
+                    "chat": {"id": 999999999},  # wrong chat
+                },
+            },
+        }
+    ]
+    main([])
+    ca.state.clear_pending_approval.assert_not_called()
+    ca._send_approval_email.assert_not_called()
+
+
+def test_callback_correct_chat_id_is_matched(base):
+    """A callback_query from the correct chat is matched when chat_id matches."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [
+        {
+            "update_id": 100,
+            "callback_query": {
+                "id": "cq_right_chat",
+                "data": "approve",
+                "message": {
+                    "message_id": 42,
+                    "chat": {"id": int(_CHAT_ID)},  # correct chat
+                },
+            },
+        }
+    ]
+    main([])
+    ca.state.clear_pending_approval.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# argparse choices — invalid --callback-data rejected
+# ---------------------------------------------------------------------------
+
+def test_invalid_callback_data_rejected_by_argparse(mocker, env, lock_mock):
+    """argparse rejects --callback-data values other than 'approve' or 'reject'."""
+    mocker.patch("scripts.check_approval._load_env")
+    with pytest.raises(SystemExit):
+        main(["--callback-data", "Approve"])  # capital A — not in choices
