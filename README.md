@@ -30,6 +30,50 @@ FieldKit combines three things:
 
 The result: a custom system the client fully owns, built faster than starting from scratch, on infrastructure they control.
 
+### System Architecture
+
+```mermaid
+graph LR
+    subgraph External["External"]
+        Admin["👤 Admin"]
+        Gmail[Gmail]
+        Drive[Google Drive]
+    end
+
+    subgraph Mac["Mac Mini — client location"]
+        direction TB
+        OC[OpenClaw]
+        Cron[System Cron]
+
+        subgraph Scripts["Python Scripts"]
+            F1[check_email]
+            F2[process_photos]
+            F3[check_approval]
+        end
+
+        State[(state.json)]
+    end
+
+    Admin -- "Telegram command" --> OC
+    OC --> F2
+
+    Cron -- "every minute" --> F1
+    Cron -- "every minute" --> F3
+
+    Gmail -- monitors inbox --> F1
+    Drive -- downloads media --> F2
+
+    F1 -- "new email alert" --> Admin
+    F2 -- "approval request" --> Admin
+    F2 --> State
+    F3 --> State
+    F3 -- "post confirmed" --> Admin
+
+    Admin -- "approve / reject" --> F3
+```
+
+All processing runs locally on the Mac Mini. Nothing leaves the client's hardware unless the admin explicitly approves it.
+
 ---
 
 ## Prerequisites
@@ -44,19 +88,17 @@ Before using FieldKit, you need the infrastructure layer in place:
 
 ```
 fieldkit/
-├── .specify/specs/          # Platform-wide governance docs
-│   ├── framework-philosophy.md
-│   ├── extraction-plan.md
-│   └── development-log.md
+├── .specify/                # Framework-wide spec-kit configuration
+│   ├── memory/constitution.md   # Governing principles for all clients
+│   └── templates/overrides/     # FieldKit-specific spec and plan templates
 │
-├── platform/                # Shared engines (extracted after N≥2 clients)
+├── platform/                # Shared infrastructure (email agent, cron workers)
+│   └── .specify/            # Platform feature specs
 │
 ├── clients/                 # One directory per client
-│   └── _template/           # Starter kit — copy this for every new client
-│       ├── .specify/
-│       │   ├── memory/
-│       │   │   └── constitution.md   # Governing principles template
-│       │   └── specs/
+│   ├── _template/           # Starter kit — copy this for every new client
+│   └── _demo/               # Reference implementation with placeholder data
+│       ├── .specify/        # Feature specs (001-email-agent, 002-photo-video-agent, …)
 │       └── src/
 │
 └── updates/                 # Open development — weekly build-in-public posts
@@ -73,8 +115,6 @@ fieldkit/
 - **Client ownership** — each client gets their own isolated codebase they fully own
 - **Incremental delivery** — one feature shipped and validated before the next begins
 
-See [`.specify/specs/framework-philosophy.md`](.specify/specs/framework-philosophy.md) for the full philosophy.
-
 ---
 
 ## Getting Started
@@ -86,7 +126,7 @@ See [`.specify/specs/framework-philosophy.md`](.specify/specs/framework-philosop
    ```bash
    cp -r clients/_template clients/<your-client-name>
    ```
-3. **Write the constitution** — fill in `clients/<your-client-name>/.specify/memory/constitution.md`
+3. **Write the constitution** — fill in `clients/<your-client-name>/.specify/constitution.md`
 4. **Write feature specs** — use the spec-kit workflow (see below)
 5. **Run clarification** — resolve ambiguities before planning
 6. **Plan and build** — technology decisions happen here, after specs are solid
@@ -94,12 +134,12 @@ See [`.specify/specs/framework-philosophy.md`](.specify/specs/framework-philosop
 ### The spec-kit Workflow
 
 ```
-/speckit.constitution  →  Establish governing principles
-/speckit.specify       →  Write feature specifications
-/speckit.clarify       →  Resolve ambiguities before planning
-/speckit.plan          →  Generate technical implementation plan
-/speckit.tasks         →  Break down into actionable tasks
-/speckit.implement     →  Build with AI assistance
+/speckit-constitution  →  Establish governing principles
+/speckit-specify       →  Write feature specifications
+/speckit-clarify       →  Resolve ambiguities before planning
+/speckit-plan          →  Generate technical implementation plan
+/speckit-tasks         →  Break down into actionable tasks
+/speckit-implement     →  Build with AI assistance
 ```
 
 Specifications are technology-agnostic — they define *what* and *why*, not *how*. Tech stack decisions happen in the planning phase, after specs are complete and validated.
