@@ -41,4 +41,10 @@ Example: for a new photo agent spec in the demo client →
 
 - Root `.specify/memory/constitution.md` — FieldKit framework principles (privacy, HITL, budget governance) that apply to ALL client work
 - `{client}/.specify/constitution.md` — Client-specific principles (created per client by `/speckit-constitution`)
+### Active feature plan
+
+**Feature 003 — Facebook Video Upload**
+Plan: [`clients/_demo/.specify/003-facebook-upload/plan.md`](clients/_demo/.specify/003-facebook-upload/plan.md)
+Branch: `001-upload-facebook-video`
+Status: Planning complete — ready for `/speckit-tasks`
 <!-- SPECKIT END -->
