@@ -43,8 +43,10 @@ Example: for a new photo agent spec in the demo client →
 - `{client}/.specify/constitution.md` — Client-specific principles (created per client by `/speckit-constitution`)
 ### Active feature plan
 
-**Feature 004 — End-to-End Test Rig**
-Plan: [`clients/_demo/.specify/004-e2e-test-rig/plan.md`](clients/_demo/.specify/004-e2e-test-rig/plan.md)
+**Feature 004 — End-to-End Test Rig: IMPLEMENTATION COMPLETE (T001–T035). Pending: T034 (live e2e test).**
+Tasks: [`clients/_demo/.specify/004-e2e-test-rig/tasks.md`](clients/_demo/.specify/004-e2e-test-rig/tasks.md)
 Branch: `001-upload-facebook-video`
-Status: Planning complete — ready for `/speckit-tasks`
+Status: 363 tests passing. Run `python3 clients/_demo/src/photo-agent/scripts/run_e2e_test.py --duration 30` for live validation.
+
+**Next feature: 005 — Instagram Video Upload** (inherits Meta auth from Feature 003)
 <!-- SPECKIT END -->
