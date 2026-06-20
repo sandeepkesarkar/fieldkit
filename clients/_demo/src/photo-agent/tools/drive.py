@@ -117,6 +117,41 @@ def _drive_get(endpoint: str, params: dict) -> dict:
     return resp.json()
 
 
+def create_folder(name: str, parent_id: str) -> str:
+    """Create a new folder under parent_id and return its Drive file ID.
+
+    Raises ValueError for unsafe folder names. Raises RuntimeError on HTTP error.
+    """
+    if not _SAFE_FOLDER_NAME_RE.match(name):
+        raise ValueError(f"create_folder: unsafe folder name: {name!r}")
+    access_token = _get_access_token()
+    metadata = json.dumps({
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    })
+    try:
+        resp = requests.post(
+            _DRIVE_FILES_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+            },
+            data=metadata,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive create_folder request failed: {exc}") from exc
+    if not resp.ok:
+        raise RuntimeError(f"Drive create_folder failed: HTTP {resp.status_code}")
+    try:
+        folder_id = resp.json()["id"]
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"Drive create_folder response missing id: {exc}") from exc
+    logger.info("create_folder: name=%s folder_id=%s", name, folder_id)
+    return folder_id
+
+
 def find_folder(name: str, parent_id: str) -> str:
     """Return the Drive folder ID matching name under parent_id.
 
@@ -205,10 +240,11 @@ def download(file_id: str, output_path: Path) -> None:
     logger.info("download: file_id=%s bytes=%d", file_id, output_path.stat().st_size)
 
 
-def upload(local_path: Path, parent_id: str, name: str) -> str:
+def upload(local_path: Path, parent_id: str, name: str, content_type: str = "video/mp4") -> str:
     """Upload local_path to Drive under parent_id using resumable upload.
 
     Returns the new Drive file ID. Resumable upload handles files of any size.
+    content_type defaults to "video/mp4"; pass "image/jpeg" for JPEG frame uploads.
     """
     if not local_path.exists():
         raise FileNotFoundError(f"upload: local file not found: {local_path}")
@@ -223,7 +259,7 @@ def upload(local_path: Path, parent_id: str, name: str) -> str:
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Type": "video/mp4",
+                "X-Upload-Content-Type": content_type,
                 "X-Upload-Content-Length": str(local_path.stat().st_size),
             },
             data=metadata,

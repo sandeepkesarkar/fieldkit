@@ -386,7 +386,6 @@ def _run(args) -> None:
         if email_sent:
             _openclaw_send(f"✅ Approved: {project_name}\nView folder: {drive_folder_link}")
 
-        _delete_local_file(video_local_path, project_name)
         try:
             activity_log.log_approved(project_name)
         except (ValueError, OSError) as exc:

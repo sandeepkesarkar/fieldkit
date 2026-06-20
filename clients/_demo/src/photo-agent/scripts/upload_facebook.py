@@ -38,6 +38,38 @@ _log = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 3
 _COOLDOWN_SECONDS = 60
+_REPO_ROOT = Path(__file__).parents[5]
+
+
+def _get_tmp_root() -> Path:
+    """Return the allowed root directory for local video files."""
+    tmp_raw = os.environ.get("VIDEO_TMP_DIR", "")
+    if tmp_raw:
+        p = Path(tmp_raw)
+        return (p if p.is_absolute() else (_REPO_ROOT / p)).resolve()
+    return (_REPO_ROOT / "data" / "photo-agent" / "tmp").resolve()
+
+
+def _delete_local_file(video_local_path: str, project_name: str) -> None:
+    """Delete the local temp video file. Best-effort: logs on failure, never raises."""
+    try:
+        p = Path(video_local_path).resolve()
+        allowed = _get_tmp_root()
+        try:
+            p.relative_to(allowed)
+        except ValueError:
+            _log.error(
+                "refused to delete file outside tmp directory: project=%s",
+                project_name,
+            )
+            return
+        if p.exists():
+            p.unlink()
+            _log.info("deleted local video file: project=%s", project_name)
+        else:
+            _log.debug("local video file already absent: project=%s", project_name)
+    except OSError as exc:
+        _log.warning("failed to delete local video file: project=%s error=%s", project_name, exc)
 
 
 def main(argv=None) -> None:
@@ -124,6 +156,7 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
 
     # Success path.
     facebook_state.mark_published(idem_key, post_id)
+    _delete_local_file(video_path, project_name)
     facebook_logger.log_upload_published(project_name, post_id)
     post_url = f"https://www.facebook.com/{post_id}"
     _send_confirmation(chat_id, f"✅ Video live on Facebook! {post_url}")

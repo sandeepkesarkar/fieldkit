@@ -232,8 +232,8 @@ def test_approve_sends_telegram_confirmation(base):
     assert _PROJECT in msg
 
 
-def test_approve_deletes_local_file(base, tmp_path, monkeypatch):
-    """approve path deletes the local temp video file."""
+def test_approve_preserves_local_file(base, tmp_path, monkeypatch):
+    """approve path leaves the local video file intact — upload_facebook.py deletes it after upload."""
     import scripts.check_approval as ca
     monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path))
     local_file = tmp_path / "video.mp4"
@@ -243,7 +243,16 @@ def test_approve_deletes_local_file(base, tmp_path, monkeypatch):
     ca.state.get_pending_approval.return_value = pending
     ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
     main([])
-    assert not local_file.exists()
+    assert local_file.exists()
+
+
+def test_approve_does_not_delete_local_file(base, mocker):
+    """approve path does NOT delete the local video file — upload_facebook.py owns deletion."""
+    import scripts.check_approval as ca
+    mock_delete = mocker.patch("scripts.check_approval._delete_local_file")
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    main([])
+    mock_delete.assert_not_called()
 
 
 def test_approve_clears_pending_approval(base):

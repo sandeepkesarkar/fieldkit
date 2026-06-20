@@ -14,6 +14,7 @@ import pytest
 
 from tools.drive import (
     DriveFolderNotFoundError,
+    create_folder,
     delete,
     download,
     find_folder,
@@ -338,3 +339,93 @@ def test_folder_link_does_not_make_http_calls():
     with patch("tools.drive.requests.get") as mock_get:
         folder_link("xyz789")
     mock_get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# T006: create_folder
+# ---------------------------------------------------------------------------
+
+def test_create_folder_returns_folder_id():
+    """create_folder() POSTs to Drive v3 and returns the new folder ID."""
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"id": "new_folder_id_abc"}
+    with patch("tools.drive.requests.post", return_value=mock_resp) as mock_post:
+        result = create_folder("e2e-test-20260620-143000", "parent_folder_id")
+    assert result == "new_folder_id_abc"
+
+
+def test_create_folder_sends_correct_mime_type():
+    """create_folder() sets mimeType to application/vnd.google-apps.folder in the request body."""
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {"id": "folder_id"}
+    with patch("tools.drive.requests.post", return_value=mock_resp) as mock_post:
+        create_folder("e2e-test-20260620-143000", "parent_id")
+    call_kwargs = mock_post.call_args
+    body = json.loads(call_kwargs.kwargs.get("data") or call_kwargs.args[1] if len(call_kwargs.args) > 1 else call_kwargs.kwargs["data"])
+    assert body.get("mimeType") == "application/vnd.google-apps.folder"
+    assert body.get("parents") == ["parent_id"]
+
+
+def test_create_folder_raises_on_http_error():
+    """create_folder() raises RuntimeError when Drive returns an HTTP error."""
+    mock_resp = MagicMock()
+    mock_resp.ok = False
+    mock_resp.status_code = 403
+    with patch("tools.drive.requests.post", return_value=mock_resp):
+        with pytest.raises(RuntimeError, match="403"):
+            create_folder("test-folder", "parent_id")
+
+
+def test_create_folder_raises_on_unsafe_name():
+    """create_folder() raises ValueError for folder names containing unsafe characters."""
+    with pytest.raises(ValueError, match="unsafe folder name"):
+        create_folder("test/folder!", "parent_id")
+
+
+# ---------------------------------------------------------------------------
+# T006: upload with content_type parameter
+# ---------------------------------------------------------------------------
+
+def test_upload_uses_content_type_for_jpeg(tmp_path):
+    """upload() uses content_type='image/jpeg' in the X-Upload-Content-Type header when specified."""
+    local_file = tmp_path / "frame_001.jpg"
+    local_file.write_bytes(b"\xff\xd8\xff" + b"\x00" * 64)
+
+    init_resp = MagicMock()
+    init_resp.ok = True
+    init_resp.headers = {"Location": "https://upload.googleapis.com/session/abc"}
+
+    upload_resp = MagicMock()
+    upload_resp.ok = True
+    upload_resp.json.return_value = {"id": "file_id_xyz"}
+
+    with patch("tools.drive.requests.post", return_value=init_resp) as mock_post, \
+         patch("tools.drive.requests.put", return_value=upload_resp):
+        upload(local_file, "parent_id", "frame_001.jpg", content_type="image/jpeg")
+
+    headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args.args[1]
+    assert headers["X-Upload-Content-Type"] == "image/jpeg"
+
+
+def test_upload_defaults_to_video_mp4(tmp_path):
+    """upload() defaults to 'video/mp4' for X-Upload-Content-Type when content_type is not given."""
+    local_file = tmp_path / "video.mp4"
+    local_file.write_bytes(b"\x00" * 64)
+
+    init_resp = MagicMock()
+    init_resp.ok = True
+    init_resp.headers = {"Location": "https://upload.googleapis.com/session/def"}
+
+    upload_resp = MagicMock()
+    upload_resp.ok = True
+    upload_resp.json.return_value = {"id": "file_id_zzz"}
+
+    with patch("tools.drive.requests.post", return_value=init_resp) as mock_post, \
+         patch("tools.drive.requests.put", return_value=upload_resp):
+        upload(local_file, "parent_id", "video.mp4")
+
+    headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args.args[1]
+    assert headers["X-Upload-Content-Type"] == "video/mp4"

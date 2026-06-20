@@ -18,6 +18,7 @@ from tools.facebook_api import (
     FacebookTokenError,
     FacebookUploadError,
     build_auth_url,
+    delete_post,
     exchange_code_for_token,
     exchange_for_long_lived_token,
     get_page_access_token,
@@ -310,3 +311,73 @@ def test_facebook_upload_error_is_subclass_of_runtime_error():
 def test_facebook_token_error_is_not_facebook_upload_error():
     """FacebookTokenError and FacebookUploadError are distinct types."""
     assert not issubclass(FacebookTokenError, FacebookUploadError)
+
+
+# ---------------------------------------------------------------------------
+# T009: delete_post
+# ---------------------------------------------------------------------------
+
+def test_delete_post_succeeds_on_200_true(mocker):
+    """delete_post() returns None on a successful {'success': true} response."""
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {"success": True}
+    mocker.patch("tools.facebook_api.requests.delete", return_value=mock_resp)
+
+    delete_post("page_token", "post_id_abc")  # must not raise
+
+
+def test_delete_post_sends_delete_to_graph_api(mocker):
+    """delete_post() sends DELETE to /{post_id}?access_token=... on the Graph API."""
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {"success": True}
+    mock_delete = mocker.patch("tools.facebook_api.requests.delete", return_value=mock_resp)
+
+    delete_post("my_page_token", "post_999")
+
+    url = mock_delete.call_args.args[0]
+    assert "post_999" in url
+    assert "graph.facebook.com" in url
+    params = mock_delete.call_args.kwargs.get("params") or {}
+    assert params.get("access_token") == "my_page_token"
+
+
+def test_delete_post_raises_on_graph_error_code_100(mocker):
+    """delete_post() raises FacebookUploadError when the Graph API returns error code 100."""
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {
+        "error": {
+            "message": "Invalid parameter",
+            "type": "GraphMethodException",
+            "code": 100,
+        }
+    }
+    mocker.patch("tools.facebook_api.requests.delete", return_value=mock_resp)
+
+    with pytest.raises(FacebookUploadError):
+        delete_post("page_token", "post_id_abc")
+
+
+def test_delete_post_raises_on_http_error(mocker):
+    """delete_post() raises FacebookUploadError on an HTTP error response."""
+    mock_resp = MagicMock()
+    mock_resp.ok = False
+    mock_resp.status_code = 403
+    mock_resp.json.return_value = {}
+    mocker.patch("tools.facebook_api.requests.delete", return_value=mock_resp)
+
+    with pytest.raises(FacebookUploadError):
+        delete_post("page_token", "post_id_abc")
+
+
+def test_delete_post_raises_on_network_error(mocker):
+    """delete_post() raises FacebookUploadError on a requests network exception."""
+    mocker.patch(
+        "tools.facebook_api.requests.delete",
+        side_effect=requests.exceptions.RequestException("timeout"),
+    )
+
+    with pytest.raises(FacebookUploadError):
+        delete_post("page_token", "post_id_abc")

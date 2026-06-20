@@ -11,6 +11,7 @@ are mocked. No real network or file-system access.
 """
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import ANY
 
 import pytest
@@ -122,6 +123,16 @@ def test_happy_path_logs_published(with_pending):
     import scripts.upload_facebook as uf
     main([])
     uf.facebook_logger.log_upload_published.assert_called_once_with(_PROJECT, _POST_ID)
+
+
+def test_happy_path_deletes_local_file_after_published(with_pending, tmp_path, monkeypatch):
+    """On success, the local video file is deleted after mark_published."""
+    import scripts.upload_facebook as uf
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path))
+    video_path = uf.facebook_state.get_pending_upload.return_value["video_local_path"]
+    assert Path(video_path).exists()
+    main([])
+    assert not Path(video_path).exists()
 
 
 def test_happy_path_sends_telegram_confirmation(with_pending):

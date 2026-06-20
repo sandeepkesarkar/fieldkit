@@ -136,6 +136,41 @@ def get_page_access_token(long_user_token: str, page_id: str) -> str:
     raise FacebookUploadError(f"Page {page_id!r} not found in user's accounts")
 
 
+def delete_post(page_access_token: str, post_id: str) -> None:
+    """Delete a Facebook post by ID.
+
+    Raises:
+        FacebookUploadError — on HTTP error, network failure, or any Graph API error
+            including code 100 ("post not found"). Callers that want to treat code 100
+            as a non-fatal warning should catch FacebookUploadError explicitly.
+    """
+    url = f"{_GRAPH_BASE}/{post_id}"
+    try:
+        resp = requests.delete(
+            url,
+            params={"access_token": page_access_token},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise FacebookUploadError(f"Post delete request failed: {exc}") from exc
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+
+    error = data.get("error") if isinstance(data, dict) else None
+    if error:
+        code = error.get("code") if isinstance(error, dict) else None
+        msg = error.get("message", "") if isinstance(error, dict) else str(error)
+        raise FacebookUploadError(f"Facebook API error {code} deleting post {post_id}: {msg}")
+
+    if not resp.ok:
+        raise FacebookUploadError(f"Post delete failed: HTTP {resp.status_code}")
+
+    logger.info("delete_post: post_id=%s", post_id)
+
+
 def upload_video(page_access_token: str, page_id: str, video_path) -> str:
     """Upload a video file to a Facebook Page. Returns the Facebook post ID.
 
