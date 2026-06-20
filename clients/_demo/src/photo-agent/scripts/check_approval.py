@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -35,6 +36,7 @@ load_dotenv(Path(__file__).parents[1] / ".env")
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from tools import drive, state
+from tools import facebook_state
 from tools import logger as activity_log
 from tools import telegram_api
 
@@ -145,6 +147,38 @@ def _delete_local_file(video_local_path: str, project_name: str) -> None:
             _log.debug("local video file already absent: project=%s", project_name)
     except OSError as exc:
         _log.warning("failed to delete local video file: project=%s error=%s", project_name, exc)
+
+
+def _enqueue_facebook_upload(
+    project_name: str, video_local_path: str, telegram_message_id: int
+) -> None:
+    """Enqueue a Facebook video upload job after approval.
+
+    Skipped silently when FB_PAGE_ID is not configured.
+    Failure is logged as an error but does NOT abort the approve flow.
+    """
+    page_id = os.environ.get("FB_PAGE_ID", "")
+    if not page_id:
+        return
+    idem_key = str(telegram_message_id)
+    try:
+        if facebook_state.is_published(idem_key):
+            _log.warning("FB upload already published for key=%s — skipping enqueue", idem_key)
+            return
+        facebook_state.set_pending_upload({
+            "project_name": project_name,
+            "video_local_path": video_local_path,
+            "page_id": page_id,
+            "status": "pending",
+            "attempt_count": 0,
+            "last_attempt_at": None,
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+            "idempotency_key": idem_key,
+            "fb_post_id": None,
+        })
+        _log.info("FB upload enqueued: project=%s key=%s", project_name, idem_key)
+    except Exception as exc:
+        _log.error("Failed to enqueue FB upload for project=%s: %s", project_name, exc)
 
 
 _TAP_TOASTS = {"approve": "✅ Approving...", "reject": "❌ Rejecting..."}
@@ -357,6 +391,8 @@ def _run(args) -> None:
             activity_log.log_approved(project_name)
         except (ValueError, OSError) as exc:
             _log.error("activity log failed after approval: %s", exc)
+
+        _enqueue_facebook_upload(project_name, video_local_path, telegram_message_id)
 
     elif callback_data == "reject":
         # Drive delete is best-effort — failure is logged but does not block the rejection.
