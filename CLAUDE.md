@@ -43,8 +43,8 @@ Example: for a new photo agent spec in the demo client →
 - `{client}/.specify/constitution.md` — Client-specific principles (created per client by `/speckit-constitution`)
 ### Active feature plan
 
-**Feature 003 — Facebook Video Upload**
-Plan: [`clients/_demo/.specify/003-facebook-upload/plan.md`](clients/_demo/.specify/003-facebook-upload/plan.md)
+**Feature 004 — End-to-End Test Rig**
+Plan: [`clients/_demo/.specify/004-e2e-test-rig/plan.md`](clients/_demo/.specify/004-e2e-test-rig/plan.md)
 Branch: `001-upload-facebook-video`
 Status: Planning complete — ready for `/speckit-tasks`
 <!-- SPECKIT END -->
