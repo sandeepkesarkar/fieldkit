@@ -298,6 +298,20 @@ def test_upload_video_raises_facebook_upload_error_on_non_190_fb_error(mocker, t
         upload_video("token", "123456789", video_file)
 
 
+def test_upload_video_raises_facebook_upload_error_when_response_missing_id(mocker, tmp_path):
+    """upload_video() raises FacebookUploadError (not KeyError) when response has no 'id' field."""
+    video_file = tmp_path / "video.mp4"
+    video_file.write_bytes(b"\x00" * 64)
+
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {"video_id": "async_12345"}  # async upload path — no 'id'
+    mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
+
+    with pytest.raises(FacebookUploadError, match="missing 'id' field"):
+        upload_video("token", "123456789", video_file)
+
+
 def test_facebook_token_error_is_subclass_of_runtime_error():
     """FacebookTokenError is a RuntimeError subclass."""
     assert issubclass(FacebookTokenError, RuntimeError)

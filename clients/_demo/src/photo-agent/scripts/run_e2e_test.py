@@ -55,7 +55,15 @@ _SPP_BASE_DEFAULT = 4
 _N_FRAMES_CAP = 30
 _POLL_INTERVAL = 10
 
-_FONT_PATH = "/System/Library/Fonts/Helvetica.ttc"
+_FONT_PATH = os.environ.get(
+    "FIELDKIT_E2E_FONT_PATH",
+    "/System/Library/Fonts/Helvetica.ttc",
+)
+
+_DATA_DIR = Path(
+    os.environ.get("FIELDKIT_DATA_DIR", str(_PHOTO_AGENT_DIR.parents[4] / "data"))
+) / "photo-agent"
+_LAST_RUN_FILE = _DATA_DIR / "e2e_last_run.json"
 
 
 def _compute_frames(duration: int, spp_base: int) -> tuple[int, int]:
@@ -132,18 +140,42 @@ def _upload_frames_to_drive(
     return folder_id, file_ids
 
 
+def _save_run_ids(test_name: str, folder_id: str, fb_post_id: str | None) -> None:
+    """Persist the most recent run's IDs to disk for use by --cleanup."""
+    import json as _json
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _LAST_RUN_FILE.write_text(
+        _json.dumps({"test_name": test_name, "folder_id": folder_id, "fb_post_id": fb_post_id})
+    )
+
+
+def _load_run_ids() -> tuple[str, str | None]:
+    """Load folder_id and fb_post_id from the last run. Raises RuntimeError if not found."""
+    import json as _json
+    if not _LAST_RUN_FILE.exists():
+        raise RuntimeError(
+            f"No previous run found at {_LAST_RUN_FILE} — run the test first before using --cleanup"
+        )
+    data = _json.loads(_LAST_RUN_FILE.read_text())
+    return data["folder_id"], data.get("fb_post_id")
+
+
 def _run_process_photos(test_name: str, spp_effective: int, timeout: int) -> None:
     """Run process_photos.py as a subprocess with SECONDS_PER_PHOTO override.
 
-    Raises RuntimeError if the subprocess exits non-zero.
-    After the subprocess exits, polls state.json until pending_approval appears
-    for this test_name (confirms process_photos.py wrote state).
+    Raises RuntimeError if the subprocess exits non-zero or times out.
     """
     env = {**os.environ, "SECONDS_PER_PHOTO": str(spp_effective)}
-    result = subprocess.run(
-        [sys.executable, _PROCESS_PHOTOS, "--project", test_name],
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, _PROCESS_PHOTOS, "--project", test_name],
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"process_photos.py timed out after {timeout}s for project={test_name}"
+        )
     if result.returncode != 0:
         raise RuntimeError(
             f"process_photos.py exited {result.returncode} for project={test_name}"
@@ -234,6 +266,22 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+
+    # --cleanup standalone mode: load previous run IDs from disk and clean up
+    if args.cleanup:
+        missing_token = [k for k in ["FB_PAGE_ACCESS_TOKEN"] if not os.environ.get(k)]
+        if missing_token:
+            print(f"ERROR: required env var FB_PAGE_ACCESS_TOKEN is not set", file=sys.stderr)
+            sys.exit(1)
+        try:
+            folder_id_c, fb_post_id_c = _load_run_ids()
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        page_token = os.environ["FB_PAGE_ACCESS_TOKEN"]
+        _cleanup(folder_id_c, fb_post_id_c, page_token)
+        print("✅ Cleanup complete.", flush=True)
+        return
 
     # Pre-flight: required env vars
     missing_vars = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
@@ -334,11 +382,14 @@ def main(argv=None) -> None:
                      f"timed out after {elapsed:.0f}s", elapsed)
         sys.exit(1)
 
+    _save_run_ids(test_name, folder_id, fb_post_id)
+
     total_elapsed = time.time() - overall_start
     mins = int(total_elapsed) // 60
     secs = int(total_elapsed) % 60
     print(f"✅ All stages passed. Total: {mins}m {secs}s", flush=True)
     print(f"Post: https://www.facebook.com/{fb_post_id}", flush=True)
+    print(f"Run 'python3 scripts/run_e2e_test.py --cleanup' to remove the Drive folder and Facebook post.", flush=True)
 
 
 if __name__ == "__main__":

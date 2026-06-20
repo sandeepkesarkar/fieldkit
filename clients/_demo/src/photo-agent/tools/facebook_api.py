@@ -211,4 +211,9 @@ def upload_video(page_access_token: str, page_id: str, video_path) -> str:
     if not resp.ok:
         raise FacebookUploadError(f"Upload failed: HTTP {resp.status_code}")
 
-    return data["id"]
+    try:
+        return data["id"]
+    except (KeyError, TypeError) as exc:
+        raise FacebookUploadError(
+            f"Upload response missing 'id' field: {exc} — response: {data!r}"
+        ) from exc

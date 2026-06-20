@@ -249,6 +249,7 @@ def upload(local_path: Path, parent_id: str, name: str, content_type: str = "vid
     if not local_path.exists():
         raise FileNotFoundError(f"upload: local file not found: {local_path}")
 
+    file_size = local_path.stat().st_size
     access_token = _get_access_token()
     metadata = json.dumps({"name": name, "parents": [parent_id]})
 
@@ -260,7 +261,7 @@ def upload(local_path: Path, parent_id: str, name: str, content_type: str = "vid
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json; charset=UTF-8",
                 "X-Upload-Content-Type": content_type,
-                "X-Upload-Content-Length": str(local_path.stat().st_size),
+                "X-Upload-Content-Length": str(file_size),
             },
             data=metadata,
             timeout=30,
@@ -280,7 +281,7 @@ def upload(local_path: Path, parent_id: str, name: str, content_type: str = "vid
             upload_resp = requests.put(
                 session_uri,
                 headers={
-                    "Content-Length": str(local_path.stat().st_size),
+                    "Content-Length": str(file_size),
                 },
                 data=f,
                 timeout=600,
