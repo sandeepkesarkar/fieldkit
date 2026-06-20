@@ -932,3 +932,62 @@ def test_invalid_callback_data_rejected_by_argparse(mocker, env, lock_mock):
     mocker.patch("scripts.check_approval._load_env")
     with pytest.raises(SystemExit):
         main(["--callback-data", "Approve"])  # capital A — not in choices
+
+
+# ---------------------------------------------------------------------------
+# Facebook upload enqueueing on approve path (Feature 003)
+# ---------------------------------------------------------------------------
+
+_FB_PAGE_ID = "123456789"
+
+
+@pytest.fixture
+def base_fb(base, monkeypatch):
+    """Extends base with Facebook env and state mocks for FB enqueue tests."""
+    monkeypatch.setenv("FB_PAGE_ID", _FB_PAGE_ID)
+    import scripts.check_approval as ca
+    base.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    base.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    return base
+
+
+def test_approve_enqueues_facebook_upload(base_fb):
+    """approve path calls facebook_state.set_pending_upload with correct required fields."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    main([])
+    ca.facebook_state.set_pending_upload.assert_called_once()
+    record = ca.facebook_state.set_pending_upload.call_args.args[0]
+    assert record["project_name"] == _PROJECT
+    assert record["video_local_path"] == _PENDING["video_local_path"]
+    assert record["page_id"] == _FB_PAGE_ID
+    assert record["idempotency_key"] == str(_PENDING["telegram_message_id"])
+
+
+def test_approve_enqueue_idempotency_skip(base_fb):
+    """If is_published(key) returns True, set_pending_upload is NOT called."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    ca.facebook_state.is_published.return_value = True
+    main([])
+    ca.facebook_state.set_pending_upload.assert_not_called()
+
+
+def test_approve_enqueue_skipped_without_fb_page_id(base, mocker, monkeypatch):
+    """When FB_PAGE_ID is not set, facebook_state.set_pending_upload is never called."""
+    monkeypatch.delenv("FB_PAGE_ID", raising=False)
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    mock_set = mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    main([])
+    mock_set.assert_not_called()
+
+
+def test_approve_enqueue_failure_does_not_abort_approve_flow(base_fb):
+    """A facebook_state exception during enqueue is caught — the approve flow still completes."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    ca.facebook_state.set_pending_upload.side_effect = Exception("state error")
+    main([])
+    ca.state.clear_pending_approval.assert_called_once()
+    ca.state.set_telegram_offset.assert_called_once_with(101)

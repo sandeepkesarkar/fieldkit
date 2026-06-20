@@ -52,6 +52,23 @@ def _check(response: requests.Response) -> dict:
     return data
 
 
+def send_message(chat_id: str, text: str) -> None:
+    """Send a plain-text message to chat_id. Raises RuntimeError on failure."""
+    if not chat_id:
+        raise RuntimeError("send_message: chat_id must not be empty")
+    logger.debug("send_message: sending")
+    try:
+        response = requests.post(
+            _url("sendMessage"),
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Telegram request failed: {exc}") from exc
+    _check(response)
+    logger.debug("send_message: ok")
+
+
 def send_message_with_buttons(
     chat_id: str,
     text: str,
