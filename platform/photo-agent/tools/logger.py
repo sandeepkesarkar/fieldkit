@@ -19,10 +19,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Allow override via environment variable for portability; default resolves to
-# <repo-root>/logs/ — this file sits five directory levels deep
-# (tools/ → photo-agent/ → src/ → _demo/ → clients/ → repo root).
-LOG_DIR = Path(os.environ.get("FIELDKIT_LOG_DIR", str(Path(__file__).parents[5] / "logs"))).resolve()
+_log_dir_raw = os.environ.get("FIELDKIT_LOG_DIR", "")
+if not _log_dir_raw:
+    raise RuntimeError("FIELDKIT_LOG_DIR is not set — add it to your client .env file")
+LOG_DIR = Path(_log_dir_raw).resolve()
 LOG_FILE = LOG_DIR / "photo-agent.log"
 
 _TOKEN_RE = re.compile(r'^[A-Za-z0-9_-]+$')

@@ -27,10 +27,10 @@ FB_PAGE_ID=               # Set by generate_auth_link.py
 FB_PAGE_ACCESS_TOKEN=     # Set by generate_auth_link.py (permanent token, never expires)
 ```
 
-Optional overrides:
+Required — set in `clients/<client>/src/photo-agent/.env`:
 ```bash
-FIELDKIT_DATA_DIR=   # Override data directory (default: <repo-root>/data)
-FIELDKIT_LOG_DIR=    # Override log directory (default: <repo-root>/logs)
+FIELDKIT_DATA_DIR=   # Absolute path to client data directory (e.g. /path/to/fieldkit/clients/<client>/data)
+FIELDKIT_LOG_DIR=    # Absolute path to client log directory (e.g. /path/to/fieldkit/clients/<client>/logs)
 ```
 
 ---
@@ -40,7 +40,7 @@ FIELDKIT_LOG_DIR=    # Override log directory (default: <repo-root>/logs)
 Add to crontab (`crontab -e`) alongside the existing `check_approval.py` entry:
 
 ```cron
-* * * * * /usr/local/bin/python3 /path/to/fieldkit/clients/_demo/src/photo-agent/scripts/upload_facebook.py --source cron >> /path/to/fieldkit/logs/cron.log 2>&1
+* * * * * /usr/local/bin/python3 /path/to/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron >> /path/to/fieldkit/logs/cron.log 2>&1
 ```
 
 Replace `/path/to/fieldkit` with the absolute path to your FieldKit repo root.
@@ -51,8 +51,8 @@ Replace `/path/to/fieldkit` with the absolute path to your FieldKit repo root.
 
 From the repo root:
 ```bash
-python3 clients/_demo/src/photo-agent/scripts/upload_facebook.py
-python3 clients/_demo/src/photo-agent/scripts/upload_facebook.py --source cron
+python3 platform/photo-agent/scripts/upload_facebook.py
+python3 platform/photo-agent/scripts/upload_facebook.py --source cron
 ```
 
 ---

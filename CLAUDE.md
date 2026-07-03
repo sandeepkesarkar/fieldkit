@@ -3,7 +3,7 @@
 
 This is the FieldKit mono-repo. It contains multiple specifiable units:
 - **`platform/`** — Shared infrastructure (email agent, cron workers, etc.)
-- **`clients/{name}/`** — Client implementations (currently `_demo`, `_template`)
+- **`clients/{name}/`** — Client implementations (currently `_demo`, `_construction_co`, `_template`)
 
 ### Before any spec-kit command
 
@@ -43,10 +43,14 @@ Example: for a new photo agent spec in the demo client →
 - `{client}/.specify/constitution.md` — Client-specific principles (created per client by `/speckit-constitution`)
 ### Active feature plan
 
-**Feature 004 — End-to-End Test Rig: IMPLEMENTATION COMPLETE (T001–T035). Pending: T034 (live e2e test).**
-Tasks: [`clients/_demo/.specify/004-e2e-test-rig/tasks.md`](clients/_demo/.specify/004-e2e-test-rig/tasks.md)
-Branch: `001-upload-facebook-video`
-Status: 363 tests passing. Run `python3 clients/_demo/src/photo-agent/scripts/run_e2e_test.py --duration 30` for live validation.
+**Platform Feature 002 — Photo-Agent Migration: IMPLEMENTATION COMPLETE (T001–T048).**
+Tasks: [`platform/.specify/002-photo-agent/tasks.md`](platform/.specify/002-photo-agent/tasks.md)
+Branch: `001-platform-photo-agent`
+Status: 368 tests passing. `clients/_construction_co` scaffolded (credentials pending). Remaining: T040–T042 (live two-client isolation run), T050 (adversarial review).
 
-**Next feature: 005 — Instagram Video Upload** (inherits Meta auth from Feature 003)
+Permanent clients:
+- `_demo` — full pipeline (video → Telegram approval → Facebook)
+- `_construction_co` — scoped pipeline (video → Telegram approval only, no Facebook)
+
+**_demo Feature 005 — Instagram Video Upload** (next after Platform 002 adversarial review passes)
 <!-- SPECKIT END -->

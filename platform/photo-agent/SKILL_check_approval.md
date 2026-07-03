@@ -10,21 +10,21 @@ metadata: {"openclaw": {"requires": {"bins": ["python3"]}}}
 ## When triggered by the Approve button (callback_data == "approve")
 
 ```bash
-cd ~/src/fieldkit/clients/_demo/src/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
+cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
 python3 scripts/check_approval.py --callback-data approve 2>&1
 ```
 
 ## When triggered by the Reject button (callback_data == "reject")
 
 ```bash
-cd ~/src/fieldkit/clients/_demo/src/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
+cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
 python3 scripts/check_approval.py --callback-data reject 2>&1
 ```
 
 ## When invoked manually (e.g. /check_approval command)
 
 ```bash
-cd ~/src/fieldkit/clients/_demo/src/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
+cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
 python3 scripts/check_approval.py 2>&1
 ```
 

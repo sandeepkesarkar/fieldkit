@@ -29,7 +29,7 @@ Page access token to `.env` automatically.
 ## Usage
 
 ```bash
-cd clients/_demo/src/photo-agent
+cd platform/photo-agent
 python3 scripts/generate_auth_link.py --page-id YOUR_PAGE_ID
 ```
 

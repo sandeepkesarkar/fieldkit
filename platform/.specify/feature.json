@@ -1,1 +1,3 @@
-{"feature_directory": ".specify/001-email-agent"}
+{
+  "feature_directory": "platform/.specify/002-photo-agent"
+}

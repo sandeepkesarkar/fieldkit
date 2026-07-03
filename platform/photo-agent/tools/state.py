@@ -19,10 +19,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Allow override via environment variable for portability; default resolves to
-# <repo-root>/data/photo-agent/ — this file sits five directory levels deep
-# (tools/ → photo-agent/ → src/ → _demo/ → clients/ → repo root).
-DATA_DIR = Path(os.environ.get("FIELDKIT_DATA_DIR", str(Path(__file__).parents[5] / "data"))) / "photo-agent"
+_data_dir_raw = os.environ.get("FIELDKIT_DATA_DIR", "")
+if not _data_dir_raw:
+    raise RuntimeError("FIELDKIT_DATA_DIR is not set — add it to your client .env file")
+DATA_DIR = Path(_data_dir_raw) / "photo-agent"
 STATE_FILE = DATA_DIR / "state.json"
 
 __all__ = [

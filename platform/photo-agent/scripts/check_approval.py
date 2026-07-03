@@ -28,10 +28,12 @@ import requests
 
 from dotenv import load_dotenv
 
-# Must be called before any FieldKit module import: state.py and logger.py compute
-# DATA_DIR/LOG_DIR as module-level constants at import time, so FIELDKIT_DATA_DIR
-# and FIELDKIT_LOG_DIR in .env only take effect if os.environ is populated first.
-load_dotenv(Path(__file__).parents[1] / ".env")
+_ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
+load_dotenv(_ROOT / ".env")
+_CLIENT = os.environ.get("CLIENT_NAME")
+if not _CLIENT:
+    sys.exit("ERROR: CLIENT_NAME is not set in fieldkit/.env")
+load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", override=True)
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -42,7 +44,7 @@ from tools import telegram_api
 
 _log = logging.getLogger(__name__)
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
-_REPO_ROOT = Path(__file__).parents[5]
+_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _try_acquire_check_lock() -> "IO | None":
@@ -52,10 +54,7 @@ def _try_acquire_check_lock() -> "IO | None":
     check_approval instance is already running. The caller must close
     the returned file object to release the lock.
     """
-    data_dir = (
-        Path(os.environ.get("FIELDKIT_DATA_DIR", str(_REPO_ROOT / "data")))
-        / "photo-agent"
-    )
+    data_dir = Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent"
     data_dir.mkdir(parents=True, exist_ok=True)
     lock_path = data_dir / "check_approval.lock"
     f = open(lock_path, "w")

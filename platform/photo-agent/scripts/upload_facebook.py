@@ -27,7 +27,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parents[1] / ".env")
+_ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
+load_dotenv(_ROOT / ".env")
+_CLIENT = os.environ.get("CLIENT_NAME")
+if not _CLIENT:
+    sys.exit("ERROR: CLIENT_NAME is not set in fieldkit/.env")
+load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", override=True)
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -38,7 +43,7 @@ _log = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 3
 _COOLDOWN_SECONDS = 60
-_REPO_ROOT = Path(__file__).parents[5]
+_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _get_tmp_root() -> Path:
