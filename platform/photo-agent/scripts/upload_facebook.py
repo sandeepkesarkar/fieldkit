@@ -52,7 +52,8 @@ def _get_tmp_root() -> Path:
     if tmp_raw:
         p = Path(tmp_raw)
         return (p if p.is_absolute() else (_REPO_ROOT / p)).resolve()
-    return (_REPO_ROOT / "data" / "photo-agent" / "tmp").resolve()
+    # Default to client-specific data dir so clients never share a tmp directory.
+    return (Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent" / "tmp").resolve()
 
 
 def _delete_local_file(video_local_path: str, project_name: str) -> None:

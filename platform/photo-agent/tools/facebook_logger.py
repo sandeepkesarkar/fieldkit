@@ -1,7 +1,7 @@
 """
 Activity log writer for Facebook video upload events.
 
-Appends structured pipe-delimited lines to <repo-root>/logs/photo-agent.log
+Appends structured pipe-delimited lines to $FIELDKIT_LOG_DIR/photo-agent.log
 (the same file as logger.py). Each function corresponds to a distinct lifecycle
 event in the Facebook video upload pipeline.
 

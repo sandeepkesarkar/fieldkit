@@ -2,7 +2,7 @@
 State manager for the Facebook video upload pipeline.
 
 Manages:
-  <repo-root>/data/photo-agent/facebook_state.json
+  $FIELDKIT_DATA_DIR/photo-agent/facebook_state.json
     — pending VideoUploadJob record + published idempotency keys
 
 All read-modify-write operations acquire an exclusive file lock (fcntl.LOCK_EX)
