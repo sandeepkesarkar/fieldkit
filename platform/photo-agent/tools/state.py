@@ -2,7 +2,7 @@
 State manager for the photo-video agent.
 
 Manages:
-  <repo-root>/data/photo-agent/state.json  — pending approval record + Telegram update offset
+  $FIELDKIT_DATA_DIR/photo-agent/state.json  — pending approval record + Telegram update offset
 
 All read-modify-write operations acquire an exclusive file lock (fcntl.LOCK_EX) before
 reading and release it after writing. This prevents corruption when process_photos.py

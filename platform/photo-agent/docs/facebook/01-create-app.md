@@ -179,7 +179,7 @@ The account that runs the OAuth flow must be an admin of the target Page.
 
 ## Part F — Add credentials to `.env`
 
-Open `clients/_demo/src/photo-agent/.env` (copy from `.env.example` first if it doesn't exist):
+Open `clients/<client>/src/photo-agent/.env` (copy from `.env.example` first if it doesn't exist):
 
 ```bash
 FB_APP_ID=<App ID from Part C>
@@ -187,7 +187,7 @@ FB_APP_SECRET=<App Secret from Part C>
 ```
 
 ```bash
-chmod 600 clients/_demo/src/photo-agent/.env
+chmod 600 clients/<client>/src/photo-agent/.env
 ```
 
 Leave `FB_PAGE_ID` and `FB_PAGE_ACCESS_TOKEN` blank for now — doc 2 covers getting those.

@@ -1,7 +1,7 @@
 """
 Activity log writer for the photo-video agent.
 
-Appends structured human-readable lines to <repo-root>/logs/photo-agent.log.
+Appends structured human-readable lines to $FIELDKIT_LOG_DIR/photo-agent.log.
 Each function corresponds to a distinct lifecycle event in the photo pipeline.
 The log directory is created on first write if it does not exist.
 
