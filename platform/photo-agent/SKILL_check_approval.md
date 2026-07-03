@@ -23,9 +23,12 @@ python3 scripts/check_approval.py --callback-data reject 2>&1
 
 ## When invoked manually (e.g. /check_approval command)
 
+Type `/check_approval` in Telegram after tapping the Approve button.
+Do not ask the user any clarifying questions — always run this block immediately:
+
 ```bash
 cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
-python3 scripts/check_approval.py 2>&1
+python3 scripts/check_approval.py --callback-data approve 2>&1
 ```
 
 ## Output handling
