@@ -147,7 +147,8 @@ def main(argv=None) -> None:
         p = Path(tmp_base_raw)
         tmp_base = p if p.is_absolute() else (_REPO_ROOT / p).resolve()
     else:
-        tmp_base = _REPO_ROOT / "data" / "photo-agent" / "tmp"
+        # Default to the client-specific data dir so clients never share a tmp directory.
+        tmp_base = Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent" / "tmp"
 
     try:
         lock_f = _acquire_run_lock()
