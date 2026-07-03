@@ -20,7 +20,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(os.environ.get("FIELDKIT_DATA_DIR", str(Path(__file__).parents[5] / "data"))) / "photo-agent"
+_data_dir_raw = os.environ.get("FIELDKIT_DATA_DIR", "")
+if not _data_dir_raw:
+    raise RuntimeError("FIELDKIT_DATA_DIR is not set — add it to your client .env file")
+DATA_DIR = Path(_data_dir_raw) / "photo-agent"
 STATE_FILE = DATA_DIR / "facebook_state.json"
 
 __all__ = [

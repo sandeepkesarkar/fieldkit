@@ -1,22 +1,23 @@
 """
-Tests for scripts/run_e2e_test.py — the Feature 004 end-to-end pipeline test rig.
+Tests for the Feature 004 end-to-end pipeline.
 
 T012: Pre-flight checks (missing env vars, pending approval, FFmpeg, duration range)
 T013: Stage 1 — _compute_frames and _generate_clock_frames
 T014: Stage 2 — _upload_frames_to_drive
-T015: Stage 3 — _run_process_photos and pending-approval polling
+T015: Stage 3 — _run_process_photos
 T016: Stages 4–5 — approval and Facebook post polling, timeout paths
 
 T025: Stage progress output format (US2)
 T028: --cleanup flag (US3)
 
+Helper functions are imported from their stage modules; run_e2e_test re-exports
+them so the import path from this file stays unchanged.
 All external calls (subprocess, drive, state, facebook_state) are mocked.
 """
 
-import math
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -146,8 +147,6 @@ def test_preflight_duration_above_max_mentions_maximum(valid_env, mocker, capsys
 def test_compute_frames_30s_default_spp():
     """30s with spp=4: n_frames=8, spp_effective=4 (formula: n*spp-(n-1)*0.5 ≈ 30)."""
     n_frames, spp_effective = _compute_frames(30, 4)
-    # n=8: 8*4 - 7*0.5 = 32 - 3.5 = 28.5 (close to 30) — accept plan's formula result
-    # The exact n depends on the formula in the plan: ceil((30-0.5)/(4-0.5)) = ceil(29.5/3.5) = ceil(8.43) = 9
     assert n_frames >= 1
     assert spp_effective >= 1
 
@@ -161,8 +160,6 @@ def test_compute_frames_n_frames_within_cap():
 
 def test_compute_frames_large_duration_bumps_spp():
     """When duration requires more than 30 frames, spp_effective > spp_base."""
-    # 300s at spp=4: naive n_frames = ceil((300-0.5)/3.5) = ceil(85.6) = 86 > 30
-    # So n_frames should be capped at 30 and spp_effective > 4
     n_frames, spp_effective = _compute_frames(300, 4)
     assert n_frames == 30
     assert spp_effective > 4
@@ -174,66 +171,34 @@ def test_compute_frames_2s_minimum():
     assert n_frames >= 1
 
 
-def test_generate_clock_frames_calls_ffmpeg(tmp_path):
-    """_generate_clock_frames invokes FFmpeg via subprocess.run."""
-    import scripts.run_e2e_test as rig
-    with patch.object(rig.subprocess, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
-        # Create dummy output files so the existence check passes
-        for i in range(1, 4):
-            (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\xff\xd8\xff\x00")
-        _generate_clock_frames(3, 1700000000, tmp_path)
-    mock_run.assert_called_once()
-    cmd = mock_run.call_args.args[0]
-    assert "ffmpeg" in cmd[0]
+def test_generate_clock_frames_creates_correct_count(tmp_path):
+    """_generate_clock_frames creates exactly n_frames JPEG files."""
+    _generate_clock_frames(3, 1700000000, tmp_path)
+    frames = sorted(tmp_path.glob("frame_*.jpg"))
+    assert len(frames) == 3
 
 
-def test_generate_clock_frames_uses_rate_1(tmp_path):
-    """FFmpeg command uses rate=1 so each frame advances by 1 second."""
-    import scripts.run_e2e_test as rig
-    with patch.object(rig.subprocess, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
-        for i in range(1, 4):
-            (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\xff\xd8\xff\x00")
-        _generate_clock_frames(3, 1700000000, tmp_path)
-    cmd = mock_run.call_args.args[0]
-    full_cmd = " ".join(cmd)
-    assert "rate=1" in full_cmd or "-r 1" in full_cmd or "rate" in full_cmd
+def test_generate_clock_frames_files_are_nonempty(tmp_path):
+    """All generated JPEG frames are non-empty files."""
+    _generate_clock_frames(3, 1700000000, tmp_path)
+    for f in sorted(tmp_path.glob("frame_*.jpg")):
+        assert f.stat().st_size > 0, f"{f.name} is empty"
 
 
-def test_generate_clock_frames_uses_localtime_pts(tmp_path):
-    """FFmpeg drawtext uses localtime PTS expansion for the timestamp overlay."""
-    import scripts.run_e2e_test as rig
-    with patch.object(rig.subprocess, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
-        for i in range(1, 4):
-            (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\xff\xd8\xff\x00")
-        _generate_clock_frames(3, 1700000000, tmp_path)
-    cmd = mock_run.call_args.args[0]
-    full_cmd = " ".join(cmd)
-    assert "localtime" in full_cmd
+def test_generate_clock_frames_sequential_naming(tmp_path):
+    """Frames are named frame_001.jpg, frame_002.jpg, etc."""
+    _generate_clock_frames(4, 1700000000, tmp_path)
+    names = sorted(f.name for f in tmp_path.glob("frame_*.jpg"))
+    assert names == ["frame_001.jpg", "frame_002.jpg", "frame_003.jpg", "frame_004.jpg"]
 
 
-def test_generate_clock_frames_correct_frame_count(tmp_path):
-    """FFmpeg -frames:v argument matches n_frames."""
-    import scripts.run_e2e_test as rig
-    with patch.object(rig.subprocess, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
-        for i in range(1, 6):
-            (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\xff\xd8\xff\x00")
-        _generate_clock_frames(5, 1700000000, tmp_path)
-    cmd = mock_run.call_args.args[0]
-    frames_idx = cmd.index("-frames:v")
-    assert cmd[frames_idx + 1] == "5"
-
-
-def test_generate_clock_frames_raises_on_ffmpeg_failure(tmp_path):
-    """_generate_clock_frames raises RuntimeError when FFmpeg exits non-zero."""
-    import scripts.run_e2e_test as rig
-    with patch.object(rig.subprocess, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=1, stderr=b"error")
-        with pytest.raises(RuntimeError):
-            _generate_clock_frames(3, 1700000000, tmp_path)
+def test_generate_clock_frames_raises_on_bad_font(tmp_path):
+    """_generate_clock_frames raises RuntimeError when the font file does not exist."""
+    import os
+    env_patch = {"FIELDKIT_E2E_FONT_PATH": "/nonexistent/font.ttf"}
+    with patch.dict(os.environ, env_patch):
+        with pytest.raises(RuntimeError, match="font"):
+            _generate_clock_frames(2, 1700000000, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +207,11 @@ def test_generate_clock_frames_raises_on_ffmpeg_failure(tmp_path):
 
 def test_upload_frames_calls_create_folder(tmp_path):
     """_upload_frames_to_drive calls drive.create_folder once with the test name."""
-    import scripts.run_e2e_test as rig
+    import scripts.e2e_stage2_upload_drive as stage2
     for i in range(1, 4):
         (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\x00")
-    with patch.object(rig.drive, "create_folder", return_value="folder_id") as mock_cf, \
-         patch.object(rig.drive, "upload", return_value="file_id"):
+    with patch.object(stage2.drive, "create_folder", return_value="folder_id") as mock_cf, \
+         patch.object(stage2.drive, "upload", return_value="file_id"):
         _upload_frames_to_drive(tmp_path, "e2e-test-20260620-143000", "root_id")
     mock_cf.assert_called_once()
     assert "e2e-test-20260620-143000" in str(mock_cf.call_args)
@@ -254,23 +219,23 @@ def test_upload_frames_calls_create_folder(tmp_path):
 
 def test_upload_frames_uploads_each_frame(tmp_path):
     """_upload_frames_to_drive calls drive.upload for each JPEG frame."""
-    import scripts.run_e2e_test as rig
+    import scripts.e2e_stage2_upload_drive as stage2
     n = 5
     for i in range(1, n + 1):
         (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\x00")
-    with patch.object(rig.drive, "create_folder", return_value="folder_id"), \
-         patch.object(rig.drive, "upload", return_value="file_id") as mock_up:
+    with patch.object(stage2.drive, "create_folder", return_value="folder_id"), \
+         patch.object(stage2.drive, "upload", return_value="file_id") as mock_up:
         _upload_frames_to_drive(tmp_path, "e2e-test-20260620-143000", "root_id")
     assert mock_up.call_count == n
 
 
 def test_upload_frames_uses_jpeg_content_type(tmp_path):
     """drive.upload is called with content_type='image/jpeg' for all frames."""
-    import scripts.run_e2e_test as rig
+    import scripts.e2e_stage2_upload_drive as stage2
     for i in range(1, 3):
         (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\x00")
-    with patch.object(rig.drive, "create_folder", return_value="folder_id"), \
-         patch.object(rig.drive, "upload", return_value="fid") as mock_up:
+    with patch.object(stage2.drive, "create_folder", return_value="folder_id"), \
+         patch.object(stage2.drive, "upload", return_value="fid") as mock_up:
         _upload_frames_to_drive(tmp_path, "test-name", "root_id")
     for c in mock_up.call_args_list:
         kw = c.kwargs
@@ -279,11 +244,11 @@ def test_upload_frames_uses_jpeg_content_type(tmp_path):
 
 def test_upload_frames_returns_folder_and_file_ids(tmp_path):
     """_upload_frames_to_drive returns (folder_id, [file_id, ...])."""
-    import scripts.run_e2e_test as rig
+    import scripts.e2e_stage2_upload_drive as stage2
     for i in range(1, 3):
         (tmp_path / f"frame_{i:03d}.jpg").write_bytes(b"\x00")
-    with patch.object(rig.drive, "create_folder", return_value="the_folder"), \
-         patch.object(rig.drive, "upload", side_effect=["fid_1", "fid_2"]):
+    with patch.object(stage2.drive, "create_folder", return_value="the_folder"), \
+         patch.object(stage2.drive, "upload", side_effect=["fid_1", "fid_2"]):
         folder_id, file_ids = _upload_frames_to_drive(tmp_path, "test-name", "root_id")
     assert folder_id == "the_folder"
     assert file_ids == ["fid_1", "fid_2"]
@@ -295,10 +260,8 @@ def test_upload_frames_returns_folder_and_file_ids(tmp_path):
 
 def test_run_process_photos_calls_subprocess(mocker):
     """_run_process_photos launches process_photos.py via subprocess.run."""
-    import scripts.run_e2e_test as rig
-    mock_run = mocker.patch.object(rig.subprocess, "run", return_value=MagicMock(returncode=0))
-    mocker.patch.object(rig.state, "get_pending_approval",
-                        return_value={"project_name": "e2e-test-20260620-143000"})
+    import scripts.e2e_stage3_process as stage3
+    mock_run = mocker.patch.object(stage3.subprocess, "run", return_value=MagicMock(returncode=0))
     _run_process_photos("e2e-test-20260620-143000", spp_effective=4, timeout=30)
     mock_run.assert_called_once()
     cmd = mock_run.call_args.args[0]
@@ -307,10 +270,8 @@ def test_run_process_photos_calls_subprocess(mocker):
 
 def test_run_process_photos_passes_project_arg(mocker):
     """process_photos.py is invoked with --project set to the test name."""
-    import scripts.run_e2e_test as rig
-    mock_run = mocker.patch.object(rig.subprocess, "run", return_value=MagicMock(returncode=0))
-    mocker.patch.object(rig.state, "get_pending_approval",
-                        return_value={"project_name": "e2e-test-20260620-143000"})
+    import scripts.e2e_stage3_process as stage3
+    mock_run = mocker.patch.object(stage3.subprocess, "run", return_value=MagicMock(returncode=0))
     _run_process_photos("e2e-test-20260620-143000", spp_effective=4, timeout=30)
     cmd = mock_run.call_args.args[0]
     assert "--project" in cmd
@@ -319,20 +280,17 @@ def test_run_process_photos_passes_project_arg(mocker):
 
 def test_run_process_photos_passes_spp_env(mocker):
     """process_photos.py subprocess receives SECONDS_PER_PHOTO in its environment."""
-    import scripts.run_e2e_test as rig
-    mock_run = mocker.patch.object(rig.subprocess, "run", return_value=MagicMock(returncode=0))
-    mocker.patch.object(rig.state, "get_pending_approval",
-                        return_value={"project_name": "e2e-test-20260620-143000"})
+    import scripts.e2e_stage3_process as stage3
+    mock_run = mocker.patch.object(stage3.subprocess, "run", return_value=MagicMock(returncode=0))
     _run_process_photos("e2e-test-20260620-143000", spp_effective=7, timeout=30)
-    env = mock_run.call_args.kwargs.get("env") or mock_run.call_args.args[1] if len(mock_run.call_args.args) > 1 else {}
     env = mock_run.call_args.kwargs.get("env", {})
     assert env.get("SECONDS_PER_PHOTO") == "7"
 
 
 def test_run_process_photos_raises_on_nonzero_exit(mocker):
     """_run_process_photos raises RuntimeError when process_photos.py exits non-zero."""
-    import scripts.run_e2e_test as rig
-    mocker.patch.object(rig.subprocess, "run", return_value=MagicMock(returncode=1))
+    import scripts.e2e_stage3_process as stage3
+    mocker.patch.object(stage3.subprocess, "run", return_value=MagicMock(returncode=1))
     with pytest.raises(RuntimeError):
         _run_process_photos("e2e-test-20260620-143000", spp_effective=4, timeout=30)
 
@@ -343,45 +301,45 @@ def test_run_process_photos_raises_on_nonzero_exit(mocker):
 
 def test_wait_for_approval_returns_when_approval_cleared(mocker):
     """_wait_for_approval returns when pending_approval is None and fb upload is enqueued."""
-    import scripts.run_e2e_test as rig
-    mocker.patch.object(rig.state, "get_pending_approval", return_value=None)
-    mocker.patch.object(rig.facebook_state, "get_pending_upload",
+    import scripts.e2e_stage4_await_approval as stage4
+    mocker.patch.object(stage4.state, "get_pending_approval", return_value=None)
+    mocker.patch.object(stage4.facebook_state, "get_pending_upload",
                         return_value={"project_name": "e2e-test-20260620-143000", "status": "pending"})
-    mocker.patch("scripts.run_e2e_test.time.sleep")
+    mocker.patch("scripts.e2e_stage4_await_approval.time.sleep")
     _wait_for_approval("e2e-test-20260620-143000", timeout=60)  # must not raise
 
 
 def test_wait_for_approval_exits_on_timeout(mocker):
     """_wait_for_approval raises SystemExit (or RuntimeError) when the timeout elapses."""
-    import scripts.run_e2e_test as rig
-    mocker.patch.object(rig.state, "get_pending_approval",
+    import scripts.e2e_stage4_await_approval as stage4
+    mocker.patch.object(stage4.state, "get_pending_approval",
                         return_value={"project_name": "e2e-test-20260620-143000"})
-    mocker.patch.object(rig.facebook_state, "get_pending_upload", return_value=None)
-    mocker.patch("scripts.run_e2e_test.time.sleep")
-    mocker.patch("scripts.run_e2e_test.time.time", side_effect=[0, 0, 70])  # start, check, elapsed > 60
+    mocker.patch.object(stage4.facebook_state, "get_pending_upload", return_value=None)
+    mocker.patch("scripts.e2e_stage4_await_approval.time.sleep")
+    mocker.patch("scripts.e2e_stage4_await_approval.time.time", side_effect=[0, 0, 70])
     with pytest.raises((SystemExit, RuntimeError)):
         _wait_for_approval("e2e-test-20260620-143000", timeout=60)
 
 
 def test_wait_for_facebook_post_returns_post_id_on_success(mocker):
     """_wait_for_facebook_post returns the post_id when status becomes 'published'."""
-    import scripts.run_e2e_test as rig
-    mocker.patch.object(rig.facebook_state, "get_pending_upload",
+    import scripts.e2e_stage5_await_facebook as stage5
+    mocker.patch.object(stage5.facebook_state, "get_pending_upload",
                         return_value={"project_name": "e2e-test-20260620-143000",
                                       "status": "published", "fb_post_id": "post_abc"})
-    mocker.patch("scripts.run_e2e_test.time.sleep")
+    mocker.patch("scripts.e2e_stage5_await_facebook.time.sleep")
     result = _wait_for_facebook_post("e2e-test-20260620-143000", timeout=60)
     assert result == "post_abc"
 
 
 def test_wait_for_facebook_post_exits_on_timeout(mocker):
     """_wait_for_facebook_post raises SystemExit (or RuntimeError) when timeout elapses."""
-    import scripts.run_e2e_test as rig
-    mocker.patch.object(rig.facebook_state, "get_pending_upload",
+    import scripts.e2e_stage5_await_facebook as stage5
+    mocker.patch.object(stage5.facebook_state, "get_pending_upload",
                         return_value={"project_name": "e2e-test-20260620-143000",
                                       "status": "pending", "fb_post_id": None})
-    mocker.patch("scripts.run_e2e_test.time.sleep")
-    mocker.patch("scripts.run_e2e_test.time.time", side_effect=[0, 0, 70])
+    mocker.patch("scripts.e2e_stage5_await_facebook.time.sleep")
+    mocker.patch("scripts.e2e_stage5_await_facebook.time.time", side_effect=[0, 0, 70])
     with pytest.raises((SystemExit, RuntimeError)):
         _wait_for_facebook_post("e2e-test-20260620-143000", timeout=60)
 
@@ -416,7 +374,6 @@ def test_print_stage_has_timestamp_prefix(capsys):
     from scripts.run_e2e_test import _print_stage
     _print_stage(3, 5, "Some stage", "ok", 10.0)
     out = capsys.readouterr().out
-    # Matches [digits:digits:digits] at the start
     import re
     assert re.match(r"^\[\d{2}:\d{2}:\d{2}\]", out.strip())
 
@@ -428,11 +385,10 @@ def test_print_stage_has_timestamp_prefix(capsys):
 def test_cleanup_calls_drive_delete(mocker):
     """_cleanup() calls drive.delete with the folder_id."""
     import scripts.run_e2e_test as rig
-    from tools.facebook_api import FacebookUploadError
-    mock_delete = mocker.patch.object(rig.drive, "delete")
+    mocker.patch.object(rig.drive, "delete")
     mocker.patch("scripts.run_e2e_test.facebook_api.delete_post")
     _cleanup("folder_abc", "post_xyz", "page_token")
-    mock_delete.assert_called_once_with("folder_abc")
+    rig.drive.delete.assert_called_once_with("folder_abc")
 
 
 def test_cleanup_calls_facebook_delete_post(mocker):

@@ -28,7 +28,7 @@ which gws || { echo "ERROR: gws not found — check installation"; exit 1; }
 If either check fails, report the error and stop. Otherwise run:
 
 ```bash
-cd ~/src/fieldkit/clients/_demo/src/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
+cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
 timeout 660 python3 scripts/process_photos.py --project "<extracted_project_name>" 2>&1
 ```
 

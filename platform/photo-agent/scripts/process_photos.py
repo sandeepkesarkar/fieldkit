@@ -27,10 +27,16 @@ from typing import NoReturn
 
 from dotenv import load_dotenv
 
-# Must be called before any FieldKit module import: state.py and logger.py compute
-# DATA_DIR/LOG_DIR as module-level constants at import time, so FIELDKIT_DATA_DIR
-# and FIELDKIT_LOG_DIR in .env only take effect if os.environ is populated first.
-load_dotenv(Path(__file__).parents[1] / ".env")
+# Two-step env loading: root config first (CLIENT_NAME, FIELDKIT_ROOT), then
+# client secrets (override=True so client values win). Must run before any
+# FieldKit module import — state.py and logger.py raise RuntimeError at import
+# time if FIELDKIT_DATA_DIR / FIELDKIT_LOG_DIR are unset.
+_ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
+load_dotenv(_ROOT / ".env")
+_CLIENT = os.environ.get("CLIENT_NAME")
+if not _CLIENT:
+    sys.exit("ERROR: CLIENT_NAME is not set in fieldkit/.env")
+load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", override=True)
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -42,7 +48,7 @@ from tools.video_generator import FFmpegVideoGenerator, VideoConfig, VideoGenera
 
 _log = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).parents[5]
+_REPO_ROOT = Path(__file__).parents[3]
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 
 _MIN_PHOTOS = 2
@@ -73,10 +79,7 @@ def _telegram_error(message: str) -> NoReturn:
 
 def _acquire_run_lock():
     """Exclusively lock data/photo-agent/run.lock. Returns the open file object."""
-    data_dir = (
-        Path(os.environ.get("FIELDKIT_DATA_DIR", str(_REPO_ROOT / "data")))
-        / "photo-agent"
-    )
+    data_dir = Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent"
     data_dir.mkdir(parents=True, exist_ok=True)
     f = open(data_dir / "run.lock", "w")
     fcntl.flock(f, fcntl.LOCK_EX)

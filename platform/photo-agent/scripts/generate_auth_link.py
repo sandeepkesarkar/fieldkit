@@ -27,7 +27,12 @@ from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv, set_key
 
-load_dotenv(Path(__file__).parents[1] / ".env")
+_ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
+load_dotenv(_ROOT / ".env")
+_CLIENT = os.environ.get("CLIENT_NAME")
+if not _CLIENT:
+    sys.exit("ERROR: CLIENT_NAME is not set in fieldkit/.env")
+load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", override=True)
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -36,7 +41,7 @@ from tools.facebook_api import FacebookUploadError
 
 _log = logging.getLogger(__name__)
 
-_ENV_PATH = Path(__file__).parents[1] / ".env"
+_ENV_PATH = _ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env"
 _OAUTH_SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]
 
 

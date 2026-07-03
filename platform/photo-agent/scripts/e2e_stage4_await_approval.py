@@ -1,0 +1,82 @@
+"""
+e2e_stage4_await_approval.py — E2E Stage 4: Wait for Telegram approval.
+
+Polls state.json and facebook_state.json until check_approval.py has cleared
+the pending_approval and enqueued a Facebook upload for this test run.
+
+Tap Approve in Telegram while this script is polling. If not using cron,
+run check_approval.py in another terminal to process the approval.
+
+Usage:
+    python3 scripts/e2e_stage4_await_approval.py
+    python3 scripts/e2e_stage4_await_approval.py --timeout 600
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+_ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
+load_dotenv(_ROOT / ".env")
+_CLIENT = os.environ.get("CLIENT_NAME")
+if not _CLIENT:
+    sys.exit("ERROR: CLIENT_NAME is not set in fieldkit/.env")
+load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", override=True)
+
+sys.path.insert(0, str(Path(__file__).parents[1]))
+
+from tools import facebook_state, state
+
+_DATA_DIR = Path(os.environ.get("FIELDKIT_DATA_DIR", str(Path(__file__).parents[3] / "data"))) / "photo-agent"
+_RUN_STATE_FILE = _DATA_DIR / "e2e_run_state.json"
+_POLL_INTERVAL = 10
+
+
+def _wait_for_approval(test_name: str, timeout: int) -> None:
+    """Poll until pending_approval is cleared and a matching FB upload is enqueued.
+
+    Raises SystemExit on timeout.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pending = state.get_pending_approval()
+        fb = facebook_state.get_pending_upload()
+        if pending is None and fb is not None and fb.get("project_name") == test_name:
+            return
+        time.sleep(_POLL_INTERVAL)
+    raise SystemExit(f"Stage 4 timed out after {timeout}s waiting for approval of {test_name}")
+
+
+def main(argv=None) -> None:
+    """Entry point — read run state, poll for approval."""
+    parser = argparse.ArgumentParser(description="E2E Stage 4: Wait for Telegram approval.")
+    parser.add_argument("--timeout", type=int, default=600,
+                        help="Timeout in seconds (default 600)")
+    args = parser.parse_args(argv)
+
+    if not _RUN_STATE_FILE.exists():
+        print(f"ERROR: No run state at {_RUN_STATE_FILE} — run Stages 1–3 first.", file=sys.stderr)
+        sys.exit(1)
+
+    run_state = json.loads(_RUN_STATE_FILE.read_text())
+    test_name = run_state["test_name"]
+
+    print(f"Waiting for approval of {test_name} (timeout: {args.timeout}s)...")
+    print("  Approve in Telegram. Run check_approval.py if not using cron.")
+
+    try:
+        _wait_for_approval(test_name, args.timeout)
+    except SystemExit as exc:
+        print(f"Stage 4 ❌ — {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Stage 4 ✅ — Approved, FB upload enqueued")
+
+
+if __name__ == "__main__":
+    main()
