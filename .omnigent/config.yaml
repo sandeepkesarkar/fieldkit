@@ -1,0 +1,9 @@
+# Points at dev-infrastructure's committed Polly config (single source of
+# truth for cross-vendor review pinning, cost cap, and skills) rather than
+# vendoring a copy here. Assumes fieldkit and dev-infrastructure are checked
+# out as sibling directories (true on servicehub-dev, the only machine this
+# runs on). `omnigent run` (no args) from this repo now launches Polly
+# scoped to this workspace -- matching dev-infrastructure's own setup, so
+# fieldkit work gets the same automatic Codex cross-review when routed
+# through Polly instead of run directly.
+default_agent: ../dev-infrastructure/omnigent/polly/config.yaml
