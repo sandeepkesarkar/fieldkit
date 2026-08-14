@@ -1,0 +1,141 @@
+# Hermes Agent — Telegram Gateway Setup (Mac Mini / `servicehub-dev`)
+
+Covers issue #6: replacing OpenClaw's Telegram gateway with Hermes's, with
+Anthropic as the default model provider. Builds on
+[`01-install.md`](01-install.md) (issue #5). Skill dispatch
+(`process_photos`, `check_approval`) is separate (#7, #8) — this note stops at
+a working, supervised gateway that receives a Telegram message and replies.
+
+Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-hermes-runtime/spec.md) (FR-001, FR-004).
+
+## Sequence — happy path
+
+```mermaid
+sequenceDiagram
+    actor Admin
+    participant TG as Telegram
+    participant GW as Hermes Gateway (launchd)
+    participant Claude as Anthropic API
+
+    Admin->>TG: sends message / taps button
+    TG->>GW: long-poll getUpdates
+    GW->>Claude: agent turn (skill dispatch)
+    Claude-->>GW: response
+    GW->>TG: sendMessage
+    TG-->>Admin: reply delivered
+```
+
+## What was configured
+
+1. **Model provider — Anthropic, default.**
+   ```bash
+   hermes config set model.provider anthropic
+   hermes config set model.default claude-sonnet-5
+   ```
+   `ANTHROPIC_API_KEY` was added to `~/.hermes/.env` directly by the admin
+   (not passed through this session — see PR discussion). Verified with
+   `hermes doctor` → `✓ Anthropic API`.
+
+   Chose `claude-sonnet-5` (Claude 5 family) over the config template's
+   stale default (`claude-opus-4.6`) — current-generation model, and Sonnet
+   is the right cost/capability point for tool-calling skill dispatch versus
+   Opus.
+
+2. **Telegram credentials — reused the existing `_demo` bot.**
+   `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` (the admin's chat ID)
+   were copied from `clients/_demo/src/photo-agent/.env` into
+   `~/.hermes/.env` — this is the same bot OpenClaw was already using, not a
+   new one. Copied via a script that reads the source value and writes it
+   directly to the destination file without the value passing through the
+   session transcript.
+
+   Also required: `python-telegram-bot` (optional Hermes dependency, not
+   installed by `--skip-browser` since it isn't a browser tool):
+   ```bash
+   cd ~/.hermes/hermes-agent
+   uv pip install python-telegram-bot --python ~/.hermes/hermes-agent/venv/bin/python
+   ```
+
+3. **Gateway installed as an always-on supervisor**, mirroring OpenClaw's
+   prior `launchd` behavior:
+   ```bash
+   hermes gateway install --start-now --start-on-login
+   ```
+   Installs `~/Library/LaunchAgents/ai.hermes.gateway.plist` (label
+   `ai.hermes.gateway`), auto-restarts on crash, auto-starts at login.
+
+## Quirk: Telegram single-poller conflict with OpenClaw
+
+Telegram's Bot API allows only one active `getUpdates` long-poll per bot
+token. Since Hermes is reusing OpenClaw's bot token, both gateways running
+at once produced:
+
+```
+Conflict: terminated by other getUpdates request; make sure that only one
+bot instance is running
+```
+
+**Fix:** unloaded (not uninstalled) OpenClaw's launchd service —
+`launchctl unload ~/Library/LaunchAgents/ai.openclaw.gateway.plist` — freeing
+the poll for Hermes. This is reversible (`launchctl load` to restore) and was
+confirmed with the admin before running, since it stops a live service. Full
+OpenClaw uninstall is separate (#14), once #7/#8 port the remaining skills
+and there's nothing left depending on it.
+
+## Verification
+
+Manual checklist (no automated test for gateway supervision itself — a
+running background service isn't something a unit test exercises):
+
+- [x] `hermes doctor` → `✓ Anthropic API`
+- [x] `hermes gateway status` → `✓ Gateway is supervised by launchd (PID ...)`, auto-start and auto-restart both available
+- [x] Gateway log shows `[Telegram] Connected to Telegram (polling mode)` and `✓ telegram connected`
+- [x] Admin sent `/start` → correctly ignored as a platform ping (`Ignoring /start platform ping for session agent:main:telegram:dm:<chat_id>` — expected Hermes behavior, not routed to the agent)
+- [x] Admin sent a plain-text message (`Hi`) → logged as `inbound message: platform=telegram user=Sandeep Kesarkar chat=<chat_id> msg='Hi'`, dispatched to Anthropic (`response ready: ... api_calls=1 response=436 chars`), and delivered back to Telegram
+
+```
+2026-08-14 10:36:41 [Telegram] Flushing text batch agent:main:telegram:dm:<chat_id> (2 chars)
+2026-08-14 10:36:41 inbound message: platform=telegram user=Sandeep Kesarkar chat=<chat_id> msg='Hi' ...
+2026-08-14 10:36:48 response ready: platform=telegram chat=<chat_id> time=7.2s api_calls=1 response=436 chars
+2026-08-14 10:36:48 [Telegram] Sending response (436 chars) to <chat_id>
+```
+
+## Switching a client to OpenAI
+
+For a future OpenAI-backed client (#12), the provider swap is:
+
+```bash
+hermes config set model.provider openai-codex   # or "custom" pointed at OpenAI's endpoint
+```
+
+or, for a plain OpenAI API key rather than OAuth, set `provider: "custom"`
+with `base_url: "https://api.openai.com/v1"` under `model:` in
+`config.yaml`, and put `OPENAI_API_KEY` in `.env`. (`hermes auth list`
+already shows an `OPENAI_API_KEY` credential available in this environment —
+untouched by this issue, just noted for #12.)
+
+**Open question for #11/#12, not resolved here:** this Hermes install is a
+single gateway process with one global `config.yaml`/`.env` on this Mac
+Mini. Two demo customers each needing their *own* provider (Anthropic vs
+OpenAI) and their own bot token means either separate named gateway profiles
+(`hermes gateway list` shows profile support — `default` is the only one
+today) or Hermes's per-client model-routing block
+(`platforms.api_server.extra.model_routes` in `config.yaml`). Deciding
+between those is #11/#12's problem, not this issue's — flagging it here so
+it isn't a surprise.
+
+## Install/config locations touched
+
+| What | Where |
+|---|---|
+| Model provider config | `~/.hermes/config.yaml` (`model.provider`, `model.default`) |
+| Secrets | `~/.hermes/.env` (`ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`) |
+| Gateway supervisor | `~/Library/LaunchAgents/ai.hermes.gateway.plist` |
+| Gateway logs | `~/.hermes/logs/gateway.log` |
+| OpenClaw gateway (unloaded, not removed) | `~/Library/LaunchAgents/ai.openclaw.gateway.plist` |
+
+## Next steps (separate issues)
+
+- #7 / #8 — port `process_photos` / `check_approval` dispatch as Hermes skills
+- #11 / #12 — Anthropic-backed / OpenAI-backed demo customers (resolves the multi-client provider question above)
+- #14 — uninstall OpenClaw once nothing depends on it
