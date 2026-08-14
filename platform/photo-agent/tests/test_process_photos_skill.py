@@ -1,11 +1,13 @@
 """
-Structural tests for the Hermes process_photos skill (platform/.specify/003-hermes-runtime,
+Structural tests for the Hermes process-photos skill (platform/.specify/003-hermes-runtime,
 issue #7).
 
 SKILL.md is prose an LLM follows, not executable code, so these tests can't
-exercise the dispatch behavior itself (verified manually — see
-platform/docs/hermes/03-process-photos-skill.md). What they can and do check:
-the skill's documented contract stays consistent with the script it dispatches
+exercise the dispatch behavior itself. Dispatch-path coverage (Hermes
+actually routing a command to this file) lives in
+test_process_photos_dispatch.py; manual LLM-driven verification is in
+platform/docs/hermes/03-process-photos-skill.md. What these tests check: the
+skill's documented contract stays consistent with the script it dispatches
 to, so an edit to one side can't silently drift from the other.
 """
 
@@ -13,7 +15,7 @@ import re
 from pathlib import Path
 
 _SKILL_PATH = (
-    Path(__file__).resolve().parents[1] / "skills" / "process_photos" / "SKILL.md"
+    Path(__file__).resolve().parents[1] / "skills" / "process-photos" / "SKILL.md"
 )
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "process_photos.py"
 
@@ -35,12 +37,15 @@ def test_skill_file_exists():
     assert _SKILL_PATH.is_file(), f"expected skill at {_SKILL_PATH}"
 
 
-def test_frontmatter_name_matches_slash_command():
-    """The skill's `name` becomes its Telegram slash command (no separate
-    user-invocable field in Hermes) -- must stay `process_photos` (underscore)
-    to match the admin's existing muscle memory from OpenClaw."""
+def test_frontmatter_name_is_spec_compliant_and_hyphenated():
+    """The skill's `name` must be lowercase letters/digits/hyphens only, per
+    the agentskills.io spec (no underscores). Hermes normalizes this to the
+    same internal command key and auto-converts it to underscores for the
+    actual Telegram bot command regardless (see test_process_photos_dispatch.py
+    and platform/docs/hermes/03-process-photos-skill.md), so the admin's
+    `/process_photos` muscle memory from OpenClaw is unaffected by this."""
     frontmatter, _ = _read_skill()
-    assert re.search(r"^name:\s*process_photos\s*$", frontmatter, re.MULTILINE)
+    assert re.search(r"^name:\s*process-photos\s*$", frontmatter, re.MULTILINE)
 
 
 def test_prerequisites_list_required_binaries():

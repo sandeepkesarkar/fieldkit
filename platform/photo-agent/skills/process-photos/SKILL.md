@@ -1,5 +1,5 @@
 ---
-name: process_photos
+name: process-photos
 description: "Generate a video from photos in a Google Drive project folder and send it to the admin for approval."
 version: 1.0.0
 author: FieldKit
@@ -24,8 +24,33 @@ OpenClaw -> Hermes mapping (issue #7, platform/.specify/003-hermes-runtime/spec.
   prerequisite-checking behavior.
 - Invocation: OpenClaw needed `user-invocable: true` in frontmatter to expose
   a skill as a manual command. Hermes has no such field -- every installed
-  skill's `name` is automatically a slash command (here, `/process_photos`,
-  unchanged from today).
+  skill's `name` is automatically a slash command.
+- Naming (cross-review finding, issue #18): the agentskills.io spec requires
+  `name` to be lowercase letters/digits/hyphens only -- no underscores. This
+  file originally used `name: process_photos` to match the admin's existing
+  `/process_photos` muscle memory, but that violates the spec. Verified in
+  Hermes's own source (`~/.hermes/hermes-agent/agent/skill_commands.py`,
+  `scan_skill_commands()`) that this was unnecessary: Hermes *always*
+  normalizes a skill's `name` to a hyphenated slug for its internal command
+  key (`name.lower().replace('_', '-')`, then strips anything not
+  `[a-z0-9-]`), regardless of whether the frontmatter uses `_` or `-`.
+  Separately, `hermes_cli/commands.py::_sanitize_telegram_name()` converts
+  that hyphenated key back to underscores when registering the Telegram bot
+  command, because Telegram itself restricts command names to
+  `[a-z0-9_]` -- so the bot command stays `/process_photos` either way.
+  `agent/skill_commands.py::resolve_skill_command_key()` also treats `-`/`_`
+  as interchangeable on lookup, for the same reason. Confirmed empirically
+  from the Hermes venv:
+  `scan_skill_commands()` mapped this file to `/process-photos` even before
+  this rename (frontmatter still said `process_photos`), and
+  `resolve_skill_command_key('process_photos')` already resolved to
+  `/process-photos`. So renaming `name:` to `process-photos` here is a
+  no-op for dispatch -- verified with `hermes skills list` after the rename
+  (see platform/docs/hermes/03-process-photos-skill.md) -- and brings the
+  frontmatter into spec compliance. The Telegram-facing command the admin
+  actually types stays `/process_photos` (unchanged, per Telegram's own
+  underscore-only restriction), which is why the body text below still says
+  `/process_photos`, not `/process-photos`.
 - Discovery / sync: OpenClaw skills were manually synced into
   `~/.openclaw/workspace/skills/` (see fieldkit's
   `openclaw_skill_cache` notes -- editing SKILL_*.md required a manual resync
@@ -40,7 +65,7 @@ OpenClaw -> Hermes mapping (issue #7, platform/.specify/003-hermes-runtime/spec.
   instructions either way, not runtime-specific syntax.
 -->
 
-# process_photos
+# process-photos
 
 The admin provides a project name after the command (e.g. `/process_photos kitchen_remodel`).
 

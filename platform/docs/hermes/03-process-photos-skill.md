@@ -1,8 +1,14 @@
-# process_photos as a Hermes Skill (issue #7)
+# process-photos as a Hermes Skill (issue #7)
 
 Replaces OpenClaw's `SKILL_process_photos.md` with a Hermes-native skill at
-`platform/photo-agent/skills/process_photos/SKILL.md`. `process_photos.py`
+`platform/photo-agent/skills/process-photos/SKILL.md`. `process_photos.py`
 itself is unchanged — this is a dispatch-layer swap only, per FR-002.
+
+The skill's `name:` is `process-photos` (hyphenated, per the agentskills.io
+spec). The Telegram slash command the admin actually types stays
+`/process_photos` (underscore) — Hermes auto-converts hyphens to underscores
+when it registers a Telegram bot command, because Telegram itself restricts
+command names to `[a-z0-9_]`. See "Naming: hyphen vs. underscore" below.
 
 ## Setup: `skills.external_dirs`
 
@@ -18,13 +24,72 @@ skills:
 ```
 
 No copy step, no stale-cache risk — edit `SKILL.md`, Hermes picks it up on
-the next turn. Verified with `hermes skills list`:
+the next turn. Verified with `hermes skills list --source local`:
 
 ```
-│ process_photos          │                      │ local   │ local   │ enabled │
+┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━┓
+┃ Name           ┃ Category ┃ Source ┃ Trust ┃ Status  ┃
+┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━━┩
+│ process-photos │          │ local  │ local │ enabled │
+└────────────────┴──────────┴────────┴───────┴─────────┘
+0 hub-installed, 0 builtin, 1 local — 1 enabled, 0 disabled
 ```
+
+(captured on the issue-7-process-photos-skill branch with
+`skills.external_dirs` temporarily pointed at this branch's worktree, since
+the skill isn't merged to `main` yet — same discovery mechanism the running
+gateway uses against the real `~/src/fieldkit` checkout post-merge.)
 
 Applied to the running gateway with `hermes gateway restart`.
+
+## Naming: hyphen vs. underscore (cross-review finding, PR #18)
+
+Cross-review flagged that `name: process_photos` violates the agentskills.io
+spec (`name` must be lowercase letters/digits/hyphens only — no
+underscores), but pointed out the tension: Telegram bot commands themselves
+can't contain hyphens (Telegram restricts command names to `[a-z0-9_]`).
+
+Investigated Hermes's own source rather than guessing:
+
+- `agent/skill_commands.py::scan_skill_commands()` normalizes **any**
+  skill's frontmatter `name` to a hyphenated slug for its internal command
+  key — `name.lower().replace('_', '-')`, then strips anything outside
+  `[a-z0-9-]`. This runs regardless of whether the frontmatter itself used
+  `_` or `-`.
+- `hermes_cli/commands.py::_sanitize_telegram_name()` then converts that
+  hyphenated key **back** to underscores when registering the actual
+  Telegram bot command, specifically because Telegram disallows hyphens.
+  Its own docstring gives `/claude-code` → registered as `/claude_code` as
+  the worked example.
+- `agent/skill_commands.py::resolve_skill_command_key()` treats `-`/`_` as
+  interchangeable on lookup for the same reason (its docstring: "Hyphens and
+  underscores are treated interchangeably in user input").
+
+So Hermes was already normalizing `process_photos` → `/process-photos`
+internally before this fix — the underscore in the frontmatter was doing
+nothing for dispatch. Verified empirically, from the Hermes venv, **before**
+renaming (frontmatter still said `name: process_photos`):
+
+```
+$ ~/.hermes/hermes-agent/venv/bin/python -c "
+from agent.skill_commands import scan_skill_commands, resolve_skill_command_key
+cmds = scan_skill_commands()
+for k, v in cmds.items():
+    if 'photo' in k: print(k, '->', v['skill_md_path'])
+print('resolve process_photos ->', resolve_skill_command_key('process_photos'))
+print('resolve process-photos ->', resolve_skill_command_key('process-photos'))
+"
+/process-photos -> .../platform/photo-agent/skills/process_photos/SKILL.md
+resolve process_photos -> /process-photos
+resolve process-photos -> /process-photos
+```
+
+Ran the identical script again after renaming the frontmatter to
+`name: process-photos` — same output (`skill_md_path` now pointing at the
+renamed directory) — confirming the rename is a no-op for dispatch. Renamed
+for spec compliance; the Telegram-facing command the admin types stays
+`/process_photos` (Telegram's own underscore-only restriction, unaffected by
+this frontmatter change).
 
 ## OpenClaw → Hermes mapping
 
@@ -33,9 +98,9 @@ Full reasoning lives as an HTML comment at the top of the skill file itself
 
 - **Slash command**: no more `user-invocable: true` frontmatter field —
   every installed skill's `name` is automatically a slash command in Hermes.
-  Named the skill `process_photos` (underscore, matching the script and the
-  admin's existing `/process_photos` muscle memory) rather than following
-  the hyphenated convention used by Hermes's own bundled skills.
+  Named the skill `process-photos` (hyphenated, agentskills.io-compliant —
+  see "Naming" above); the Telegram command the admin types stays
+  `/process_photos`, matching prior muscle memory from OpenClaw.
 - **Prerequisites**: OpenClaw's `metadata.openclaw.requires.bins` had no
   Hermes equivalent (no declarative prerequisite-enforcement mechanism).
   Used the agentskills.io-standard `prerequisites.commands` field
@@ -47,15 +112,27 @@ Full reasoning lives as an HTML comment at the top of the skill file itself
 
 ## Verification
 
-SKILL.md is prose, not executable code — `platform/photo-agent/tests/
-test_process_photos_skill.py` checks structural consistency (frontmatter
-name, prerequisites, the skill's stated validation regex matching
-`scripts/process_photos.py`'s actual `_PROJECT_NAME_RE`, verbatim-relay
-instructions present) but can't exercise real dispatch. Manual verification
-instead:
+SKILL.md is prose, not executable code, so no automated test can make an LLM
+follow its instructions. Three layers of coverage instead:
 
-- [x] `hermes skills list` shows `process_photos` discovered from the
-  external dir, enabled
+- `platform/photo-agent/tests/test_process_photos_skill.py` — structural
+  consistency (frontmatter name, prerequisites, the skill's stated
+  validation regex matching `scripts/process_photos.py`'s actual
+  `_PROJECT_NAME_RE`, verbatim-relay instructions present).
+- `platform/photo-agent/tests/test_process_photos_dispatch.py` — real
+  dispatch-path coverage (cross-review finding, PR #18). Runs Hermes's own
+  `scan_skill_commands()` / `resolve_skill_command_key()` (imported from the
+  local Hermes install, executed via Hermes's own venv interpreter) against
+  this skill's actual files, confirming Hermes discovers this exact file,
+  registers it under `/process-photos`, and resolves the Telegram-sanitized
+  `/process_photos` form back to it. No LLM call — deterministic and fast.
+  Skipped automatically where Hermes isn't installed.
+- Manual verification (below) for the parts neither automated layer can
+  reach: an LLM actually following the skill's prose against a live Hermes
+  session.
+
+- [x] `hermes skills list --source local` shows `process-photos` discovered
+  from the external dir, enabled (see "Naming" above for the exact output)
 - [x] Empty argument (`/process_photos`) → correct validation message
 - [x] Invalid argument, realistic case (`/process_photos kitchen remodel`,
   a space) → correct validation message, verbatim match to the skill's
