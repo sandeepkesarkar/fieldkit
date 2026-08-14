@@ -23,6 +23,10 @@ env/
 .env
 !.env.example
 
+# Omnigent per-session Codex home (auth.json copy, sqlite state) — created
+# by `omnigent run --harness codex` invocations in this directory
+.codex-tmp/
+
 
 # Editor
 .vscode/
