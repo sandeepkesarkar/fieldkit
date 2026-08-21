@@ -214,12 +214,20 @@ untrusted content through a file instead of a shell string, for that reason.
      # A plain pipeline statement here would trip `set -e` immediately on
      # failure, before $OMNIGENT_OK could ever be set to reflect that --
      # using it as an `if` condition is exempt from `set -e`'s early exit,
-     # so both branches always run to completion.
+     # so both branches always run to completion. Capture the failure via
+     # plain `$?`, not `${PIPESTATUS[0]}` / `$pipestatus[1]` -- those
+     # arrays are bash- and zsh-specific respectively (different name,
+     # different indexing), and under zsh with `set -u` referencing the
+     # bash-only `PIPESTATUS` aborts outright before this branch can even
+     # finish. `pipefail` (already set above) makes plain `$?` immediately
+     # after the pipeline equal to the *pipeline's* real exit status in
+     # both shells, with no array needed at all -- verified live in bash
+     # and zsh 5.9 (macOS default).
      if omnigent run --harness codex --no-log -p "$(cat "$PROMPT_FILE")" \
           | tee "$REVIEW_FILE"; then
        OMNIGENT_OK=1
      else
-       PIPE_STATUS=${PIPESTATUS[0]}
+       PIPE_STATUS=$?
      fi
      [ "$OMNIGENT_OK" -eq 1 ] || exit "$PIPE_STATUS"
    )
