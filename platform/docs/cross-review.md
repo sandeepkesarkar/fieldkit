@@ -167,11 +167,34 @@ untrusted content through a file instead of a shell string, for that reason.
      # run's -- leave everything for manual review rather than guessing;
      # every entry is still 700-equivalent (Omnigent's own mkdtemp) either
      # way, so leaving one behind isn't a credential-exposure regression.
+     #
+     # That "exactly one new entry = ours" rule only holds when THIS run's
+     # own omnigent invocation actually succeeded. If it fails *before*
+     # creating its own session directory, while a genuinely concurrent,
+     # unrelated omnigent invocation creates its own directory in that same
+     # window, the before/after snapshot still shows exactly one new entry
+     # -- but it's the OTHER session's, not ours (proven live). Auto-
+     # removing on that basis would delete a live concurrent session's
+     # auth.json/state. So: automatic removal only ever runs on the
+     # success path, gated on $OMNIGENT_OK below. On any failure, leave
+     # .codex-tmp/ completely untouched -- whatever is or isn't in there --
+     # and let the operator inspect/clean it up by hand, since ownership
+     # can't be reliably established once this run itself didn't complete.
      BEFORE_LIST=$(mktemp)
      ls -A .codex-tmp > "$BEFORE_LIST" 2>/dev/null || true
+     OMNIGENT_OK=0
+     PIPE_STATUS=0
 
      cleanup() {
        local after new_entries new_count
+       if [ "$OMNIGENT_OK" -ne 1 ]; then
+         echo "omnigent run did not complete successfully -- leaving" \
+              ".codex-tmp/ untouched (ownership of any new entry can't be" \
+              "reliably established after a failure -- see comment above)." \
+              "Inspect it manually if cleanup is needed." >&2
+         rm -f "$BEFORE_LIST"
+         return
+       fi
        after=$(mktemp)
        ls -A .codex-tmp > "$after" 2>/dev/null || true
        new_entries=$(comm -13 <(sort "$BEFORE_LIST") <(sort "$after"))
@@ -188,8 +211,17 @@ untrusted content through a file instead of a shell string, for that reason.
      }
      trap cleanup EXIT
 
-     omnigent run --harness codex --no-log -p "$(cat "$PROMPT_FILE")" \
-       | tee "$REVIEW_FILE"
+     # A plain pipeline statement here would trip `set -e` immediately on
+     # failure, before $OMNIGENT_OK could ever be set to reflect that --
+     # using it as an `if` condition is exempt from `set -e`'s early exit,
+     # so both branches always run to completion.
+     if omnigent run --harness codex --no-log -p "$(cat "$PROMPT_FILE")" \
+          | tee "$REVIEW_FILE"; then
+       OMNIGENT_OK=1
+     else
+       PIPE_STATUS=${PIPESTATUS[0]}
+     fi
+     [ "$OMNIGENT_OK" -eq 1 ] || exit "$PIPE_STATUS"
    )
    OMNIGENT_STATUS=$?
    rm -f "$PROMPT_FILE"
