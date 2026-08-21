@@ -156,17 +156,72 @@ getUpdates ..."), and per FR-002a it's now documented as the sole mechanism
 for the button-tap trigger, not an alternate path alongside a
 Hermes-dispatched one.
 
-**Known follow-up risk, not resolved by this issue:** Telegram's Bot API
-allows only one active `getUpdates` long-poll per bot token (this is exactly
-what forced OpenClaw's gateway to be unloaded when Hermes's gateway went
-live in #6 — see `02-gateway-setup.md`'s "single-poller conflict" note).
-`check_approval.py`'s cron leg polls the same shared bot token Hermes's
-gateway now holds a continuous long-poll on. Whether this produces the same
-`409 Conflict` in practice — and if so, how to resolve it (e.g. moving the
-cron leg's polling onto Hermes's `gateway_platform_event` hook via a custom
-plugin, or a different arbitration scheme) — is out of scope for #8 and
-tracked as a separate follow-up, same as #18 tracked its `gws` OAuth gap as
-follow-up rather than blocking scope.
+**Known follow-up risk — confirmed during PR #21 review, not resolved by
+this issue.** Telegram's Bot API allows only one active `getUpdates`
+long-poll per bot token (this is exactly what forced OpenClaw's gateway to
+be unloaded when Hermes's gateway went live in #6 — see
+`02-gateway-setup.md`'s "single-poller conflict" note). `check_approval.py`'s
+cron leg polls the same shared bot token Hermes's gateway now holds a
+continuous long-poll on.
+
+This is not a theoretical risk. Confirmed from `python-telegram-bot`
+(Hermes's own dependency) source, `venv/lib/.../telegram/ext/_updater.py`,
+`Updater._start_polling`'s `polling_action_cb`:
+
+```python
+if updates:
+    ...
+    for update in updates:
+        await self.update_queue.put(update)
+    self._last_update_id = updates[-1].update_id + 1  # Add one to 'confirm' it
+```
+
+The offset advance is unconditional — it happens for every update PTB
+receives, whether or not any handler (including `_handle_callback_query`
+above) recognizes or acts on it. Telegram's per-token offset is shared
+across every caller; whichever poller's `getUpdates` call returns first
+"confirms" (and removes) that update for everyone. Hermes polls
+continuously; `check_approval.py`'s cron leg polls once a minute. Once both
+are active on the same token, Hermes will consume and offset-past a
+button-tap callback before the cron leg's next run can see it, essentially
+every time — not occasionally. Concurrent overlapping calls can also
+produce a `409 Conflict` outright.
+
+**Live evidence gathered during review (2026-08-21):**
+
+- `~/.hermes/logs/gateway.log` was cycling through `409 Conflict: terminated
+  by other getUpdates request` roughly every 25 seconds, in real time,
+  during the review.
+- That specific conflict is *not* currently `check_approval.py`'s cron leg
+  vs. Hermes, though: `logs/cron.log` shows every cron invocation failing at
+  the OS level —
+  `can't open file '.../clients/_demo/src/photo-agent/scripts/check_approval.py'`
+  — because the crontab entry still points at the pre-Feature-002-migration
+  path. The cron leg never reaches `getUpdates` right now; a separate,
+  pre-existing bug this issue did not introduce.
+- `launchctl list` shows `ai.openclaw.gateway` still loaded alongside
+  `ai.hermes.gateway` right now, contradicting `02-gateway-setup.md`'s claim
+  that OpenClaw was unloaded during #6. The live 409s are almost certainly
+  Hermes vs. OpenClaw, not Hermes vs. the cron leg.
+
+So FR-002a's premise — that the cron leg keeps handling the button tap
+"unchanged" — does not currently hold in practice, for two independent
+pre-existing reasons, and would still face the guaranteed PTB-offset race
+against Hermes even once the crontab path is fixed. None of this was
+introduced by #8, and fixing live crontab/launchd state is outside a
+git-tracked file and outside this issue's scope — not attempted here.
+
+**Decision (admin, PR #21 review thread, 2026-08-21):** FieldKit is moving
+to stop depending on OpenClaw entirely rather than design a long-term
+shared-bot-token arrangement between it and Hermes. This is already the
+existing dependency chain: #13 (verify the cron-triggered scripts, including
+`check_approval.py`'s cron leg, actually run — its acceptance criteria would
+currently fail on both findings above) gates #14 (uninstall OpenClaw from
+the Mac Mini). No new issues opened; findings posted to #13 instead. The
+PTB-offset race against Hermes itself (independent of OpenClaw) is a
+separate, still-open question #13 should also verify once the crontab path
+is corrected — uninstalling OpenClaw alone does not resolve it, since Hermes
+would still be the sole continuous poller racing the cron leg.
 
 ## OpenClaw → Hermes mapping
 
@@ -225,8 +280,10 @@ Two layers of automated coverage, plus one honest gap:
 - Live `hermes skills list` confirmation once merged to `main` (see
   "Verification note" above)
 - Live Telegram round-trip for the manual `/check_approval` command
-- Follow-up: resolve (or confirm absence of) the `getUpdates` single-poller
-  conflict between Hermes's gateway and `check_approval.py`'s cron leg
-- Follow-up: `#14` — uninstall OpenClaw once nothing depends on it (now
-  unblocked for `check_approval`/`process_photos`; still gated on whatever
-  else OpenClaw was doing)
+- `#13` — verify cron-triggered scripts (including `check_approval.py`'s
+  cron leg) actually run; per this issue's review findings, its acceptance
+  criteria would currently fail (stale crontab path) and should also verify
+  the PTB-offset race against Hermes once that's fixed
+- `#14` — uninstall OpenClaw from the Mac Mini (gated on #13; admin decision
+  during PR #21 review to stop depending on OpenClaw entirely rather than
+  design a long-term shared-bot-token arrangement)

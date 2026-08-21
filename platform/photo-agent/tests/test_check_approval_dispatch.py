@@ -21,13 +21,16 @@ in the issue's acceptance criteria, with opposite expected outcomes:
   file, the same positive assertion #18 made for process-photos.
 - Button-callback path: proves the NEGATIVE -- that Hermes's own
   `_handle_callback_query` takes zero action (no answer_callback_query, no
-  edit_message_text, no skill/agent-turn dispatch) for FieldKit's actual
-  `callback_data` values ("approve" / "reject"), and that
-  `_normalize_platform_event` (Hermes's only other generic inbound-event
-  hook) returns None for a bare callback_query update. This is what
-  SKILL.md's HTML-comment mapping documents in prose; this test is the
-  reproducible evidence behind that claim, run against Hermes's real source,
-  not a description of it.
+  edit_message_text) AND makes no call into `adapter._message_handler` (the
+  entry point it would have to use to route a callback into an agent turn /
+  skill invocation, mocked and asserted uncalled -- not merely inferred from
+  the Telegram-visible side effects) for FieldKit's actual `callback_data`
+  values ("approve" / "reject"), and that `_normalize_platform_event`
+  (Hermes's only other generic inbound-event hook) returns None for an
+  update that actually carries a `callback_query`. This is what SKILL.md's
+  HTML-comment mapping documents in prose; this test is the reproducible
+  evidence behind that claim, run against Hermes's real source, not a
+  description of it.
 
 Both probes run under Hermes's own venv interpreter
 (~/.hermes/hermes-agent/venv/bin/python), not fieldkit's -- see
@@ -106,6 +109,12 @@ config = PlatformConfig(enabled=True, token="test-token", extra={})
 adapter = TelegramAdapter(config)
 adapter._bot = AsyncMock()
 adapter._app = MagicMock()
+# Wired so a real dispatch attempt is actually observable, not just inferred
+# from the absence of a Telegram-visible side effect (answer/edit). If
+# _handle_callback_query ever routed a foreign callback through the agent
+# turn, it would do so by calling this -- see adapter.py's other call sites
+# (lines ~961/1138/1215), all outside _handle_callback_query itself.
+adapter._message_handler = AsyncMock()
 
 results = {}
 for cb_data in ("approve", "reject"):
@@ -128,11 +137,17 @@ for cb_data in ("approve", "reject"):
     results[cb_data] = {
         "answer_called": query.answer.called,
         "edit_message_text_called": query.edit_message_text.called,
+        "message_handler_called": adapter._message_handler.called,
     }
+    adapter._message_handler.reset_mock()
 
+# A callback_query-bearing update -- the exact shape a real inbound Telegram
+# button tap produces -- to confirm _normalize_platform_event truly ignores
+# it rather than merely not having been asked about one.
 norm_update = MagicMock()
 norm_update.message_reaction = None
 norm_update.edited_message = None
+norm_update.callback_query = MagicMock()
 results["normalize_platform_event"] = adapter._normalize_platform_event(norm_update)
 
 print(json.dumps(results))
@@ -218,22 +233,29 @@ def test_frontmatter_name_is_the_source_of_the_registered_command(command_dispat
 def test_hermes_takes_no_action_on_a_bare_approve_callback(callback_dispatch_result):
     """FieldKit's Approve button sends callback_data="approve" with no
     Hermes-recognized prefix. Hermes's _handle_callback_query must fall
-    through every branch and do nothing -- proving there is no path from
-    this button tap to a skill or agent-turn dispatch."""
+    through every branch: no Telegram-visible side effect (answer/edit), AND
+    -- the part that actually matters for dispatch -- no call into
+    adapter._message_handler, the entry point _handle_callback_query would
+    have to use to route a callback into an agent turn / skill invocation.
+    Not inferred from the first two; independently asserted via the mocked
+    handler."""
     result = callback_dispatch_result["approve"]
     assert result["answer_called"] is False
     assert result["edit_message_text_called"] is False
+    assert result["message_handler_called"] is False
 
 
 def test_hermes_takes_no_action_on_a_bare_reject_callback(callback_dispatch_result):
     result = callback_dispatch_result["reject"]
     assert result["answer_called"] is False
     assert result["edit_message_text_called"] is False
+    assert result["message_handler_called"] is False
 
 
 def test_generic_platform_event_hook_does_not_cover_callback_query(callback_dispatch_result):
     """_normalize_platform_event is Hermes's only other generic inbound-event
-    escape hatch. It must return None for a callback_query-bearing update --
-    confirming there is no alternate route for a foreign callback_data to
-    reach a skill."""
+    escape hatch. Probed with an update that actually carries a
+    callback_query attribute (not merely omits one) -- it must still return
+    None, confirming there is no alternate route for a foreign callback_data
+    to reach a skill."""
     assert callback_dispatch_result["normalize_platform_event"] is None
