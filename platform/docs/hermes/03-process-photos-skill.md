@@ -170,4 +170,4 @@ port, and not worth hardening against for this issue's scope.
 
 - Live Telegram confirmation when the `_demo` bot is reachable
 - `gws` re-authorization (separate from this issue)
-- #8 — rewrite `check_approval` the same way
+- #8 — rewrite `check_approval` the same way (done — see `04-check-approval-skill.md`; turned out to need a spec amendment first, since Hermes can't dispatch on the button-callback trigger the way it dispatches on `/process_photos`)

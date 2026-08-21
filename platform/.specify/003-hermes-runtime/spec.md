@@ -2,7 +2,7 @@
 
 **Status:** Spec
 **Type:** Platform feature
-**Last Updated:** 2026-08-13
+**Last Updated:** 2026-08-21 (FR-002a amendment, issue #8)
 
 ---
 
@@ -16,7 +16,7 @@ Replace OpenClaw with [Hermes Agent](https://github.com/NousResearch/hermes-agen
 
 **In scope:**
 - Replacing OpenClaw's Telegram gateway with Hermes's gateway
-- Rewriting the two chat-driven skill dispatches (`process_photos` on-demand command, `check_approval` button callback) as Hermes skills
+- Rewriting the two chat-driven skill dispatches (`process_photos` on-demand command, `check_approval` on-demand command) as Hermes skills — see FR-002a: `check_approval`'s button-callback trigger is not a Hermes skill dispatch and stays on its existing cron leg
 - Model provider configuration: Anthropic by default, OpenAI as an explicit per-client choice
 - Preserving governance behavior that actually exists in code today (approval gate, admin allowlist)
 - Updating `constitution.md` and the spec-kit override template to remove architecture claims retired by the Mac Mini → Cloud pivot
@@ -41,12 +41,12 @@ As the admin, I send Telegram commands and tap approve/reject buttons exactly as
 
 **Why this priority:** This is the entire user-facing surface of the runtime. If it doesn't work, nothing else matters.
 
-**Independent test:** Send `/check_approval` and tap Approve on a pending video; confirm the same photo-pipeline behavior as under OpenClaw.
+**Independent test:** Send `/check_approval` (manual command, dispatched by Hermes) and separately tap Approve on a pending video (handled by `check_approval.py`'s existing cron leg, not Hermes — see FR-002a); confirm the same photo-pipeline behavior as under OpenClaw in both cases.
 
 **Acceptance scenarios:**
 
-1. **Given** a pending photo approval, **When** the admin taps Approve in Telegram, **Then** Hermes dispatches `check_approval.py` exactly as OpenClaw did, and the video is queued for the existing cron-driven upload.
-2. **Given** the admin sends the manual command to process photos, **When** Hermes receives it, **Then** it dispatches `process_photos.py` and relays output verbatim — no improvising, no summarizing — matching the current `SKILL_*.md` instructions.
+1. **Given** a pending photo approval, **When** the admin taps Approve in Telegram, **Then** `check_approval.py`'s existing cron leg (unchanged, FR-003) detects and processes the button tap — **not** Hermes; see FR-002 and FR-002a for why Hermes cannot dispatch on the raw button-callback trigger — and the video is queued for the existing cron-driven upload.
+2. **Given** the admin sends the manual command to process photos or check approval status, **When** Hermes receives it, **Then** it dispatches `process_photos.py` or `check_approval.py` respectively and relays output verbatim — no improvising, no summarizing — matching the current `SKILL_*.md` instructions.
 
 ---
 
@@ -78,6 +78,7 @@ As the admin, the approval gate and the admin allowlist enforcement keep working
 
 - What happens if Hermes's gateway process crashes mid-approval? Today OpenClaw runs under `launchd`; Hermes needs an equivalent always-on supervisor (`hermes gateway install`).
 - What happens if a chat-driven skill is invoked while the cron leg for the same resource (e.g. `check_approval`) is mid-run? Existing race-condition handling in `check_approval.py` is caller-agnostic and should be unaffected.
+- What happens when `check_approval.py`'s cron leg and Hermes's gateway both call Telegram `getUpdates` on the shared bot token? Per FR-002a, this is a known, unresolved risk of the same `409 Conflict` #6 hit between OpenClaw and Hermes — tracked as a follow-up, not fixed by this feature.
 - What happens if OpenAI is selected for a demo customer but the API key is missing or invalid? Must fail loud at startup or first call, not silently.
 
 ---
@@ -85,8 +86,9 @@ As the admin, the approval gate and the admin allowlist enforcement keep working
 ## Functional Requirements
 
 - **FR-001:** Hermes MUST replace OpenClaw as the Telegram gateway process on the Mac Mini, running under an always-on supervisor equivalent to today's `launchd` daemon.
-- **FR-002:** Hermes MUST dispatch `process_photos.py` on the existing manual-command trigger and `check_approval.py` on the existing button-callback trigger, relaying output verbatim, matching current `SKILL_*.md` instructions.
-- **FR-003:** The cron-triggered scripts (`check_email.py`, `check_approval.py`'s cron leg, `upload_facebook.py`) MUST remain unchanged — no Hermes dependency is introduced into their invocation path.
+- **FR-002:** Hermes MUST dispatch `process_photos.py` on the existing manual-command trigger and `check_approval.py` on the existing manual `/check_approval` command trigger, relaying output verbatim, matching current `SKILL_*.md` instructions.
+- **FR-002a:** The Approve/Reject button-callback trigger MUST continue to be handled exclusively by `check_approval.py`'s pre-existing cron leg (FR-003), independent of Hermes. **Amended 2026-08-21 (issue #8):** the original FR-002 draft assumed Hermes could dispatch a skill directly off the raw button tap, by analogy with OpenClaw. Verified empirically against the local Hermes install that this is not possible: `plugins/platforms/telegram/adapter.py::_handle_callback_query` only recognizes a closed set of Hermes-internal `callback_data` prefixes (`mp:`, `cp:`, `gt:`, `ea:`, `sc:`, `cl:`, `update_prompt:`); a `callback_data` of `"approve"` or `"reject"` (FieldKit's own payload, from `tools/telegram_api.py::send_message_with_buttons`) falls through every branch and the handler returns having done nothing — no `answer_callback_query`, no `edit_message_text`, and critically no skill or agent-turn dispatch of any kind (confirmed by directly invoking `_handle_callback_query` with both values under Hermes's own venv). `_normalize_platform_event`, Hermes's only other generic inbound-event hook, is wired for `message_reaction` and `edited_message` only and returns `None` for a `callback_query` update, so there is no alternate escape hatch either. Hermes's own `docs/relay-connector-contract.md` documents the same posture by design: *"Foreign callback payloads (another integration's buttons) never become prompt events... dropped at the connector."* This is a structural limitation of Hermes's current callback-handling design, not a configuration or naming gap (contrast with the `process-photos` naming question in #7/#18, which *was* resolved by configuration). No workaround was pursued within fieldkit's scope, since it would require patching Hermes itself (an installed dependency, not a fieldkit-owned file). **Known follow-up risk, not resolved by this amendment:** Hermes's gateway now holds the sole active `getUpdates` long-poll on the shared bot token (see `platform/docs/hermes/02-gateway-setup.md`'s "single-poller conflict" note from #6); `check_approval.py`'s cron leg polls the same token independently, which risks the identical `409 Conflict` #6 hit between OpenClaw and Hermes. Whether this conflict actually manifests in practice, and if so how to resolve it, is out of scope for #8 and tracked as a separate follow-up.
+- **FR-003:** The cron-triggered scripts (`check_email.py`, `check_approval.py`'s cron leg, `upload_facebook.py`) MUST remain unchanged — no Hermes dependency is introduced into their invocation path. Per FR-002a, `check_approval.py`'s cron leg is now the sole mechanism handling the Approve/Reject button-callback trigger.
 - **FR-004:** Model routing MUST default to Anthropic and MUST support OpenAI as an explicit per-client configuration choice, with no other behavioral difference between providers.
 - **FR-005:** Two demo customers MUST exist as first-class FieldKit clients under the existing Option C monorepo model (`clients/{name}/.specify/...`) — one Anthropic-backed, one OpenAI-backed.
 - **FR-006:** `constitution.md`'s Architecture Constraints MUST be updated to reflect Hermes (not OpenClaw) as the runtime, and MUST no longer state architecture facts retired by the Mac Mini → Cloud pivot (see Constitution Updates below).
