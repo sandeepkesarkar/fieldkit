@@ -1,17 +1,21 @@
 # Cross-Vendor Review for fieldkit PRs
 
 Implements `dev-infrastructure/specs/github-task-workflow.md` FR-011 / SC-006
-("Every code PR MUST carry a cross-vendor review... before being labeled
-`needs-approval`") for fieldkit specifically. fieldkit issues aren't worked
-through Polly/the poller (those are scoped to `dev-infrastructure` only, per
-the Rollout Phase decision in `dev-infrastructure/specs/omnigent-setup.md`) —
-so unlike `dev-infrastructure`, where Polly's `cross-review` skill dispatches
-this automatically, here it's a step the implementer (so far, always me) runs
-by hand before flipping a PR to `needs-approval`.
+for fieldkit specifically — that upstream spec's own wording is "Every code
+PR MUST carry a cross-vendor review... before being labeled `needs-approval`"
+(dev-infrastructure-wide phrasing; quoted here for traceability, not as
+fieldkit's scope statement — see **Scope** below for that). fieldkit issues
+aren't worked through Polly/the poller (those are scoped to
+`dev-infrastructure` only, per the Rollout Phase decision in
+`dev-infrastructure/specs/omnigent-setup.md`) — so unlike `dev-infrastructure`,
+where Polly's `cross-review` skill dispatches this automatically, here it's a
+step the implementer (so far, always me) runs by hand before flipping a PR to
+`needs-approval`.
 
-**Scope:** every fieldkit PR from issue #7 onward. (This doc's own PR, #17,
-and the two PRs before it, #15 and #16, predate or introduce the mechanism —
-see "Known gap" below for exactly what that means for each.)
+**Scope:** every fieldkit PR from issue #7 onward — the one authoritative
+statement of scope for this doc. (This doc's own PR, #17, and the two PRs
+before it, #15 and #16, predate or introduce the mechanism — see "Known gap"
+below for exactly what that means for each.)
 
 **No linked issue?** Not every PR maps to a GitHub issue (this doc's own PR
 is an example — process documentation, not part of an issue breakdown). When
@@ -62,11 +66,17 @@ the invoking shell would interpret those before Codex or `gh` ever see them
 (command injection in the documented procedure itself). Both steps route
 untrusted content through a file instead of a shell string, for that reason.
 
-1. Gather the diff and the issue's acceptance criteria (skip the `gh issue
-   view` call if there's no linked issue — see "No linked issue?" above):
+1. Gather the diff and the acceptance criteria. If the PR has a linked
+   issue, pull the criteria from there; otherwise use the PR description
+   itself (see "No linked issue?" above) — only one of the two `gh` calls
+   below is needed, not both:
    ```bash
    gh pr diff <pr-number> --repo sandeepkesarkar/fieldkit
-   gh issue view <issue-number> --repo sandeepkesarkar/fieldkit --json body
+
+   # has a linked issue:
+   gh issue view <issue-number> --repo sandeepkesarkar/fieldkit --json body -q .body
+   # no linked issue -- use the PR description instead:
+   gh pr view <pr-number> --repo sandeepkesarkar/fieldkit --json body -q .body
    ```
 
 2. Read the current Standing Review Dimensions. The range below is
@@ -82,23 +92,33 @@ untrusted content through a file instead of a shell string, for that reason.
    directly into a shell string), then pass it to `omnigent run` via command
    substitution on the *whole file* — bash does not re-expand the content of
    a `$(...)` substitution, so this is safe even though the file itself
-   contains untrusted text. A `trap` guarantees `.codex-tmp/` (Omnigent's
-   per-session Codex home, which includes an `auth.json` copy per the
-   `.gitignore` entry) is removed on both the success and failure path:
+   contains untrusted text.
+
+   `omnigent run --harness codex` creates `.codex-tmp/` itself, relative to
+   the cwd it's launched from — that path is hardcoded in Omnigent
+   (`codex_executor.py`, not configurable via `CODEX_HOME` or similar), and
+   it holds an `auth.json` copy for the life of the session. Build the
+   prompt file first in the current shell (its value needs to survive into
+   step 5), then run **only the `omnigent` invocation itself** inside a
+   subshell with its own `trap` — that scopes cleanup to fire the moment
+   that subshell exits (i.e. right after `omnigent run` completes), instead
+   of a shell-level `EXIT` trap, which would only fire when the *entire
+   pasted-into-terminal interactive shell* eventually closes, leaving
+   `.codex-tmp/` exposed for the rest of that terminal session:
 
    ```bash
    cd ~/src/fieldkit
-   trap 'rm -rf .codex-tmp' EXIT
-
    PROMPT_FILE=$(mktemp)
+   REVIEW_FILE=$(mktemp)
+
    cat > "$PROMPT_FILE" <<'PROMPT_EOF'
    Review this diff against the acceptance contract below. Do NOT edit any
    files -- report only.
 
    === ACCEPTANCE CONTRACT ===
    PROMPT_EOF
-   # Issue body if there is one (see "No linked issue?"), else paste the PR
-   # description instead -- either way, append via redirection, not `-p`:
+   # Issue body if there is one, else the PR description (see step 1 /
+   # "No linked issue?") -- either way, append via redirection, not `-p`:
    gh issue view <issue-number> --repo sandeepkesarkar/fieldkit --json body -q .body \
      >> "$PROMPT_FILE"
 
@@ -115,39 +135,63 @@ untrusted content through a file instead of a shell string, for that reason.
    separately, grouped by dimension, each with file:line evidence. If a
    dimension finds nothing, say so explicitly.\n' >> "$PROMPT_FILE"
 
-   omnigent run --harness codex --no-log -p "$(cat "$PROMPT_FILE")" \
-     | tee /tmp/cross-review-output.txt
+   # Everything that touches .codex-tmp/ is scoped to this subshell so
+   # cleanup runs the moment `omnigent run` finishes, not whenever this
+   # terminal session eventually closes.
+   (
+     set -e
+     # Pre-create .codex-tmp restricted to this user BEFORE omnigent ever
+     # touches it -- omnigent's own `mkdir(parents=True, exist_ok=True)`
+     # call reuses an existing directory as-is without loosening its
+     # permissions, so this closes the exposure window for the whole run
+     # rather than chmod-ing after the fact. (The per-session subdirectory
+     # Omnigent creates inside it via Python's `tempfile.mkdtemp` is
+     # already 0700 by default -- this step is only needed for the shared
+     # parent, which Omnigent creates with plain `mkdir` at default
+     # (umask-dependent) permissions.)
+     mkdir -p .codex-tmp
+     chmod 700 .codex-tmp
 
+     # Cleanup must never blindly `rm -rf .codex-tmp` -- if that directory
+     # pre-existed for an unrelated reason, that would destroy it. Instead,
+     # mark "now" with a sentinel file, then on exit remove only the
+     # subdirectories Omnigent created *after* that point -- i.e. only
+     # this run's own session directory.
+     SENTINEL=$(mktemp)
+     trap 'find .codex-tmp -mindepth 1 -maxdepth 1 -type d -newer "$SENTINEL" -exec rm -rf {} +; rm -f "$SENTINEL"' EXIT
+
+     omnigent run --harness codex --no-log -p "$(cat "$PROMPT_FILE")" \
+       | tee "$REVIEW_FILE"
+   )
+   # cleanup trap above already fired on subshell exit (success or
+   # failure). $PROMPT_FILE and $REVIEW_FILE are untouched by it and
+   # still valid here -- step 5 uses $REVIEW_FILE, then:
    rm -f "$PROMPT_FILE"
-   # trap fires here on exit (success or failure), removing .codex-tmp/
    ```
 
-   Immediately after `omnigent run --harness codex` creates `.codex-tmp/`
-   (and before the `trap` cleanup fires), it holds a copy of `auth.json`.
-   Restrict access for the life of that directory in case the trap doesn't
-   get a chance to run (e.g. a killed shell):
-   ```bash
-   chmod 700 .codex-tmp 2>/dev/null
-   chmod 600 .codex-tmp/auth.json 2>/dev/null
-   ```
-   Add this right after the `omnigent run` invocation starts producing
-   `.codex-tmp/`, or fold it into a wrapper script if this procedure gets
-   automated later.
+   `-p` passes the whole prompt file as one argv element, which is subject
+   to the OS's argv/environment size limit (`getconf ARG_MAX` — commonly
+   ~1MB on macOS, higher on Linux). This is normally not a problem for a
+   single-PR diff, but if a diff is unusually large and `omnigent run`
+   fails with an argument-list-too-long-style error, there's no documented
+   stdin-based alternative for the first message as of this writing — the
+   practical workaround is to scope the diff (review large/generated files
+   separately, or exclude vendored/lockfile-style hunks with
+   `gh pr diff ... -- . ':!path/to/lockfile'`) rather than pasting the
+   entire diff unfiltered.
 
 4. Blocking findings → fix them, push the update, and re-run steps 1–3
    against the updated diff (mirrors Polly's own fix-loop in
    `cross-review/SKILL.md` step 5). Clean → proceed.
 
-5. Post the review output as a PR comment straight from the file captured in
-   step 3 (`-F`/`--body-file` reads the file directly — no shell
-   interpolation of the untrusted review text at all), *then* post the
-   one-line issue summary and flip the label to `needs-approval` — the
-   review comment must already be on the PR before it reaches that state,
-   per SC-006:
+5. Post the review output as a PR comment straight from `$REVIEW_FILE`
+   (`-F`/`--body-file` reads the file directly — no shell interpolation of
+   the untrusted review text at all), *then* post the one-line issue
+   summary and flip the label to `needs-approval` — the review comment must
+   already be on the PR before it reaches that state, per SC-006:
    ```bash
-   gh pr comment <pr-number> --repo sandeepkesarkar/fieldkit \
-     -F /tmp/cross-review-output.txt
-   rm -f /tmp/cross-review-output.txt
+   gh pr comment <pr-number> --repo sandeepkesarkar/fieldkit -F "$REVIEW_FILE"
+   rm -f "$REVIEW_FILE"
    ```
 
 ## Known gap
@@ -174,4 +218,5 @@ merged PRs before this one differ:
   dedicated issue exists, treat #16's cross-review findings as open and
   unresolved — do not treat #16 as clean precedent.
 
-Every fieldkit PR from issue #7 onward goes through this procedure.
+See **Scope** at the top for which PRs this procedure applies to going
+forward.
