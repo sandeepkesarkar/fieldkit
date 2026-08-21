@@ -137,9 +137,13 @@ untrusted content through a file instead of a shell string, for that reason.
 
    # Everything that touches .codex-tmp/ is scoped to this subshell so
    # cleanup runs the moment `omnigent run` finishes, not whenever this
-   # terminal session eventually closes.
+   # terminal session eventually closes. `pipefail` matters here as much
+   # as `-e`: without it, a failed `omnigent run` piped through `tee`
+   # still exits 0 (tee's own exit status), so a real review failure
+   # would silently look like success -- verified live: `false | tee
+   # /dev/null` returns 0 under plain `set -e`, but 1 under `pipefail`.
    (
-     set -e
+     set -euo pipefail
      # Pre-create .codex-tmp restricted to this user BEFORE omnigent ever
      # touches it -- omnigent's own `mkdir(parents=True, exist_ok=True)`
      # call reuses an existing directory as-is without loosening its
@@ -152,21 +156,48 @@ untrusted content through a file instead of a shell string, for that reason.
      mkdir -p .codex-tmp
      chmod 700 .codex-tmp
 
-     # Cleanup must never blindly `rm -rf .codex-tmp` -- if that directory
-     # pre-existed for an unrelated reason, that would destroy it. Instead,
-     # mark "now" with a sentinel file, then on exit remove only the
-     # subdirectories Omnigent created *after* that point -- i.e. only
-     # this run's own session directory.
-     SENTINEL=$(mktemp)
-     trap 'find .codex-tmp -mindepth 1 -maxdepth 1 -type d -newer "$SENTINEL" -exec rm -rf {} +; rm -f "$SENTINEL"' EXIT
+     # Cleanup must identify the exact directory THIS run created, not
+     # "whatever looks new" -- a purely time-based guard (e.g. "delete
+     # anything newer than a sentinel") also deletes a sibling directory
+     # from a concurrent omnigent invocation that happens to start in the
+     # same window, since that's newer too. Snapshot .codex-tmp/'s entries
+     # before and after instead, and only auto-remove when the before/after
+     # diff is unambiguous (exactly one new entry). If it's not -- e.g. a
+     # concurrent session's directory really did appear alongside this
+     # run's -- leave everything for manual review rather than guessing;
+     # every entry is still 700-equivalent (Omnigent's own mkdtemp) either
+     # way, so leaving one behind isn't a credential-exposure regression.
+     BEFORE_LIST=$(mktemp)
+     ls -A .codex-tmp > "$BEFORE_LIST" 2>/dev/null || true
+
+     cleanup() {
+       local after new_entries new_count
+       after=$(mktemp)
+       ls -A .codex-tmp > "$after" 2>/dev/null || true
+       new_entries=$(comm -13 <(sort "$BEFORE_LIST") <(sort "$after"))
+       new_count=$(printf '%s\n' "$new_entries" | grep -c . || true)
+       if [ "$new_count" -eq 1 ]; then
+         rm -rf -- ".codex-tmp/$new_entries"
+       elif [ "$new_count" -gt 1 ]; then
+         echo "WARNING: $new_count new .codex-tmp/ entries appeared during" \
+              "this run (possible concurrent omnigent session) -- not" \
+              "auto-removing any of them, review manually:" >&2
+         printf '  %s\n' $new_entries >&2
+       fi
+       rm -f "$BEFORE_LIST" "$after"
+     }
+     trap cleanup EXIT
 
      omnigent run --harness codex --no-log -p "$(cat "$PROMPT_FILE")" \
        | tee "$REVIEW_FILE"
    )
-   # cleanup trap above already fired on subshell exit (success or
-   # failure). $PROMPT_FILE and $REVIEW_FILE are untouched by it and
-   # still valid here -- step 5 uses $REVIEW_FILE, then:
+   OMNIGENT_STATUS=$?
    rm -f "$PROMPT_FILE"
+   if [ "$OMNIGENT_STATUS" -ne 0 ]; then
+     echo "omnigent run failed (exit $OMNIGENT_STATUS) -- do NOT proceed to" \
+          "step 5 with a partial/empty review. Re-run step 3, or" \
+          "investigate the failure above first." >&2
+   fi
    ```
 
    `-p` passes the whole prompt file as one argv element, which is subject
@@ -175,10 +206,17 @@ untrusted content through a file instead of a shell string, for that reason.
    single-PR diff, but if a diff is unusually large and `omnigent run`
    fails with an argument-list-too-long-style error, there's no documented
    stdin-based alternative for the first message as of this writing — the
-   practical workaround is to scope the diff (review large/generated files
-   separately, or exclude vendored/lockfile-style hunks with
-   `gh pr diff ... -- . ':!path/to/lockfile'`) rather than pasting the
-   entire diff unfiltered.
+   practical workaround is to scope the diff down with `gh pr diff`'s own
+   repeatable `--exclude <glob>` flag (**not** a git pathspec — `gh pr diff`
+   takes only a single PR argument plus its own flags, so `-- path` / `:!path`
+   syntax is silently rejected):
+   ```bash
+   gh pr diff <pr-number> --repo sandeepkesarkar/fieldkit \
+     --exclude '*.lock' --exclude 'generated/*' >> "$PROMPT_FILE"
+   ```
+   verified against the installed `gh` (2.92.0): `--exclude` actually drops
+   the matching files' hunks from the diff output, unlike the pathspec
+   syntax this doc previously (incorrectly) suggested.
 
 4. Blocking findings → fix them, push the update, and re-run steps 1–3
    against the updated diff (mirrors Polly's own fix-loop in
