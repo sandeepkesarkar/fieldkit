@@ -107,5 +107,5 @@ no shell profile edit was needed.
 
 - #6 — configure the Telegram gateway + supervisor and default model provider
   (`hermes setup`, `hermes gateway install`)
-- #7 / #8 — port `process_photos` / `check_approval` dispatch as Hermes skills
+- #7 / #8 — port `process_photos` / `check_approval` dispatch as Hermes skills (done — see `03-process-photos-skill.md`, `04-check-approval-skill.md`; #8's button-callback trigger stays on its existing cron leg, not Hermes, per FR-002a)
 - #14 — uninstall OpenClaw once Hermes fully covers its role (SC-003)

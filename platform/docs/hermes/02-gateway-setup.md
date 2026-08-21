@@ -136,6 +136,6 @@ it isn't a surprise.
 
 ## Next steps (separate issues)
 
-- #7 / #8 — port `process_photos` / `check_approval` dispatch as Hermes skills
+- #7 / #8 — port `process_photos` / `check_approval` dispatch as Hermes skills (done — see `03-process-photos-skill.md`, `04-check-approval-skill.md`; #8's button-callback trigger stays on its existing cron leg, not Hermes, per FR-002a)
 - #11 / #12 — Anthropic-backed / OpenAI-backed demo customers (resolves the multi-client provider question above)
 - #14 — uninstall OpenClaw once nothing depends on it
