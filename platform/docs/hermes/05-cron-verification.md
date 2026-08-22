@@ -2,28 +2,35 @@
 
 Covers issue #13: verifying the three cron-triggered scripts
 (`check_email.py`, `check_approval.py`'s cron leg, `upload_facebook.py`)
-remain untouched by the Hermes migration and still run successfully with
+remain untouched by the Hermes migration and still run via cron with
 Hermes installed and running. Builds on
 [`01-install.md`](01-install.md) (#5), [`02-gateway-setup.md`](02-gateway-setup.md) (#6),
 and [`04-check-approval-skill.md`](04-check-approval-skill.md) (#8).
 
 Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-hermes-runtime/spec.md) (FR-003, SC-001).
 
+> **Revision note (2026-08-22):** the version of this document written
+> during PR #22 overstated several of its own conclusions — see issue #13
+> (reopened) for the retroactive cross-vendor review that found this. This
+> revision corrects the doc in place rather than appending an errata
+> section, since an inaccurate "verification" doc is worse than none. The
+> corrected verdicts are in "Acceptance Criteria — Final Status" below.
+
 ## Summary
 
 The three scripts themselves are confirmed byte-for-byte unchanged since
 before Feature 003 (Hermes migration) began. The **crontab entries that
-invoke them were not** — they carried two live bugs, both now fixed on the
-Mac Mini. Neither bug was introduced by this issue's work; both predate it
-and were previously invisible because the first bug masked the second.
+invoke them were not** — they carried two live bugs, now fixed on the Mac
+Mini, plus a live-data issue in one script's state file found during this
+revision's re-verification (unrelated to the crontab or to Feature 003).
 
 1. **Stale script paths** (pre-existing, from the Feature 002 photo-agent
    migration to `platform/`) — `check_approval.py` and `upload_facebook.py`'s
    crontab entries still pointed at the old `clients/_demo/src/photo-agent/scripts/`
    location. Every cron invocation failed at the OS level
    (`FileNotFoundError`) before Python ever started. **Fixed.**
-2. **Wrong Python interpreter on `PATH`** (newly discovered while verifying
-   the fix above) — cron's `PATH` lists `/opt/homebrew/bin` before
+2. **Wrong Python interpreter on `PATH`** (discovered while verifying the
+   fix above) — cron's `PATH` lists `/opt/homebrew/bin` before
    `/usr/local/bin`, so the bare `python3` in the crontab entries resolved to
    Homebrew's Python 3.14, which has neither `python-dotenv` nor `requests`
    installed. This was completely masked by bug #1: the script was never
@@ -31,14 +38,37 @@ and were previously invisible because the first bug masked the second.
    scripts immediately failed with `ModuleNotFoundError`. **Fixed** by
    pointing the two entries at `/usr/local/bin/python3` (Python 3.13, has
    both packages) explicitly — this matches the invocation already
-   documented in `SKILL_upload_facebook.md`'s Cron Setup section, which uses
-   an explicit interpreter path for exactly this reason.
+   documented in `SKILL_upload_facebook.md`'s Cron Setup section.
+3. **A stuck test record in `facebook_state.json` (live data, not a crontab
+   or code bug)** — found 2026-08-22, during the re-verification prompted by
+   #13 reopening. The `_demo` client's live
+   `clients/_demo/data/photo-agent/facebook_state.json` had a
+   `pending_facebook_upload` record left over from manual testing
+   (`project_name="test_project"`, `idempotency_key="42"`,
+   `video_local_path="/tmp/fieldkit_test/video.mp4"`, a path that does not
+   exist on this machine) sitting at `status: "failed"`.
+   `facebook_state.get_pending_upload()` returns whatever is in
+   `pending_facebook_upload` unconditionally — it does not filter on
+   `status` — so every cron tick re-picked up this dead record and logged a
+   real (if handled) error, once a minute, indefinitely. This is what PR
+   #22's evidence run actually captured (see "What changed on 2026-08-22"
+   below) — it was not a clean success. **Fixed** by backing up the state
+   file and clearing the stale record; see that section for the full
+   before/after and the live cron.log confirmation.
+4. **A test-isolation bug that recreated #3 on its own** — a photo-agent
+   test fixture wasn't mocking the `facebook_state` calls it needed to,
+   so simply running `pytest` on this machine wrote a real record straight
+   into the same live file. Found by a second cross-review, fixed in the
+   test suite itself, and verified with a before/after diff of the live
+   file. See "Test-suite isolation bug" below — this is the one genuinely
+   new code fix in this revision; everything else here is docs plus
+   one-time live-data cleanup.
 
-`check_email.py`'s crontab entry was never stale and is unaffected by either
-bug (its imports are stdlib-only; it never depends on `dotenv` or
-`requests`). No change was made to its entry.
+`check_email.py`'s crontab entry was never stale and is unaffected by
+either crontab bug (its imports are stdlib-only; it never depends on
+`dotenv` or `requests`). No change was made to its entry.
 
-## FR-003 — scripts unchanged, no Hermes/OpenClaw dependency introduced
+## FR-003 — scripts unchanged; OpenClaw dependency corrected
 
 Diffed all three scripts against `1283c9d^` (the commit immediately before
 "Add spec: Hermes runtime migration (Platform Feature 003)"), and again
@@ -53,100 +83,274 @@ $ git diff 1283c9d^ -- platform/photo-agent/scripts/check_approval.py \
 ```
 
 All three files are byte-for-byte identical to their pre-Feature-003 state.
-The `openclaw` references visible in `check_approval.py` and
-`check_email.py` (e.g. `_openclaw_send()`, the `openclaw message send` CLI
-call) predate Feature 003 entirely — they were part of the original
-Feature 001/002 builds, not introduced by this migration. No `hermes` or
-`openclaw` import, env var, or runtime dependency was added to any of the
-three scripts' invocation paths.
+No `hermes` import, env var, or runtime dependency was added to any of the
+three scripts' invocation paths — that part of FR-003 holds.
 
-## Crontab — before and after
+**The "zero OpenClaw dependency" framing does not hold, and PR #22's
+original wording of this section was wrong to imply it did.** The
+`openclaw` references in `check_approval.py` and `check_email.py` are not
+vestigial — they are real, live, currently-reachable code paths:
+
+- `check_approval.py:76` — `_openclaw_send()` shells out to
+  `openclaw message send --channel telegram -m <message>` to deliver the
+  approve/reject confirmation and error-alert messages (called at lines
+  369, 381, 387, 408).
+- `check_email.py:145` — the same `openclaw message send` CLI call, used
+  for its own Telegram notification.
+
+Both predate Feature 003 (they're part of the original Feature 001/002
+builds, carried over unchanged — the `git diff` above confirms that part).
+But "predates Feature 003" and "zero dependency today" are different
+claims, and only the first is true. **This is a real, live dependency
+#14's OpenClaw-uninstall work needs to explicitly account for**: uninstalling
+OpenClaw without first replacing or reworking these two call sites will
+break `check_approval.py`'s and `check_email.py`'s Telegram notification
+paths, not just the button-callback race documented below.
+
+## Crontab — before and after (literal invocations)
 
 Live crontab backed up before each edit (not tracked in git — this repo
 does not track a copy of the crontab anywhere; searched for one, none
-exists). Backups: `/tmp/fieldkit-crontab-backup.txt` (pre-path-fix) and
-`/tmp/fieldkit-crontab-backup2-*.txt` (pre-interpreter-fix), on the Mac Mini.
+exists — see "Known gap" below). Backups on the Mac Mini:
+`/tmp/fieldkit-crontab-backup.txt` (pre-path-fix) and
+`/tmp/fieldkit-crontab-backup2-1787426110.txt` (pre-interpreter-fix, post-path-fix).
 
-**Before (broken — stale path):**
+These are the literal crontab lines, not paraphrased — `crontab -l` output
+at each stage:
+
+**1. Before (broken — stale path, from `fieldkit-crontab-backup.txt`):**
 ```cron
-*/5 * * * * env PATH=... bash -c 'date && python3 .../platform/email-agent/scripts/check_email.py --source cron' >> .../logs/cron.log 2>&1
-* * * * * env PATH=... bash -c 'python3 .../clients/_demo/src/photo-agent/scripts/check_approval.py --source cron' >> .../logs/cron.log 2>&1
-* * * * * env PATH=... bash -c 'python3 .../clients/_demo/src/photo-agent/scripts/upload_facebook.py --source cron' >> .../logs/cron.log 2>&1
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/Users/sandeep_a_k/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin bash -c 'date && python3 /Users/sandeep_a_k/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'python3 /Users/sandeep_a_k/src/fieldkit/clients/_demo/src/photo-agent/scripts/check_approval.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'python3 /Users/sandeep_a_k/src/fieldkit/clients/_demo/src/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
 ```
 
-**After (fixed — correct path + explicit interpreter):**
+**2. Intermediate (path fixed, interpreter still bare `python3`, from
+`fieldkit-crontab-backup2-1787426110.txt`):**
 ```cron
-*/5 * * * * env PATH=... bash -c 'date && python3 .../platform/email-agent/scripts/check_email.py --source cron' >> .../logs/cron.log 2>&1
-* * * * * env PATH=... bash -c '/usr/local/bin/python3 .../platform/photo-agent/scripts/check_approval.py --source cron' >> .../logs/cron.log 2>&1
-* * * * * env PATH=... bash -c '/usr/local/bin/python3 .../platform/photo-agent/scripts/upload_facebook.py --source cron' >> .../logs/cron.log 2>&1
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/Users/sandeep_a_k/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin bash -c 'date && python3 /Users/sandeep_a_k/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/check_approval.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
 ```
 
-Schedule, `PATH` env var, and log redirect were left untouched in both
-edits — only the script path and (in the second edit) the interpreter path
-changed.
+**3. Current (path + interpreter both fixed — live now, confirmed via
+`crontab -l` on 2026-08-22):**
+```cron
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/Users/sandeep_a_k/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin bash -c 'date && python3 /Users/sandeep_a_k/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/check_approval.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+```
+
+`check_email.py`'s line never changed across all three states. Schedule,
+`PATH` env var, and log redirect were left untouched in both edits to the
+other two lines — only the script path and (in the second edit) the
+interpreter path changed.
+
+**Known gap:** there is no tracked crontab source-of-truth in this repo, and
+no automated drift check between what's documented here and what's
+actually live on the Mac Mini — this doc is a point-in-time snapshot, and it
+already drifted from reality once (this is exactly how the stale-path bug
+went unnoticed). A follow-up idea, not built here: commit a `crontab.example`
+or similar file and add a periodic check (e.g. a cron entry or a `#7`-style
+skill) that diffs live `crontab -l` output against it and alerts on drift.
 
 ## Evidence — each script's actual cron invocation
 
-**`check_email.py`** — never stale, unaffected by either bug. Most recent
-runs before this session's edits (`logs/cron.log`, 2026-08-22 15:15:01)
-completed cleanly with no error; earlier runs in the same log show
-successful Telegram delivery (`✅ Sent via Telegram. Message ID: 87/90`).
+**`check_email.py`** — never stale, unaffected by either crontab bug. Runs
+in `logs/cron.log` complete cleanly with no error; earlier runs in the same
+log show successful Telegram delivery (`✅ Sent via Telegram. Message ID:
+87/90`).
 
 **`check_approval.py`** — ran the exact cron invocation manually after the
 interpreter fix:
 ```
-$ bash -c '/usr/local/bin/python3 .../platform/photo-agent/scripts/check_approval.py --source cron'
+$ bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/check_approval.py --source cron'
 (no output)
 $ echo $?
 0
 ```
 Silent exit 0 is the documented behavior when there is no pending approval
-in `state.json` — script-level success, no crash, no stale-path or
-missing-module error. Confirmed via live `cron.log` output at 15:16–15:18
-after the fix: no further tracebacks from either photo-agent script.
+in `state.json` — script-level success at the OS/import level: no crash, no
+stale-path or missing-module error. This still says nothing about the
+button-callback path — see "Acceptance Criteria — Final Status" below.
 
-**`upload_facebook.py`** — ran the exact cron invocation manually:
+**`upload_facebook.py`** — this is where PR #22's original evidence was
+wrong. The run captured in that PR was:
 ```
-$ bash -c '/usr/local/bin/python3 .../platform/photo-agent/scripts/upload_facebook.py --source cron'
+$ bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron'
 ERROR:__main__:video file missing: project=test_project path=/tmp/fieldkit_test/video.mp4
 ERROR:tools.facebook_state:mark_failed: key=42
 $ echo $?
 0
 ```
-Exit 0 with a handled application-level error (a stale test job already
-present in `facebook_state.json` from prior testing — unrelated to this
-issue, not introduced by this session). This is the script's own
-error-handling path completing normally, not a crash — confirms
-script-level cron success.
+PR #22 characterized this as "the script's own error-handling path
+completing normally, not a crash — confirms script-level cron success."
+That framing is misleading: exit 0 there means "an error was caught and
+logged," not "there was nothing to do." Per the summary above, this was a
+stuck test record that cron re-picked up on literally every tick.
 
-## What is explicitly NOT verified — `check_approval.py`'s button-callback race
+**Corrected chronology** (an earlier version of this section claimed the
+error repeated "for at least the four days between 2026-08-21 and this
+revision," which does not match the log — that date range is about a day,
+not four, and the cited sample only covered ~23 minutes). What `logs/cron.log`
+actually shows, checked directly:
+- **2026-06-20, continuous, all day** (00:00–23:55, every 5-minute tick):
+  the identical two-line error, from an earlier stuck test record — a
+  separate incident from the one this revision cleaned up, not portrayed as
+  connected to it.
+- **2026-08-22, ~15:20–15:38** (once cron's interpreter fix let the script
+  actually run far enough to reach this code path — see PR #22's
+  interpreter-bug fix above): the identical error, once a minute, until
+  this revision's first cleanup at 15:38.
+- **2026-08-22, ~15:50–15:57**: the same record reappeared with a fresh
+  `triggered_at` timestamp — recreated by an unrelated bug (running the
+  photo-agent test suite in an environment with a live `FB_PAGE_ID` wrote
+  a real test record through to this same file; see "Test-suite isolation
+  bug" below) — and was cleared again after that bug was fixed.
 
-This issue's acceptance criterion ("each script runs successfully via its
-existing cron invocation with Hermes installed and running") is verified at
-the **script level** for all three scripts, per the evidence above.
+Calling any of this "success" evidence was the bug this revision exists to
+correct.
 
-It is **not** verified end-to-end for `check_approval.py`'s button-tap
-approval flow, and should not be assumed to work from the above. There is a
-known, previously-confirmed (not probabilistic) race between Hermes's
-gateway and the cron leg's `getUpdates` polling over the shared Telegram bot
-token: `python-telegram-bot`'s `Updater._start_polling` advances the shared
-per-token offset for every update it receives regardless of whether its own
-handler acts on it. Hermes polls continuously; the cron leg polls once a
-minute. Hermes will consume and offset-past a real button-tap callback
-before the cron leg's next run almost every time. Full detail and source
-citations: [`04-check-approval-skill.md`](04-check-approval-skill.md)
-("Known follow-up risk") and `spec.md` FR-002a.
+## Test-suite isolation bug — tests were writing through to live production data
 
-This was not fixed or worked around here — that's explicitly #14's scope
-(uninstall OpenClaw / resolve the shared-token arrangement), not this
-issue's. `launchctl list` still shows both gateways loaded during this
-verification:
+A second cross-review (of this revision's own first draft) found that
+running `pytest platform/photo-agent/tests/` recreated the exact stuck
+record above, with a `triggered_at` timestamp matching the test run. Root
+cause: `test_check_approval.py`'s shared `base` fixture mocked the
+approval-state calls but not `facebook_state.set_pending_upload` /
+`is_published`. Every approve-path test using `base` calls into
+`check_approval.py`'s `_enqueue_facebook_upload()`, which is gated only on
+`FB_PAGE_ID` being set in the process environment — and it was, because
+this Mac Mini's real client `.env` has a real `FB_PAGE_ID` (the Facebook
+upload feature is live), and `check_approval.py` loads that `.env` at
+import time regardless of which test is running. Nothing in the shared
+fixture stopped these tests from reaching the real, unmocked
+`facebook_state` module and writing to whatever `FIELDKIT_DATA_DIR`
+happened to resolve to — the live `_demo` client's data directory, in the
+normal case of running tests on this machine with its normal `.env` in
+place.
+
+**Fixed** in `platform/photo-agent/tests/test_check_approval.py`:
+`facebook_state.set_pending_upload` and `.is_published` are now mocked
+unconditionally in the shared `base` fixture (previously only in the
+narrower `base_fb` fixture used by a handful of FB-enqueue-specific
+tests), and `FB_PAGE_ID` is explicitly cleared by default in the `env`
+fixture `base` builds on — so every test gets both protections regardless
+of which fixture it uses, and neither an ambient `FB_PAGE_ID` nor a future
+test that forgets to mock this path can write through again.
+
+**Verified, not just claimed:** re-ran the full suite with
+`FIELDKIT_ROOT` pointed at this machine's real fieldkit checkout (so the
+real client `.env` — real `FB_PAGE_ID`, real `FIELDKIT_DATA_DIR` — was
+genuinely in play, reproducing the exact condition that caused the
+corruption) and diffed the live `facebook_state.json`'s MD5 before and
+after:
+```
+$ md5 -q clients/_demo/data/photo-agent/facebook_state.json
+d2aeb5429baa94f52d8e971d101b3b3c
+$ FIELDKIT_ROOT=/Users/sandeep_a_k/src/fieldkit python3 -m pytest tests/ -q
+395 passed in 1.76s
+$ md5 -q clients/_demo/data/photo-agent/facebook_state.json
+d2aeb5429baa94f52d8e971d101b3b3c
+```
+Identical hash — the live file was not touched. The record the test suite
+had recreated was then cleared again (same backup-verify-clear procedure
+as below), and confirmed to stay clear across live cron ticks afterward.
+
+## What changed on 2026-08-22 (this revision) — full timeline
+
+1. Backed up the live state file:
+   `cp -p clients/_demo/data/photo-agent/facebook_state.json
+   /tmp/fieldkit-facebook_state-backup-20260822153839.json`.
+2. Verified the stuck record's fields matched the exact stale artifact
+   described in the reopened issue (`project_name="test_project"`,
+   `idempotency_key="42"`, `video_local_path="/tmp/fieldkit_test/video.mp4"`,
+   `status="failed"`) before touching anything, and confirmed no other
+   pending/real job existed in that file.
+3. Cleared `pending_facebook_upload` to `null`, leaving
+   `published_idempotency_keys` untouched.
+4. Watched live `logs/cron.log` across multiple real cron ticks
+   post-cleanup (15:41:26–15:43:31, spanning the `check_approval.py` and
+   `upload_facebook.py` per-minute schedule) — **zero new lines appended**.
+   This confirms the error itself is gone, not just suppressed.
+5. Ran the exact cron invocation manually for a genuine clean run:
+   ```
+   $ bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron'
+   $ echo $?
+   0
+   ```
+   No output, no error — this is the actual "nothing to do, ran clean" case
+   PR #22 should have shown and didn't.
+6. This record came back once, on its own, about 12 minutes later
+   (cleanup at 15:38:39; the recreated record's `triggered_at` was
+   15:50:16 EDT) — recreated by the test-suite isolation bug documented
+   above, with a fresh `triggered_at` timestamp from the test run.
+   Backed up again
+   (`/tmp/fieldkit-facebook_state-backup-20260822155712.json`), re-verified
+   the same four fields, and cleared it a second time — this time after
+   fixing the test isolation bug, and confirmed via the MD5 diff above that
+   a full test-suite run no longer touches this file. Watched two more full
+   minutes of live `cron.log` (15:57:24–15:59:30) afterward: zero new
+   lines, and the file itself confirmed unchanged.
+
+**Minor future hardening item (non-blocking):** the backup path used here
+(`/tmp/fieldkit-facebook_state-backup-<timestamp>.json`, matching the
+pattern already used for the crontab backups) is predictable and world-
+readable on a shared `/tmp`. Fine for a single-admin Mac Mini today; worth
+moving to a permissions-restricted backup location if this machine is ever
+shared or this becomes a routine operation.
+
+## Acceptance Criteria — Final Status
+
+Issue #13's original four criteria, with corrected verdicts (the original
+closing PR #22 marked all four as satisfied; that was wrong for three of
+them):
+
+1. **"Crontab entries unchanged from the pre-migration state."** ❌ as
+   literally worded — **corrected criterion: unchanged except for the 2
+   corrective path/interpreter repairs documented here.** The entries did
+   drift pre-migration (stale path, then the masked interpreter bug); both
+   were genuine bugs, not migration-introduced changes, and both are now
+   fixed. But "unchanged" is not an accurate description of what happened,
+   and the doc should not have implied it was.
+2. **"Each script runs successfully via its existing cron invocation with
+   Hermes installed and running."** Partially met. `check_email.py` and
+   `upload_facebook.py` (post cleanup) now run cleanly with no error, and
+   this is confirmed evidence, not a masked one. `check_approval.py`'s cron
+   leg runs cleanly at the script level, but see #4 below — its actual
+   *purpose* (handling the button-tap callback) is not met while Hermes is
+   running.
+3. **"No import, env var, or runtime dependency on Hermes or OpenClaw
+   introduced into these three scripts."** ✅ for Hermes — confirmed by the
+   `git diff` above. ❌ as worded for OpenClaw: there IS a live OpenClaw
+   dependency in two of the three scripts (see "FR-003" above). It is not
+   *introduced* by this migration, but the literal criterion ("no runtime
+   dependency on OpenClaw") is not satisfied by the current state of the
+   code, and shouldn't be marked as passed.
+4. **`check_approval.py`'s button-callback role, under SC-001.** ❌ **Not
+   met. Deferred to #14.** There is a known, previously-confirmed (not
+   probabilistic — deterministic given `python-telegram-bot`'s
+   `Updater._start_polling` behavior) offset-consumption race: Hermes's
+   continuous `getUpdates` long-poll on the shared bot token will consume
+   and advance past a real button-tap callback before the cron leg's
+   once-a-minute poll sees it, essentially every time. This is not a
+   theoretical edge case that might occur under contention — it is the
+   default outcome of running Hermes's gateway and the cron leg
+   simultaneously against the same token, and it will reproduce on the next
+   real button tap. Full source-level detail:
+   [`04-check-approval-skill.md`](04-check-approval-skill.md) ("Known
+   follow-up risk") and `spec.md` FR-002a. Fixing this is explicitly #14's
+   scope, not this issue's; recording it as "not verified" (as PR #22 did)
+   understated it — it should be recorded as a known-failing, deferred
+   criterion, since the race is confirmed, not merely unverified.
+
+Neither OpenClaw nor `launchd` was touched during this or the original
+verification session. `launchctl list` still shows both gateways loaded:
 ```
 $ launchctl list | grep -E "openclaw|hermes"
 470  0  ai.hermes.gateway
 456  0  ai.openclaw.gateway
 ```
-Neither OpenClaw nor `launchd` was touched in this session.
 
 ## Live docs already correct, no other files needed updating
 
