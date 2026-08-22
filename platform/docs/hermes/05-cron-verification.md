@@ -272,11 +272,7 @@ as below), and confirmed to stay clear across live cron ticks afterward.
 4. Watched live `logs/cron.log` across multiple real cron ticks
    post-cleanup (15:41:26–15:43:31, spanning the `check_approval.py` and
    `upload_facebook.py` per-minute schedule) — **zero new lines appended**.
-   This confirms the error itself is gone, not just suppressed; it doesn't
-   independently prove cron kept firing during that window — for that,
-   `check_email.py`'s unrelated 5-minute `date` marker continuing to append
-   on schedule through the same window is the separate confirmation that
-   cron was still running normally throughout.
+   This confirms the error itself is gone, not just suppressed.
 5. Ran the exact cron invocation manually for a genuine clean run:
    ```
    $ bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron'
@@ -285,9 +281,11 @@ as below), and confirmed to stay clear across live cron ticks afterward.
    ```
    No output, no error — this is the actual "nothing to do, ran clean" case
    PR #22 should have shown and didn't.
-6. This record came back once, on its own, a few hours later — recreated by
-   the test-suite isolation bug documented above, with a fresh
-   `triggered_at` timestamp from the test run. Backed up again
+6. This record came back once, on its own, about 12 minutes later
+   (cleanup at 15:38:39; the recreated record's `triggered_at` was
+   15:50:16 EDT) — recreated by the test-suite isolation bug documented
+   above, with a fresh `triggered_at` timestamp from the test run.
+   Backed up again
    (`/tmp/fieldkit-facebook_state-backup-20260822155712.json`), re-verified
    the same four fields, and cleared it a second time — this time after
    fixing the test isolation bug, and confirmed via the MD5 diff above that
