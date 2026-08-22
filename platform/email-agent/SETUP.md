@@ -20,8 +20,18 @@ python3 scripts/check_email.py
        ├── polls Gmail via gws
        ├── enforces ADMIN_ALLOWLIST
        ├── assigns ref IDs, applies fk-received label
-       └── sends Telegram acks via openclaw message send
+       └── sends Telegram acks via a direct Telegram Bot API call
 ```
+
+> **Known gap (as of the #14 OpenClaw uninstall):** the diagram above and Steps 8–9
+> below still describe OpenClaw's skill-dispatch mechanism (`~/.openclaw/workspace/skills/`,
+> `openclaw gateway restart`, `openclaw skills list`). Unlike `process-photos` (#7) and
+> `check-approval` (#8), `email-agent`'s manual `/check_email` skill was never ported to
+> Hermes's skill format — this file's `SKILL.md` frontmatter is still OpenClaw-shaped
+> (`metadata: {"openclaw": ...}`). `check_email.py`'s cron path and its Telegram
+> notifications no longer depend on the openclaw binary at all (see #14), but the manual
+> `/check_email` chat command is likely non-functional under Hermes until this skill is
+> ported the same way #7/#8 ported the photo-agent skills. Tracked as a follow-up.
 
 The script is deterministic — no LLM involvement beyond dispatching the single
 bash command. All configuration lives in `.env`. Logs go to `~/src/fieldkit/logs/`,
@@ -109,12 +119,13 @@ Edit `.env` and fill in all variables:
 | `AGENT_EMAIL` | The dedicated agent Gmail address (the one you will authenticate in Step 6) |
 | `ADMIN_ALLOWLIST` | Comma-separated permitted sender addresses. **The first address is also the stale-alert email recipient.** |
 | `ADMIN_TELEGRAM_CHAT_ID` | Your Telegram chat ID (see note below) |
+| `TELEGRAM_BOT_TOKEN` | Bot token for direct Telegram Bot API calls — same token Hermes's gateway uses, see `~/.hermes/.env` |
 | `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` | Set to `file` — required for cron (macOS keychain is not accessible without a user session) |
 
-**Finding `ADMIN_TELEGRAM_CHAT_ID`:** send any message to your OpenClaw bot in Telegram, then run:
+**Finding `ADMIN_TELEGRAM_CHAT_ID`:** send any message to your bot in Telegram, then run:
 
 ```bash
-grep "sendMessage ok" ~/.openclaw/logs/gateway.log | tail -5
+grep "sendMessage ok" ~/.hermes/logs/gateway.log | tail -5
 ```
 
 The chat ID appears after `chat=`.
@@ -201,30 +212,29 @@ Once all Step 9 checks pass, add a system cron entry to poll Gmail automatically
 The `--source cron` flag suppresses the "No new emails." reply on silent runs.
 
 ```bash
-OPENCLAW_BIN=$(dirname $(which openclaw))
 PYTHON3=$(which python3)
 crontab -l 2>/dev/null | grep -v check_email > /tmp/mycron
 cat >> /tmp/mycron << EOF
-*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:${OPENCLAW_BIN}:/usr/bin:/bin bash -c 'date && ${PYTHON3} ${HOME}/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> ${HOME}/src/fieldkit/logs/cron.log 2>&1
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'date && ${PYTHON3} ${HOME}/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> ${HOME}/src/fieldkit/logs/cron.log 2>&1
 EOF
 crontab /tmp/mycron && rm /tmp/mycron
 crontab -l | grep check_email
 ```
 
-> **Run this command as the user who will own the cron job** (typically your regular account, not root). The unquoted heredoc expands `$HOME`, `$PYTHON3`, and `$OPENCLAW_BIN` in your shell — if run via `sudo`, `$HOME` resolves to `/root` and the paths will be wrong.
+> **Run this command as the user who will own the cron job** (typically your regular account, not root). The unquoted heredoc expands `$HOME` and `$PYTHON3` in your shell — if run via `sudo`, `$HOME` resolves to `/root` and the paths will be wrong.
 > Change `*/5` to `*/N` to adjust the polling interval. To update the interval later, remove the entry (`crontab -e`) and re-run this step.
-> `PYTHON3=$(which python3)` and `OPENCLAW_BIN=$(dirname $(which openclaw))` are baked in at registration time to avoid selecting the wrong interpreter or binary on a machine with multiple Python or Node versions.
+> `PYTHON3=$(which python3)` is baked in at registration time to avoid selecting the wrong interpreter on a machine with multiple Python versions.
 > `date` prepends a timestamp to every entry in `cron.log` so you can see when each run fired.
 
 > `env PATH=…` is required because cron does not source your shell profile, and
-> `PATH=value cmd` only applies to that one command — subprocesses (like `openclaw`)
+> `PATH=value cmd` only applies to that one command — subprocesses (like `gws`)
 > would revert to cron's minimal PATH. `env` sets the PATH for `python3` and all
 > processes it spawns.
 > `gws` lives in `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel).
-> `openclaw` is managed by nvm and lives in a version-specific path —
-> `$(dirname $(which openclaw))` captures the correct path at registration time.
-> `$HOME` and `$OPENCLAW_BIN` are expanded by your shell when you run this command,
+> `$HOME` and `$PYTHON3` are expanded by your shell when you run this command,
 > so the crontab stores the literal values.
+> Since #14, `check_email.py` no longer shells out to `openclaw` — the cron PATH
+> only needs to resolve `gws` and `python3`.
 
 Verify it was registered:
 
@@ -258,7 +268,6 @@ tail -f ~/src/fieldkit/logs/cron.log
 | `gws gmail … failed` in Telegram | gws token may have expired. Re-run Step 6. |
 | `OS keyring failed` or `Decryption failed` in Telegram | gws was authenticated with the macOS keychain, which is inaccessible from cron. Run `gws auth logout` then re-run Step 6 (with `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`). Ensure `.env` contains `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`. |
 | `gws binary not found` in cron.log | gws is not on cron PATH. Remove the crontab entry (`crontab -e`) and re-run Step 10. |
-| `openclaw: command not found` in cron.log | openclaw (nvm-managed) is not on cron PATH. Remove the entry (`crontab -e`) and re-run Step 10 — `$(dirname $(which openclaw))` captures the current nvm bin path. If you upgraded Node via nvm since registering cron, you must re-run Step 10 again. |
-| `FileNotFoundError: 'openclaw'` in cron.log | Old-style `PATH=… cmd` entry — PATH assignment only applied to the first command, not to Python's subprocesses. Remove the entry (`crontab -e`) and re-run Step 10. |
 | `check_email: AGENT_EMAIL is not set` in Telegram | `.env` is missing `AGENT_EMAIL`. Check Step 5. |
+| `RuntimeError: TELEGRAM_BOT_TOKEN is not set` | `.env` is missing `TELEGRAM_BOT_TOKEN`. Check Step 5. |
 | Script exits with lock error | Check if another instance is still running: `pgrep -af check_email.py`. If a process is found, wait for it to finish. If no process is found but the error persists, the lock file is stale — delete it: `rm ~/src/fieldkit/data/email-agent/run.lock`. |

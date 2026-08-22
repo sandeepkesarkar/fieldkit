@@ -224,8 +224,9 @@ def enqueue_pending(ref_id: str, gmail_message_id: str, from_addr: str, subject:
 def dequeue_pending(ref_id: str) -> None:
     """Remove a pending entry after it has been acted upon.
 
-    Called after a Telegram send attempt (success or failure — OpenClaw delivery
-    cannot be observed) and after a stale-alert email is dispatched for an entry.
+    Called after a Telegram send attempt (success or failure — _telegram() is
+    best-effort and never raises) and after a stale-alert email is dispatched
+    for an entry.
     If the ref_id is not found, a warning is logged and no write occurs.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)

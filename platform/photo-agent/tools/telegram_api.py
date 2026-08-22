@@ -1,8 +1,9 @@
 """
 Telegram Bot API wrapper for the photo-video agent.
 
-Handles operations that OpenClaw's `message send` cannot perform:
-inline keyboards (reply_markup), callback dismissal, and update polling.
+Handles every Telegram operation the photo-agent scripts need: plain-text
+messages, inline keyboards (reply_markup), callback dismissal, and update
+polling.
 
 Bot token is read from TELEGRAM_BOT_TOKEN in the environment.
 All functions raise RuntimeError on HTTP error, network failure, or

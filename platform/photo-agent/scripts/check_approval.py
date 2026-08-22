@@ -9,8 +9,10 @@ Usage:
 Cron path: reads state.json for a pending approval, polls Telegram getUpdates for
 a callback_query matching the pending message_id, dispatches approve or reject.
 
-Direct path: when OpenClaw receives a button callback and passes the data as CLI
-args, getUpdates is bypassed entirely (OpenClaw already consumed the update).
+Direct path: invoked by Hermes's /check_approval skill with --callback-data
+approve, getUpdates is bypassed entirely (see platform/photo-agent/skills/
+check-approval/SKILL.md — Hermes cannot dispatch off the raw button tap itself,
+so this path only ever fires from the manual /check_approval command).
 """
 
 import argparse
@@ -19,7 +21,6 @@ import email.mime.text
 import fcntl
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,18 +71,21 @@ def _load_env() -> None:
     pass  # .env already loaded at module import time (before FieldKit module imports)
 
 
-def _openclaw_send(message: str) -> None:
-    """Send a plain-text message via openclaw. Failures are logged but not raised."""
+def _notify_admin(message: str) -> None:
+    """Send a plain-text message to the admin via the Telegram Bot API.
+
+    Failures are logged but not raised — matches the best-effort semantics of
+    every call site (an approve/reject decision must never be blocked by a
+    failed notification).
+    """
     chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
-    cmd = ["openclaw", "message", "send", "--channel", "telegram", "-m", message]
-    if chat_id:
-        cmd.extend(["--target", chat_id])
+    if not chat_id:
+        _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot send admin notification")
+        return
     try:
-        result = subprocess.run(cmd, check=False, timeout=30)
-        if result.returncode != 0:
-            _log.warning("openclaw exited %d while sending message", result.returncode)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        _log.warning("openclaw failed while sending message: %s", exc)
+        telegram_api.send_message(chat_id, message)
+    except RuntimeError as exc:
+        _log.warning("failed to send admin notification: %s", exc)
 
 
 def _send_approval_email(agent_email: str, admin_email: str, project_name: str, folder_link: str) -> None:
@@ -197,7 +201,7 @@ def _acknowledge_tap(
 ) -> None:
     """Answer the callback query (best-effort) and remove the inline buttons.
 
-    Used on the direct path where OpenClaw may or may not supply the callback_query_id.
+    Used on the direct path where the /check_approval skill may or may not supply the callback_query_id.
     Both operations are best-effort: failures are logged as warnings and do not abort
     the approval — the spinner auto-clears after ~10s and button removal is cosmetic.
     """
@@ -248,21 +252,21 @@ def main(argv=None) -> None:
         "--callback-query-id",
         default=None,
         dest="callback_query_id",
-        help="Telegram callback_query.id (OpenClaw direct path — bypasses getUpdates).",
+        help="Telegram callback_query.id (direct path — bypasses getUpdates).",
     )
     parser.add_argument(
         "--callback-data",
         choices=["approve", "reject"],
         default=None,
         dest="callback_data",
-        help="Telegram callback_query.data, 'approve' or 'reject' (OpenClaw direct path).",
+        help="Telegram callback_query.data, 'approve' or 'reject' (direct path).",
     )
     parser.add_argument(
         "--message-id",
         type=int,
         default=None,
         dest="message_id",
-        help="Telegram message_id of the approval message (OpenClaw direct path).",
+        help="Telegram message_id of the approval message (direct path).",
     )
     args = parser.parse_args(argv)
     if args.source:
@@ -299,15 +303,16 @@ def _run(args) -> None:
     admin_email = os.environ.get("ADMIN_EMAIL", "")
     chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
 
-    # Direct path: OpenClaw passes --callback-data approve|reject, bypassing getUpdates.
-    # OpenClaw's internal Telegram polling consumes the callback_query update before the
-    # cron's getUpdates call can see it, so we rely on OpenClaw knowing the button label.
+    # Direct path: the /check_approval skill (see skills/check-approval/SKILL.md)
+    # passes --callback-data approve|reject, bypassing getUpdates. Hermes's Telegram
+    # adapter cannot dispatch off the raw button-tap callback_query itself (only the
+    # cron leg below sees it), so this path only ever fires from the manual command.
     # --callback-query-id and --message-id are optional extras; --callback-data alone suffices.
     direct = args.callback_data is not None
 
     if direct:
         callback_data = args.callback_data
-        new_offset = None  # OpenClaw manages its own offset
+        new_offset = None  # direct path has no getUpdates offset to advance
 
         # Verify message_id if provided — guards against stale direct invocations.
         if args.message_id is not None and args.message_id != telegram_message_id:
@@ -366,7 +371,7 @@ def _run(args) -> None:
                 email_sent = True
             except RuntimeError as exc:
                 _log.error("approval email failed: %s", exc)
-                _openclaw_send(
+                _notify_admin(
                     f"⚠️ {project_name}: approved, but email delivery failed.\n"
                     f"View folder: {drive_folder_link}"
                 )
@@ -378,13 +383,13 @@ def _run(args) -> None:
                 )
             except (ValueError, OSError) as exc:
                 _log.error("activity log failed: %s", exc)
-            _openclaw_send(
+            _notify_admin(
                 f"⚠️ {project_name}: approved, but email not configured.\n"
                 f"View folder: {drive_folder_link}"
             )
 
         if email_sent:
-            _openclaw_send(f"✅ Approved: {project_name}\nView folder: {drive_folder_link}")
+            _notify_admin(f"✅ Approved: {project_name}\nView folder: {drive_folder_link}")
 
         try:
             activity_log.log_approved(project_name)
@@ -405,7 +410,7 @@ def _run(args) -> None:
                 _log.error("activity log failed after drive-delete error: %s", log_exc)
 
         _delete_local_file(video_local_path, project_name)
-        _openclaw_send(
+        _notify_admin(
             f"❌ Rejected: {project_name}\n"
             "Update the photos in Drive and re-trigger /process_photos."
         )
