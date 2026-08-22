@@ -47,6 +47,11 @@ def env(monkeypatch):
     monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
     monkeypatch.setenv("ADMIN_TELEGRAM_CHAT_ID", _CHAT_ID)
+    # Defense in depth against a live FB_PAGE_ID leaking in from the ambient
+    # environment (e.g. a real client .env already loaded in-process): force
+    # the FB-enqueue branch off by default for every test using this fixture,
+    # regardless of what base_fb below re-enables it to.
+    monkeypatch.delenv("FB_PAGE_ID", raising=False)
 
 
 @pytest.fixture
@@ -80,6 +85,14 @@ def base(mocker, env):
     mocker.patch("scripts.check_approval.activity_log.log_approved")
     mocker.patch("scripts.check_approval.activity_log.log_rejected")
     mocker.patch("scripts.check_approval.activity_log.log_error")
+    # Mocked unconditionally, not just in base_fb below: the approve path
+    # calls into these whenever FB_PAGE_ID is set, and a real (unmocked)
+    # facebook_state.set_pending_upload() writes straight through to the
+    # live FIELDKIT_DATA_DIR/facebook_state.json on whatever machine the
+    # suite happens to run on. No test should be able to hit that file
+    # regardless of which fixture it uses or what's in the ambient env.
+    mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    mocker.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
     return mocker
 
 
@@ -952,10 +965,14 @@ _FB_PAGE_ID = "123456789"
 
 @pytest.fixture
 def base_fb(base, monkeypatch):
-    """Extends base with Facebook env and state mocks for FB enqueue tests."""
+    """Extends base by re-enabling FB_PAGE_ID for FB enqueue tests.
+
+    facebook_state.set_pending_upload/is_published are already mocked
+    unconditionally by `base` above; re-patch is_published here only to
+    pin its return value for these tests' own assertions.
+    """
     monkeypatch.setenv("FB_PAGE_ID", _FB_PAGE_ID)
     import scripts.check_approval as ca
-    base.patch("scripts.check_approval.facebook_state.set_pending_upload")
     base.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
     return base
 
