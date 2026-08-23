@@ -23,15 +23,15 @@ python3 scripts/check_email.py
        └── sends Telegram acks via a direct Telegram Bot API call
 ```
 
-> **Known gap (as of the #14 OpenClaw uninstall):** the diagram above and Steps 8–9
+> **Known gap (as of Part 1 of #14):** the diagram above and Steps 8–9
 > below still describe OpenClaw's skill-dispatch mechanism (`~/.openclaw/workspace/skills/`,
 > `openclaw gateway restart`, `openclaw skills list`). Unlike `process-photos` (#7) and
 > `check-approval` (#8), `email-agent`'s manual `/check_email` skill was never ported to
 > Hermes's skill format — this file's `SKILL.md` frontmatter is still OpenClaw-shaped
 > (`metadata: {"openclaw": ...}`). `check_email.py`'s cron path and its Telegram
-> notifications no longer depend on the openclaw binary at all (see #14), but the manual
+> notifications no longer depend on the openclaw binary at the code level, but the manual
 > `/check_email` chat command is likely non-functional under Hermes until this skill is
-> ported the same way #7/#8 ported the photo-agent skills. Tracked as a follow-up.
+> ported the same way #7/#8 ported the photo-agent skills. Tracked as #25.
 
 The script is deterministic — no LLM involvement beyond dispatching the single
 bash command. All configuration lives in `.env`. Logs go to `~/src/fieldkit/logs/`,
@@ -233,8 +233,8 @@ crontab -l | grep check_email
 > `gws` lives in `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel).
 > `$HOME` and `$PYTHON3` are expanded by your shell when you run this command,
 > so the crontab stores the literal values.
-> Since #14, `check_email.py` no longer shells out to `openclaw` — the cron PATH
-> only needs to resolve `gws` and `python3`.
+> As of Part 1 of #14, `check_email.py` no longer shells out to `openclaw` — the
+> cron PATH only needs to resolve `gws` and `python3`.
 
 Verify it was registered:
 

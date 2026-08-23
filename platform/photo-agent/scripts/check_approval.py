@@ -84,7 +84,7 @@ def _notify_admin(message: str) -> None:
         return
     try:
         telegram_api.send_message(chat_id, message)
-    except RuntimeError as exc:
+    except Exception as exc:
         _log.warning("failed to send admin notification: %s", exc)
 
 

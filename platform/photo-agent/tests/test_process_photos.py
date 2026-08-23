@@ -495,6 +495,20 @@ def test_telegram_error_exits_even_when_send_fails(env, mocker):
     assert exc_info.value.code == 1
 
 
+def test_telegram_error_exits_even_when_send_fails_with_non_runtime_error(env, mocker):
+    """A non-RuntimeError from telegram_api.send_message (e.g. a malformed Telegram
+    response triggering an AttributeError deep in telegram_api) is also swallowed —
+    exit(1) must not depend on the exception type raised by the notification call."""
+    import scripts.process_photos as proc
+    mocker.patch(
+        "scripts.process_photos.telegram_api.send_message",
+        side_effect=AttributeError("'NoneType' object has no attribute 'get'"),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        proc._telegram_error("something broke")
+    assert exc_info.value.code == 1
+
+
 def test_telegram_error_no_chat_id_skips_send_but_still_exits(monkeypatch, mocker):
     """With ADMIN_TELEGRAM_CHAT_ID unset, _telegram_error() skips the API call but still exits 1."""
     import scripts.process_photos as proc

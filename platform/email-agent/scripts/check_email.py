@@ -143,7 +143,7 @@ def _telegram(chat_id: str, message: str) -> None:
     """Send a Telegram message via the Bot API (best-effort, no raise)."""
     try:
         telegram_api.send_message(chat_id, message[:_TELEGRAM_MAX_LEN])
-    except RuntimeError as exc:
+    except Exception as exc:
         logger.warning("_telegram: send failed — %s", exc)
 
 

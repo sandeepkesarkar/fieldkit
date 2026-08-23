@@ -30,8 +30,18 @@ def _url(method: str) -> str:
     return f"https://api.telegram.org/bot{_token()}/{method}"
 
 
+def _redact_token(text: str) -> str:
+    """Strip the bot token out of a message before it is raised or logged.
+
+    requests exceptions on connection failures embed the full request URL
+    (including /bot<TOKEN>/...) in their string representation.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    return text.replace(token, "***REDACTED***") if token else text
+
+
 def _check(response: requests.Response) -> dict:
-    """Raise RuntimeError on HTTP error or Telegram ok:false."""
+    """Raise RuntimeError on HTTP error, a malformed body, or Telegram ok:false."""
     if not response.ok:
         try:
             desc = response.json().get("description", "")
@@ -43,8 +53,8 @@ def _check(response: requests.Response) -> dict:
         data = response.json()
     except requests.exceptions.JSONDecodeError as exc:
         raise RuntimeError(f"Telegram returned non-JSON body: {exc}") from exc
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data.get('description', 'unknown')}")
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data!r}")
     return data
 
 
@@ -60,6 +70,6 @@ def send_message(chat_id: str, text: str) -> None:
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Telegram request failed: {exc}") from exc
+        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc))}") from exc
     _check(response)
     logger.debug("send_message: ok")

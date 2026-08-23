@@ -1052,3 +1052,60 @@ def test_notify_admin_no_chat_id_skips_send(monkeypatch, mocker):
     mock_send = mocker.patch("scripts.check_approval.telegram_api.send_message")
     ca._notify_admin("hello admin")
     mock_send.assert_not_called()
+
+
+def test_notify_admin_does_not_leak_token_on_network_failure(env, mocker, caplog):
+    """The bot token must not appear in _notify_admin's warning log on a connection
+    failure. requests exceptions embed the request URL (including /bot<TOKEN>/...)
+    in their string representation — telegram_api.send_message must redact it
+    before _notify_admin logs the exception verbatim."""
+    import requests
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.telegram_api.requests.post",
+        side_effect=requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: /bottest_token/sendMessage"
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        ca._notify_admin("hello admin")  # must not raise
+    assert "test_token" not in caplog.text
+
+
+def test_notify_admin_swallows_non_runtime_error(env, mocker):
+    """A non-RuntimeError from telegram_api.send_message (e.g. a malformed Telegram
+    response triggering an AttributeError deep in telegram_api) is also logged, not
+    raised — _notify_admin's best-effort guarantee must not depend on the exception type."""
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.telegram_api.send_message",
+        side_effect=AttributeError("'NoneType' object has no attribute 'get'"),
+    )
+    ca._notify_admin("hello admin")  # must not raise
+
+
+def test_approve_completes_despite_non_runtime_error_from_notify(mocker, env, lock_mock):
+    """approve path still clears pending state and advances the offset even when
+    _notify_admin's underlying Telegram call raises a non-RuntimeError — the
+    notification is best-effort and must never block approval completion."""
+    import scripts.check_approval as ca
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=_PENDING)
+    mocker.patch("scripts.check_approval.state.get_telegram_offset", return_value=50)
+    mock_set_offset = mocker.patch("scripts.check_approval.state.set_telegram_offset")
+    mock_clear = mocker.patch("scripts.check_approval.state.clear_pending_approval")
+    mocker.patch("scripts.check_approval.telegram_api.get_updates", return_value=[_APPROVE_UPDATE])
+    mocker.patch("scripts.check_approval.telegram_api.answer_callback_query")
+    mocker.patch("scripts.check_approval.telegram_api.edit_message_reply_markup")
+    mocker.patch(
+        "scripts.check_approval.telegram_api.send_message",
+        side_effect=AttributeError("'list' object has no attribute 'get'"),
+    )
+    mocker.patch("scripts.check_approval.drive.delete")
+    mocker.patch("scripts.check_approval._send_approval_email")
+    mocker.patch("scripts.check_approval.activity_log.log_approved")
+    mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    mocker.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    main([])
+    mock_clear.assert_called_once()
+    mock_set_offset.assert_called_once_with(101)

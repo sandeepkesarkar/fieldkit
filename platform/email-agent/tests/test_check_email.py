@@ -684,3 +684,55 @@ def test_telegram_swallows_send_failure(monkeypatch):
         MagicMock(side_effect=RuntimeError("Telegram HTTP error 500")),
     )
     ce._telegram("12345", "hello admin")  # must not raise
+
+
+def test_telegram_does_not_leak_token_on_network_failure(monkeypatch, caplog):
+    """The bot token must not appear in _telegram's warning log on a connection
+    failure. requests exceptions embed the request URL (including /bot<TOKEN>/...)
+    in their string representation — telegram_api.send_message must redact it
+    before _telegram logs the exception verbatim."""
+    import requests
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
+    monkeypatch.setattr(
+        ce.telegram_api.requests,
+        "post",
+        MagicMock(
+            side_effect=requests.exceptions.ConnectionError(
+                "Max retries exceeded with url: /bottest_token/sendMessage"
+            )
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        ce._telegram("12345", "hello admin")  # must not raise
+    assert "test_token" not in caplog.text
+
+
+def test_telegram_swallows_non_runtime_error(monkeypatch):
+    """A non-RuntimeError from telegram_api.send_message (e.g. a malformed Telegram
+    response triggering an AttributeError deep in telegram_api) is also logged, not
+    raised — _telegram's best-effort guarantee must not depend on the exception type."""
+    monkeypatch.setattr(
+        ce.telegram_api,
+        "send_message",
+        MagicMock(side_effect=AttributeError("'NoneType' object has no attribute 'get'")),
+    )
+    ce._telegram("12345", "hello admin")  # must not raise
+
+
+def test_email_processing_continues_despite_non_runtime_error_from_telegram(
+    monkeypatch, stub_state, stub_logger
+):
+    """main() still completes its cycle (reaching log_cycle) even when the
+    'No new emails' Telegram notification's underlying send_message call raises a
+    non-RuntimeError — a notification failure must never interrupt email processing."""
+    monkeypatch.setattr(
+        ce.telegram_api,
+        "send_message",
+        MagicMock(side_effect=AttributeError("'list' object has no attribute 'get'")),
+    )
+    monkeypatch.setattr(ce, "_gws", lambda args: {})  # empty inbox
+
+    ce.main()  # must not raise
+
+    ce.log_cycle.assert_called_once_with(0, 0)

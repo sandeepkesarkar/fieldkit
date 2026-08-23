@@ -72,7 +72,7 @@ def _telegram_error(message: str) -> NoReturn:
     else:
         try:
             telegram_api.send_message(chat_id, message)
-        except RuntimeError as exc:
+        except Exception as exc:
             _log.warning("failed to send error notification: %s", exc)
     sys.exit(1)
 

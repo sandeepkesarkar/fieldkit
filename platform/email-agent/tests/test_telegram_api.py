@@ -100,3 +100,39 @@ def test_send_message_raises_when_token_not_set(monkeypatch):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
         send_message(_CHAT_ID, "hello")
+
+
+def test_send_message_redacts_token_from_network_failure_message(monkeypatch):
+    """The bot token must not appear in the RuntimeError raised on a connection failure.
+
+    requests exceptions on connection failures embed the full request URL
+    (including /bot<TOKEN>/sendMessage) in their string representation. A caller
+    that logs the exception verbatim (e.g. check_email.py's best-effort _telegram
+    wrapper) would otherwise leak the live bot token into logs.
+    """
+    import requests
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "super_secret_token")
+    with patch(
+        "tools.telegram_api.requests.post",
+        side_effect=requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(host='api.telegram.org', port=443): "
+            "Max retries exceeded with url: /botsuper_secret_token/sendMessage"
+        ),
+    ):
+        with pytest.raises(RuntimeError) as exc_info:
+            send_message(_CHAT_ID, "hello")
+    assert "super_secret_token" not in str(exc_info.value)
+
+
+def test_malformed_non_dict_response_raises_runtime_error():
+    """A response body that is valid JSON but not an object (e.g. Telegram returning
+    null or a bare list) raises RuntimeError, not an unhandled AttributeError from
+    calling .get() on a non-dict."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock = MagicMock()
+        mock.ok = True
+        mock.json.return_value = None
+        mock_post.return_value = mock
+        with pytest.raises(RuntimeError, match="Telegram API error"):
+            send_message(_CHAT_ID, "hello")
