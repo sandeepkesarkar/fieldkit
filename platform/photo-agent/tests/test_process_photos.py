@@ -463,3 +463,58 @@ def test_happy_path_scrub_is_called(happy, env):
     mock_scrub.assert_called_once()
     scrubbed = mock_scrub.call_args.args[0]
     assert len(scrubbed) == 2
+
+
+# ---------------------------------------------------------------------------
+# _telegram_error — direct Telegram Bot API notification (replaces openclaw CLI, #14)
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the real _telegram_error() body directly (unlike the tests
+# above, which mock it out entirely via base()). telegram_api.send_message is
+# always mocked — never a real HTTP call — so no test here can reach live Telegram.
+
+def test_telegram_error_sends_via_telegram_api_and_exits(env, mocker):
+    """_telegram_error() calls telegram_api.send_message with chat_id + message, then exits 1."""
+    import scripts.process_photos as proc
+    mock_send = mocker.patch("scripts.process_photos.telegram_api.send_message")
+    with pytest.raises(SystemExit) as exc_info:
+        proc._telegram_error("something broke")
+    mock_send.assert_called_once_with("12345", "something broke")
+    assert exc_info.value.code == 1
+
+
+def test_telegram_error_exits_even_when_send_fails(env, mocker):
+    """A RuntimeError from telegram_api.send_message is swallowed — exit(1) still happens."""
+    import scripts.process_photos as proc
+    mocker.patch(
+        "scripts.process_photos.telegram_api.send_message",
+        side_effect=RuntimeError("Telegram HTTP error 500"),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        proc._telegram_error("something broke")
+    assert exc_info.value.code == 1
+
+
+def test_telegram_error_exits_even_when_send_fails_with_non_runtime_error(env, mocker):
+    """A non-RuntimeError from telegram_api.send_message (e.g. a malformed Telegram
+    response triggering an AttributeError deep in telegram_api) is also swallowed —
+    exit(1) must not depend on the exception type raised by the notification call."""
+    import scripts.process_photos as proc
+    mocker.patch(
+        "scripts.process_photos.telegram_api.send_message",
+        side_effect=AttributeError("'NoneType' object has no attribute 'get'"),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        proc._telegram_error("something broke")
+    assert exc_info.value.code == 1
+
+
+def test_telegram_error_no_chat_id_skips_send_but_still_exits(monkeypatch, mocker):
+    """With ADMIN_TELEGRAM_CHAT_ID unset, _telegram_error() skips the API call but still exits 1."""
+    import scripts.process_photos as proc
+    monkeypatch.delenv("ADMIN_TELEGRAM_CHAT_ID", raising=False)
+    mock_send = mocker.patch("scripts.process_photos.telegram_api.send_message")
+    with pytest.raises(SystemExit) as exc_info:
+        proc._telegram_error("something broke")
+    mock_send.assert_not_called()
+    assert exc_info.value.code == 1

@@ -1,7 +1,7 @@
 """
 Tests for scripts/check_approval.py.
 
-All external calls (state, Telegram API, Drive, email, openclaw) are mocked.
+All external calls (state, Telegram API, Drive, email) are mocked.
 Tests call main() directly and verify behaviour through mock assertions.
 """
 
@@ -81,7 +81,7 @@ def base(mocker, env):
     mocker.patch("scripts.check_approval.telegram_api.edit_message_reply_markup")
     mocker.patch("scripts.check_approval.drive.delete")
     mocker.patch("scripts.check_approval._send_approval_email")
-    mocker.patch("scripts.check_approval._openclaw_send")
+    mocker.patch("scripts.check_approval._notify_admin")
     mocker.patch("scripts.check_approval.activity_log.log_approved")
     mocker.patch("scripts.check_approval.activity_log.log_rejected")
     mocker.patch("scripts.check_approval.activity_log.log_error")
@@ -209,7 +209,7 @@ def test_approve_answer_callback_query_called_first(base):
     call_order = []
     ca.telegram_api.answer_callback_query.side_effect = lambda *a, **kw: call_order.append("answer")
     ca._send_approval_email.side_effect = lambda *a, **kw: call_order.append("email")
-    ca._openclaw_send.side_effect = lambda *a, **kw: call_order.append("openclaw")
+    ca._notify_admin.side_effect = lambda *a, **kw: call_order.append("notify")
 
     main([])
     assert call_order[0] == "answer"
@@ -239,8 +239,8 @@ def test_approve_sends_telegram_confirmation(base):
     import scripts.check_approval as ca
     ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
     main([])
-    ca._openclaw_send.assert_called_once()
-    msg = ca._openclaw_send.call_args.args[0]
+    ca._notify_admin.assert_called_once()
+    msg = ca._notify_admin.call_args.args[0]
     assert "✅" in msg
     assert _PROJECT in msg
 
@@ -304,7 +304,7 @@ def test_reject_answer_callback_query_called_first(base):
     call_order = []
     ca.telegram_api.answer_callback_query.side_effect = lambda *a, **kw: call_order.append("answer")
     ca.drive.delete.side_effect = lambda *a, **kw: call_order.append("drive_delete")
-    ca._openclaw_send.side_effect = lambda *a, **kw: call_order.append("openclaw")
+    ca._notify_admin.side_effect = lambda *a, **kw: call_order.append("notify")
 
     main([])
     assert call_order[0] == "answer"
@@ -343,8 +343,8 @@ def test_reject_sends_telegram_notification(base):
     import scripts.check_approval as ca
     ca.telegram_api.get_updates.return_value = [_REJECT_UPDATE]
     main([])
-    ca._openclaw_send.assert_called_once()
-    msg = ca._openclaw_send.call_args.args[0]
+    ca._notify_admin.assert_called_once()
+    msg = ca._notify_admin.call_args.args[0]
     assert "❌" in msg
 
 
@@ -353,7 +353,7 @@ def test_reject_message_instructs_to_update_and_retrigger(base):
     import scripts.check_approval as ca
     ca.telegram_api.get_updates.return_value = [_REJECT_UPDATE]
     main([])
-    msg = ca._openclaw_send.call_args.args[0]
+    msg = ca._notify_admin.call_args.args[0]
     assert "process_photos" in msg
 
 
@@ -391,8 +391,8 @@ def test_email_failure_sends_fallback_with_folder_link(base):
     ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
     ca._send_approval_email.side_effect = RuntimeError("SMTP error")
     main([])
-    ca._openclaw_send.assert_called_once()
-    msg = ca._openclaw_send.call_args.args[0]
+    ca._notify_admin.assert_called_once()
+    msg = ca._notify_admin.call_args.args[0]
     assert _PENDING["drive_folder_link"] in msg
 
 
@@ -402,7 +402,7 @@ def test_email_failure_fallback_indicates_delivery_failed(base):
     ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
     ca._send_approval_email.side_effect = RuntimeError("SMTP error")
     main([])
-    msg = ca._openclaw_send.call_args.args[0]
+    msg = ca._notify_admin.call_args.args[0]
     assert "failed" in msg.lower() or "email" in msg.lower()
 
 
@@ -444,8 +444,8 @@ def test_drive_delete_failure_rejection_still_sent(base):
     ca.telegram_api.get_updates.return_value = [_REJECT_UPDATE]
     ca.drive.delete.side_effect = RuntimeError("permission denied")
     main([])
-    ca._openclaw_send.assert_called_once()
-    msg = ca._openclaw_send.call_args.args[0]
+    ca._notify_admin.assert_called_once()
+    msg = ca._notify_admin.call_args.args[0]
     assert "❌" in msg
 
 
@@ -555,7 +555,7 @@ def test_email_failure_fallback_does_not_send_success_confirmation(base):
     ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
     ca._send_approval_email.side_effect = RuntimeError("SMTP error")
     main([])
-    msg = ca._openclaw_send.call_args.args[0]
+    msg = ca._notify_admin.call_args.args[0]
     assert "✅" not in msg
 
 
@@ -576,7 +576,7 @@ def test_delete_local_file_refuses_path_outside_tmp(tmp_path, tmp_path_factory, 
 
 
 # ---------------------------------------------------------------------------
-# Direct callback path (OpenClaw passes callback data as CLI args)
+# Direct callback path (the /check_approval skill passes callback data as CLI args)
 # ---------------------------------------------------------------------------
 
 _DIRECT_ARGS = [
@@ -593,7 +593,7 @@ _DIRECT_REJECT_ARGS = [
 
 
 def test_direct_path_does_not_call_get_updates(base):
-    """Direct callback path skips getUpdates — OpenClaw already consumed the update."""
+    """Direct callback path skips getUpdates — it never observes the raw callback_query at all."""
     import scripts.check_approval as ca
     main(_DIRECT_ARGS)
     ca.telegram_api.get_updates.assert_not_called()
@@ -626,7 +626,7 @@ def test_direct_path_approve_clears_pending_approval(base):
 
 
 def test_direct_path_approve_does_not_set_telegram_offset(base):
-    """Direct path does not touch the Telegram offset — OpenClaw manages it."""
+    """Direct path does not touch the Telegram offset — there's no getUpdates poll to advance."""
     import scripts.check_approval as ca
     main(_DIRECT_ARGS)
     ca.state.set_telegram_offset.assert_not_called()
@@ -643,8 +643,8 @@ def test_direct_path_reject_sends_telegram_notification(base):
     """Direct reject path sends the Telegram rejection notification."""
     import scripts.check_approval as ca
     main(_DIRECT_REJECT_ARGS)
-    ca._openclaw_send.assert_called_once()
-    assert "❌" in ca._openclaw_send.call_args.args[0]
+    ca._notify_admin.assert_called_once()
+    assert "❌" in ca._notify_admin.call_args.args[0]
 
 
 def test_direct_path_wrong_message_id_returns_early(base):
@@ -1017,3 +1017,95 @@ def test_approve_enqueue_failure_does_not_abort_approve_flow(base_fb):
     main([])
     ca.state.clear_pending_approval.assert_called_once()
     ca.state.set_telegram_offset.assert_called_once_with(101)
+
+
+# ---------------------------------------------------------------------------
+# _notify_admin — direct Telegram Bot API notification (replaces openclaw CLI, #14)
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the real _notify_admin() body (unlike the tests above,
+# which mock it out entirely). telegram_api.send_message is always mocked —
+# never a real HTTP call — so no test here can reach live Telegram.
+
+def test_notify_admin_sends_via_telegram_api(env, mocker):
+    """_notify_admin() calls telegram_api.send_message with the configured chat_id and message."""
+    import scripts.check_approval as ca
+    mock_send = mocker.patch("scripts.check_approval.telegram_api.send_message")
+    ca._notify_admin("hello admin")
+    mock_send.assert_called_once_with(_CHAT_ID, "hello admin")
+
+
+def test_notify_admin_swallows_telegram_failure(env, mocker):
+    """A RuntimeError from telegram_api.send_message is logged, not raised."""
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.telegram_api.send_message",
+        side_effect=RuntimeError("Telegram HTTP error 500"),
+    )
+    ca._notify_admin("hello admin")  # must not raise
+
+
+def test_notify_admin_no_chat_id_skips_send(monkeypatch, mocker):
+    """With ADMIN_TELEGRAM_CHAT_ID unset, _notify_admin() does not call telegram_api at all."""
+    import scripts.check_approval as ca
+    monkeypatch.delenv("ADMIN_TELEGRAM_CHAT_ID", raising=False)
+    mock_send = mocker.patch("scripts.check_approval.telegram_api.send_message")
+    ca._notify_admin("hello admin")
+    mock_send.assert_not_called()
+
+
+def test_notify_admin_does_not_leak_token_on_network_failure(env, mocker, caplog):
+    """The bot token must not appear in _notify_admin's warning log on a connection
+    failure. requests exceptions embed the request URL (including /bot<TOKEN>/...)
+    in their string representation — telegram_api.send_message must redact it
+    before _notify_admin logs the exception verbatim."""
+    import requests
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.telegram_api.requests.post",
+        side_effect=requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: /bottest_token/sendMessage"
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        ca._notify_admin("hello admin")  # must not raise
+    assert "test_token" not in caplog.text
+
+
+def test_notify_admin_swallows_non_runtime_error(env, mocker):
+    """A non-RuntimeError from telegram_api.send_message (e.g. a malformed Telegram
+    response triggering an AttributeError deep in telegram_api) is also logged, not
+    raised — _notify_admin's best-effort guarantee must not depend on the exception type."""
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.telegram_api.send_message",
+        side_effect=AttributeError("'NoneType' object has no attribute 'get'"),
+    )
+    ca._notify_admin("hello admin")  # must not raise
+
+
+def test_approve_completes_despite_non_runtime_error_from_notify(mocker, env, lock_mock):
+    """approve path still clears pending state and advances the offset even when
+    _notify_admin's underlying Telegram call raises a non-RuntimeError — the
+    notification is best-effort and must never block approval completion."""
+    import scripts.check_approval as ca
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=_PENDING)
+    mocker.patch("scripts.check_approval.state.get_telegram_offset", return_value=50)
+    mock_set_offset = mocker.patch("scripts.check_approval.state.set_telegram_offset")
+    mock_clear = mocker.patch("scripts.check_approval.state.clear_pending_approval")
+    mocker.patch("scripts.check_approval.telegram_api.get_updates", return_value=[_APPROVE_UPDATE])
+    mocker.patch("scripts.check_approval.telegram_api.answer_callback_query")
+    mocker.patch("scripts.check_approval.telegram_api.edit_message_reply_markup")
+    mocker.patch(
+        "scripts.check_approval.telegram_api.send_message",
+        side_effect=AttributeError("'list' object has no attribute 'get'"),
+    )
+    mocker.patch("scripts.check_approval.drive.delete")
+    mocker.patch("scripts.check_approval._send_approval_email")
+    mocker.patch("scripts.check_approval.activity_log.log_approved")
+    mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    mocker.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    main([])
+    mock_clear.assert_called_once()
+    mock_set_offset.assert_called_once_with(101)

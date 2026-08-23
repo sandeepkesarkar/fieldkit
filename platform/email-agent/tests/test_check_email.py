@@ -288,9 +288,9 @@ def test_load_env_does_not_overwrite_existing_env_var(tmp_path, monkeypatch):
     """
     _load_env skips variables that are already set in os.environ.
 
-    The .env file is the fallback; environment variables set by ~/.zshrc (which
-    OpenClaw reads at startup) take precedence. Without this guard, sourcing .env
-    after shell startup would silently overwrite the already-exported values.
+    The .env file is the fallback; environment variables already set in the shell
+    (e.g. via ~/.zshrc) take precedence. Without this guard, sourcing .env after
+    shell startup would silently overwrite the already-exported values.
     """
     env_file = tmp_path / ".env"
     env_file.write_text("FIELDKIT_TEST_VAR=from_file\n")
@@ -647,3 +647,92 @@ def test_gws_file_not_found_raises_runtime_error(monkeypatch):
 
 
 import os  # noqa: E402  — placed here to avoid shadowing the top-level fixture
+
+
+# ---------------------------------------------------------------------------
+# _telegram — direct Telegram Bot API notification (replaces openclaw CLI, #14)
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the real _telegram() body directly (unlike every test
+# above, which stubs it out entirely via monkeypatch). telegram_api.send_message
+# is always mocked here — never a real HTTP call — so no test in this module can
+# reach live Telegram.
+
+def test_telegram_sends_via_telegram_api(monkeypatch):
+    """_telegram() calls telegram_api.send_message with chat_id and the (truncated) message."""
+    mock_send = MagicMock()
+    monkeypatch.setattr(ce.telegram_api, "send_message", mock_send)
+    ce._telegram("12345", "hello admin")
+    mock_send.assert_called_once_with("12345", "hello admin")
+
+
+def test_telegram_truncates_long_messages(monkeypatch):
+    """_telegram() truncates the message to _TELEGRAM_MAX_LEN before sending."""
+    mock_send = MagicMock()
+    monkeypatch.setattr(ce.telegram_api, "send_message", mock_send)
+    long_message = "x" * (ce._TELEGRAM_MAX_LEN + 500)
+    ce._telegram("12345", long_message)
+    sent_text = mock_send.call_args.args[1]
+    assert len(sent_text) == ce._TELEGRAM_MAX_LEN
+
+
+def test_telegram_swallows_send_failure(monkeypatch):
+    """A RuntimeError from telegram_api.send_message is logged, not raised."""
+    monkeypatch.setattr(
+        ce.telegram_api,
+        "send_message",
+        MagicMock(side_effect=RuntimeError("Telegram HTTP error 500")),
+    )
+    ce._telegram("12345", "hello admin")  # must not raise
+
+
+def test_telegram_does_not_leak_token_on_network_failure(monkeypatch, caplog):
+    """The bot token must not appear in _telegram's warning log on a connection
+    failure. requests exceptions embed the request URL (including /bot<TOKEN>/...)
+    in their string representation — telegram_api.send_message must redact it
+    before _telegram logs the exception verbatim."""
+    import requests
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
+    monkeypatch.setattr(
+        ce.telegram_api.requests,
+        "post",
+        MagicMock(
+            side_effect=requests.exceptions.ConnectionError(
+                "Max retries exceeded with url: /bottest_token/sendMessage"
+            )
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        ce._telegram("12345", "hello admin")  # must not raise
+    assert "test_token" not in caplog.text
+
+
+def test_telegram_swallows_non_runtime_error(monkeypatch):
+    """A non-RuntimeError from telegram_api.send_message (e.g. a malformed Telegram
+    response triggering an AttributeError deep in telegram_api) is also logged, not
+    raised — _telegram's best-effort guarantee must not depend on the exception type."""
+    monkeypatch.setattr(
+        ce.telegram_api,
+        "send_message",
+        MagicMock(side_effect=AttributeError("'NoneType' object has no attribute 'get'")),
+    )
+    ce._telegram("12345", "hello admin")  # must not raise
+
+
+def test_email_processing_continues_despite_non_runtime_error_from_telegram(
+    monkeypatch, stub_state, stub_logger
+):
+    """main() still completes its cycle (reaching log_cycle) even when the
+    'No new emails' Telegram notification's underlying send_message call raises a
+    non-RuntimeError — a notification failure must never interrupt email processing."""
+    monkeypatch.setattr(
+        ce.telegram_api,
+        "send_message",
+        MagicMock(side_effect=AttributeError("'list' object has no attribute 'get'")),
+    )
+    monkeypatch.setattr(ce, "_gws", lambda args: {})  # empty inbox
+
+    ce.main()  # must not raise
+
+    ce.log_cycle.assert_called_once_with(0, 0)

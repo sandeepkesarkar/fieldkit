@@ -2,8 +2,8 @@
 Email intake agent main script.
 
 Polls the agent Gmail inbox, enforces ADMIN_ALLOWLIST, assigns ref IDs,
-applies the fk-received Gmail label, and sends Telegram acks via
-`openclaw message send`.
+applies the fk-received Gmail label, and sends Telegram acks via a direct
+Telegram Bot API call (tools/telegram_api.py).
 
 Usage:
     python3 scripts/check_email.py                # user-triggered (/check_email)
@@ -26,6 +26,7 @@ from typing import List, Optional
 # Allow `from tools.state import ...` without installing the package.
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
+from tools import telegram_api
 from tools.logger import log_cycle, log_received, log_rejected, log_stale_alert
 from tools.state import (
     DATA_DIR,
@@ -139,24 +140,11 @@ def _sanitize_for_telegram(text: str, max_len: int = 200) -> str:
 
 
 def _telegram(chat_id: str, message: str) -> None:
-    """Send a Telegram message via the OpenClaw CLI (best-effort, no raise)."""
-    result = subprocess.run(
-        [
-            "openclaw", "message", "send",
-            "--channel", "telegram",
-            "--target", chat_id,
-            "--message", message[:_TELEGRAM_MAX_LEN],
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        logger.warning(
-            "_telegram: openclaw exited %d — %s",
-            result.returncode,
-            result.stderr.strip()[:200],
-        )
+    """Send a Telegram message via the Bot API (best-effort, no raise)."""
+    try:
+        telegram_api.send_message(chat_id, message[:_TELEGRAM_MAX_LEN])
+    except Exception as exc:
+        logger.warning("_telegram: send failed — %s", exc)
 
 
 # ---------------------------------------------------------------------------

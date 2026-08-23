@@ -4,9 +4,9 @@ process_photos.py — Generate a photo slideshow video and send for approval.
 Usage:
     python3 scripts/process_photos.py --project <name>
 
-Invoked by the /process_photos OpenClaw skill. Integrates Drive, FFmpeg,
+Invoked by the /process_photos Hermes skill. Integrates Drive, FFmpeg,
 Telegram, and state management. Exits non-zero on any failure, sending a
-Telegram error message via openclaw before doing so.
+Telegram error message via the Bot API before doing so.
 
 Lock discipline: run.lock is held for the duration of the pipeline to prevent
 concurrent runs. state.json is separately locked inside each tools/state.py
@@ -19,7 +19,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,17 +62,18 @@ def _load_env() -> None:
 
 
 def _telegram_error(message: str) -> NoReturn:
-    """Send an error to the admin via openclaw Telegram and exit non-zero."""
+    """Send an error to the admin via the Telegram Bot API and exit non-zero.
+
+    Best-effort — a failed notification must never prevent the non-zero exit.
+    """
     chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
-    cmd = ["openclaw", "message", "send", "--channel", "telegram", "-m", message]
-    if chat_id:
-        cmd.extend(["--target", chat_id])
-    try:
-        result = subprocess.run(cmd, check=False, timeout=30)
-        if result.returncode != 0:
-            _log.warning("openclaw exited %d while sending error message", result.returncode)
-    except subprocess.TimeoutExpired:
-        _log.warning("openclaw timed out after 30s while sending error message")
+    if not chat_id:
+        _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot send error notification")
+    else:
+        try:
+            telegram_api.send_message(chat_id, message)
+        except Exception as exc:
+            _log.warning("failed to send error notification: %s", exc)
     sys.exit(1)
 
 
