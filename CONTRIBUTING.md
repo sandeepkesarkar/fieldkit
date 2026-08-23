@@ -243,6 +243,28 @@ FieldKit is built in public. Every week, a post goes out on LinkedIn covering th
 - The `.gitignore` excludes `.env` files — double-check before committing
 - If you accidentally commit a secret, rotate it immediately
 
+### Debugging secrets safely
+
+Never raw-dump a file known to hold secrets (`.env`, credential stores,
+token caches) while debugging — no `cat`, `xxd`, `tail -c`, `hexdump`, or
+similar, even to a session transcript that never reaches the user. A value
+that touches any transcript or log should be treated as compromised, since
+those persist. This applies to human and AI-agent debugging alike.
+
+Use presence/length-only checks instead, which answer "is this set, and
+does it look right" without ever printing the value itself:
+
+```bash
+grep -c '^TELEGRAM_BOT_TOKEN=' .env                       # is the key present?
+awk -F= '/^TELEGRAM_BOT_TOKEN=/{print length($2)}' .env   # how long is the value?
+```
+
+Filed and closed as issue #27, after a sub-agent's raw byte-dump of a live
+`.env` briefly exposed a real Telegram bot token in its own session
+transcript. See
+[`platform/docs/hermes/06-openclaw-removal.md`](platform/docs/hermes/06-openclaw-removal.md)
+for the full incident record and remediation.
+
 ---
 
 ## Project Structure Reference
