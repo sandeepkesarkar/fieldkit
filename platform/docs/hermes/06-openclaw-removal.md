@@ -34,9 +34,11 @@ record of what was already done and verified, not a new verification pass.
    printed the live Telegram bot token into its own session transcript via a
    raw byte-dump of `.env` — was caught immediately, remediated (token
    rotated), and is tracked to closure in issue #27.
-6. With 1–4 verified, **SC-001 (cron scripts run correctly with Hermes
-   running, with zero OpenClaw dependency) is now genuinely satisfied** —
-   see "SC-001 — Final Status" below.
+6. With 1–4 verified, SC-001 is satisfied for the OpenClaw-dependency-
+   elimination and script-execution-health portions it covers — **but not
+   in full**: `check_approval`'s Hermes-vs-cron `getUpdates` race (newly
+   tracked in issue #29) and `check_email`'s manual-command status (#25,
+   unverified) remain open. See "SC-001 — Final Status" below.
 
 ## 1. OpenClaw removed from the Mac Mini (2026-08-23)
 
@@ -52,7 +54,11 @@ Hermes-cutover work (#6) flagged that an `unload` alone is session-scoped —
 `launchd` will happily reload the job on next login or a `launchctl load`
 without anyone intending it, because `unload` doesn't change the job's
 enabled/disabled state, only whether it's currently running. That gap is
-what #16 deferred to #14 to close. Confirmed durable via:
+what #16 deferred to #14 to close. `launchctl disable` targets the
+`gui/501/ai.openclaw.gateway` launchd domain/service label directly, not a
+file — it records the disabled state in launchd's own database, independent
+of whether the plist that originally defined the job still exists on disk.
+Confirmed durable via:
 
 ```
 $ launchctl print-disabled gui/501 | grep openclaw
@@ -67,8 +73,8 @@ removed 699 packages
 $ rm -rf ~/.openclaw
 ```
 
-And removed the plist itself (the file `launchctl disable` was pointed at).
-Confirmed nothing remains:
+And removed the plist that had defined the job. Confirmed nothing remains,
+including the binary itself off `PATH`:
 
 ```
 $ launchctl list | grep openclaw
@@ -77,48 +83,125 @@ $ ls ~/.openclaw
 ls: /Users/sandeep_a_k/.openclaw: No such file or directory
 $ ls ~/Library/LaunchAgents/ | grep openclaw
 (no output)
+$ command -v openclaw
+(no output, exit 1 — not found on PATH)
 ```
 
 `ai.hermes.gateway` is unaffected by any of the above — it's a separate
 `launchd` job and was not touched.
 
-## 2. Repo-wide grep — confirmed clean (re-run for this doc)
+## 2. Repo-wide grep — complete inventory (re-run for this doc)
 
 Issue #14's acceptance criteria explicitly scopes this to active code/config
 — historical docs/specs mentioning OpenClaw for context are expected and
 fine. Re-running the grep fresh (excluding `.git`, stale local worktrees,
 and vendored `venv`/`node_modules` trees) for this doc, rather than trusting
-the earlier pass:
+an earlier pass:
 
 ```
 $ grep -ril openclaw --include="*" . \
     | grep -vE '/\.git/|/\.worktrees/|/venv/|/\.venv/|/node_modules/'
 ```
 
-Every hit falls into one of two buckets:
+A first pass of this doc classified the hits by directory/category and
+hand-waved several individual files into "historical spec-kit records"
+without actually reading each one. A cross-review of PR #28 caught that —
+several of those files turned out to be **active, current-facing governing
+docs** that still asserted OpenClaw/local-only-inference as present fact,
+not historical record. Every hit is now individually read and classified
+below; the ones that needed real content changes (not just
+reclassification) were fixed in this PR.
 
-- **Already-tracked, deliberately out-of-scope** — filed and left open on
-  purpose, not missed:
-  - Issue #25 — `platform/email-agent/SKILL.md` and `SETUP.md` still
-    describe OpenClaw's skill-install flow; `email-agent`'s manual
-    `/check_email` command was never ported to a Hermes skill (unlike
-    `process-photos` and `check-approval`, #7/#8). `check_email.py`'s own
-    logic no longer depends on the `openclaw` binary as of #24 — this is
-    purely the manual-invocation doc/skill surface.
-  - Issue #26 — `README.md`, `clients/_demo/README.md`, and
-    `clients/_template/README.md` still describe OpenClaw as the current AI
-    runtime rather than Hermes. `_template`'s copy matters most, since it's
-    what every future client is scaffolded from.
-- **Historical spec-kit records** — frozen `.specify/` planning artifacts
-  (e.g. `003-hermes-runtime/spec.md`, `002-photo-video-agent/*`,
-  `001-email-agent/*`, `004-e2e-test-rig/*`), test files exercising the
-  pre-#24 code paths' history, and dated `updates/` posts. These describe
-  decisions and states as they were at the time and are intentionally left
-  untouched, consistent with how other completed features' specs are
-  treated (see the equivalent note at the end of
-  [`05-cron-verification.md`](05-cron-verification.md)).
+**Fixed in this PR** — active docs that asserted OpenClaw or "no cloud AI
+inference" as current fact, corrected to describe Hermes and the cloud
+model-routing pivot (Anthropic default / OpenAI per-client, from #6/FR-004):
 
-No hit represents a live, reachable OpenClaw dependency. Acceptance
+- `.specify/memory/constitution.md` — the framework-level constitution,
+  authoritative for all client work. Its Architecture Constraints named
+  OpenClaw as the runtime and stated "no cloud AI inference" as a hard
+  constraint — both false since #6. This was already tracked as open issue
+  **#9** with its own pre-approved acceptance criteria (`Runtime: OpenClaw`
+  → `Runtime: Hermes Agent`, remove/rewrite the "no cloud AI inference" and
+  Mac-Mini-hardware-transfer/data-locality claims retired by the Mac Mini →
+  Cloud pivot). Implemented #9's criteria verbatim in this PR; version
+  footer bumped to 1.1 with an amendment note.
+- `clients/_template/.specify/constitution.md` — the template every new
+  client is scaffolded from (per `CONTRIBUTING.md`'s onboarding steps).
+  Same OpenClaw/no-cloud-inference claims, in the AI Provider header, the
+  "OpenClaw Cost Model" and "OpenClaw Integration" sections, and the
+  footer. Explicitly named in open issue **#10**'s acceptance criteria
+  ("Check ... `clients/_template/.specify/constitution.md` for the same
+  stale boilerplate; fix if found") — fixed here, though #10 also covers
+  `spec-template.md` boilerplate that doesn't mention OpenClaw and wasn't
+  touched by this PR's grep-driven fixes; #10 stays open for that part.
+- `clients/_demo/.specify/constitution.md` — the live demo client's own
+  constitution, marked `Status: Reference / Active`. Same class of claim
+  (AI Provider header, cost model, integration section, footer), not
+  covered by any existing issue. Fixed directly in this PR (admin decision,
+  since it mirrors #9's already-approved pattern) — scope limited to the
+  AI-provider/cloud-inference claims; the separate Mac-Mini
+  hardware-transfer/ownership content in this file was deliberately left
+  untouched, since that's the larger, still-undecided cloud-pivot ownership
+  question W3 is meant to resolve, not something this PR should
+  unilaterally settle.
+- `framework-philosophy.md` — root-level, unlinked from `README.md` but not
+  historical/dated. Its "Self-Hosted by Default" principle claimed "powered
+  by OpenClaw" and "no cloud dependency for AI inference." Fixed directly,
+  same scope limitation as above (AI-provider/inference claims only).
+- `.specify/templates/overrides/plan-template.md` — the override template
+  used by every future `/speckit-plan` run. Its Phase 2 boilerplate output
+  line named "updated cron/OpenClaw config." Simple rename to
+  "cron/Hermes config" — not previously covered by #10 (which named
+  `spec-template.md`, not `plan-template.md`).
+
+**Orphaned duplicate, left as-is** — root-level `constitution.md`: byte-for-
+byte identical (pre-fix) to `clients/_template/.specify/constitution.md`.
+Not referenced by `README.md`, `CONTRIBUTING.md`, `CLAUDE.md`, or any
+`.claude/skills/*` file — every reference to a client constitution in this
+repo points at `clients/{name}/.specify/constitution.md`, never the bare
+root path. This looks like a leftover duplicate from before the template
+was properly separated out (untouched since the initial commit). Left
+unedited here rather than guessed at — deleting or syncing it is a small
+cleanup call for the repo owner, not something this docs PR should decide
+unilaterally.
+
+**Already-tracked, deliberately out-of-scope** — filed and left open on
+purpose, not missed:
+- Issue #25 — `platform/email-agent/SKILL.md` and `SETUP.md` still
+  describe OpenClaw's skill-install flow; `email-agent`'s manual
+  `/check_email` command was never ported to a Hermes skill (unlike
+  `process-photos` and `check-approval`, #7/#8). `check_email.py`'s own
+  logic no longer depends on the `openclaw` binary as of #24 — this is
+  purely the manual-invocation doc/skill surface.
+- Issue #26 — `README.md`, `clients/_demo/README.md`, and
+  `clients/_template/README.md` still describe OpenClaw as the current AI
+  runtime rather than Hermes.
+
+**Historical records, read and confirmed genuinely historical** — each of
+these documents a past decision or state as it was at the time, not a
+current claim:
+- Frozen `.specify/` spec-kit planning artifacts: `003-hermes-runtime/spec.md`
+  (the Hermes migration spec itself — extensively discusses OpenClaw as the
+  thing being replaced, by design), `002-photo-video-agent/*`,
+  `001-email-agent/*`, `004-e2e-test-rig/*`.
+- `platform/photo-agent/skills/check-approval/SKILL.md` and
+  `process-photos/SKILL.md` — both carry an explicit "OpenClaw → Hermes
+  mapping" section (#7/#8) documenting the port for future reference; the
+  skills themselves are Hermes-only today.
+- `platform/docs/cross-review.md`, and `platform/docs/hermes/01-install.md`
+  through `05-cron-verification.md` — this doc's own predecessors, each a
+  dated record of a specific PR's findings, already following this same
+  convention (see the "no other files needed updating" note at the end of
+  `05-cron-verification.md`).
+- Test files (`test_process_photos.py`, `test_check_approval.py`,
+  `test_check_email.py`, etc.) whose fixtures or docstrings reference the
+  pre-#24 `openclaw message send` code path's history.
+- Dated `updates/` LinkedIn posts and `CONTRIBUTING.md` (this PR's own new
+  reference to issue #27's incident, in the debugging-hygiene note — a
+  historical citation, not a current-runtime claim).
+
+No remaining hit represents a live, reachable OpenClaw dependency or an
+active doc still asserting OpenClaw is the current runtime. Acceptance
 criterion 3 of #14 ("Repo-wide grep confirms no remaining reference to
 OpenClaw in active code/config") is met.
 
@@ -142,14 +225,17 @@ third-party import to trip over it.
 Fixed the same way, on the live crontab:
 
 ```
-* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/Users/sandeep_a_k/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/Users/sandeep_a_k/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin bash -c 'date && /usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
 ```
 
-(schedule, `PATH`, and log redirect unchanged — only the bare `python3` became
-the explicit `/usr/local/bin/python3` path, matching the other two entries.)
+(`check_email.py` runs on the 5-minute schedule, `*/5 * * * *`, not the
+1-minute schedule `check_approval.py` and `upload_facebook.py` use — see
+`05-cron-verification.md`'s "before/after" crontab listings. Schedule,
+`PATH`, and log redirect unchanged from before this fix — only the bare
+`python3` became the explicit `/usr/local/bin/python3` path.)
 
-Confirmed via live `tail -f logs/cron.log` across subsequent ticks: no more
-`ModuleNotFoundError`, clean runs.
+Confirmed via `tail -f logs/cron.log`, watched by a human across subsequent
+ticks: no more `ModuleNotFoundError`, clean runs.
 
 ## 4. `TELEGRAM_BOT_TOKEN` propagation gap after #24
 
@@ -165,8 +251,21 @@ Immediately after #24 landed, `check_email.py` logged on every cron tick:
 WARNING __main__ _telegram: send failed — TELEGRAM_BOT_TOKEN is not set
 ```
 
-**Root-caused as a timing gap, not a code bug.** Live investigation ruled out
-the code:
+**Two separate causes, not one — kept distinct here since conflating them
+was a finding of PR #28's own cross-review.**
+
+**Primary cause: the value was genuinely missing.** #24 added the
+`TELEGRAM_BOT_TOKEN=` key to `platform/email-agent/.env.example` — correctly,
+since a real secret value has no business in a PR diff — but that's a
+template, not the live file. Nothing backfilled the actual value into
+`platform/email-agent/.env` on the Mac Mini, so every cron tick read a
+`.env` with no `TELEGRAM_BOT_TOKEN` key at all until someone did that by
+hand. This accounts for the warning repeating across every tick from #24
+landing until the manual `.env` edit below.
+
+**Secondary, narrower cause: a one-cycle-old read explains only the single
+warning logged immediately after the fix landed.** Before concluding the
+fix had failed, the code itself was ruled out:
 
 - `check_email.py`'s `_load_env()` parses `.env` generically with no
   key whitelist — nothing about `TELEGRAM_BOT_TOKEN` specifically that could
@@ -177,16 +276,18 @@ the code:
   and confirmed the script resolves `.env` the same way regardless of
   invocation directory.
 
-The actual cause: the `.env` fix landed roughly 12 seconds after a cron tick
-had already started and read the old (token-less) file — a single
-one-cycle-old snapshot, not a defect. The very next tick, once the edited
-file was in place before the tick started, succeeded cleanly.
+The one warning that appeared *after* the value was added was explained by
+timing, not the code or a still-missing value: the `.env` edit landed
+roughly 12 seconds after that tick had already started and read the
+still-token-less file — a single stale snapshot from a tick already in
+flight, not a recurrence of the primary cause. The very next tick, with the
+edited file in place before the tick started, succeeded cleanly.
 
 **Fixed** by adding the missing `TELEGRAM_BOT_TOKEN` value to
 `platform/email-agent/.env` — copied from `~/.hermes/.env`, which already
 held a working value for the same bot (reused from #6's setup, see
-[`02-gateway-setup.md`](02-gateway-setup.md)). Verified clean across live
-cron ticks afterward.
+[`02-gateway-setup.md`](02-gateway-setup.md)). Verified clean across
+subsequent cron ticks, watched by a human afterward.
 
 ## 5. Security incident and remediation — closes issue #27
 
@@ -226,35 +327,71 @@ Issue #27's remaining acceptance item — a durable note instructing agents
 never to raw-dump a file known to hold secrets — is added in this PR to
 [`CONTRIBUTING.md`](../../../CONTRIBUTING.md)'s existing "Security & Secrets"
 section, the most natural existing home for it in this repo. Summary: use
-presence/length-only checks (`grep -c '^KEY='`, `awk -F= '/^KEY=/{print
-length($2)}'`) instead of `cat`/`xxd`/`tail -c`/`hexdump` on `.env` files or
+presence/length-only checks (`grep -c '^KEY='`, `awk '/^KEY=/{sub(/^[^=]*=/,"");
+print length}'`) instead of `cat`/`xxd`/`tail -c`/`hexdump` on `.env` files or
 credential stores.
 
 ## SC-001 — Final Status
 
-[`05-cron-verification.md`](05-cron-verification.md) left SC-001 (cron
-scripts run correctly with Hermes installed and running, with no OpenClaw
-dependency) only partially met, blocked specifically on the live
-`openclaw message send` call sites in `check_approval.py` and
-`check_email.py` (its own "FR-003" section) and deferred the
-button-callback race to #14. With everything in this doc:
+The governing spec defines SC-001 broadly: *"Every existing chat-driven and
+cron-driven flow (`check_email`, `process_photos`, `check_approval`,
+`upload_facebook`) works under Hermes with no admin-visible behavior
+change"* — not just "scripts execute without crashing." An earlier draft of
+this section claimed SC-001 was fully satisfied by removing OpenClaw;
+PR #28's cross-review correctly rejected that as overclaimed, since removing
+OpenClaw doesn't touch the specific gap `05-cron-verification.md` already
+identified. Corrected status, part by part:
 
-- **OpenClaw dependency**: zero. #24 replaced every live call site with
-  direct Telegram Bot API calls before this doc's removal step ran, and §1
-  above confirms OpenClaw itself is no longer installed on the machine at
-  all — there is no fallback path left to depend on it.
-- **Cron scripts run clean with Hermes running**: confirmed by live log
-  evidence, not just claims — §3's `cron.log` tail showed
-  `check_email.py`'s `ModuleNotFoundError` gone after the interpreter-path
-  fix, and §4's cron ticks showed the `TELEGRAM_BOT_TOKEN` warning gone
-  after the `.env` fix, both observed while `ai.hermes.gateway` was up and
-  polling.
-- **Repo-wide grep**: clean per §2, re-run fresh for this doc rather than
-  citing an earlier pass.
+**Satisfied by this doc: OpenClaw-dependency elimination and script-execution
+health.**
+- **OpenClaw dependency: zero.** #24 replaced every live `openclaw message
+  send` call site with direct Telegram Bot API calls before this doc's
+  removal step ran, and §1 confirms OpenClaw itself is no longer installed
+  on the machine at all — there is no fallback path left to depend on it.
+- **Cron scripts run clean with Hermes running:** confirmed by recorded
+  human observation while investigating, not just asserted after the fact —
+  §3 records a human watching `logs/cron.log` across ticks after the
+  interpreter-path fix and seeing `check_email.py`'s `ModuleNotFoundError`
+  stop appearing, and §4 records the same for the `TELEGRAM_BOT_TOKEN`
+  warning after the `.env` fix, both while `ai.hermes.gateway` was up and
+  polling. Neither this doc nor the PR retains a literal timestamped log
+  excerpt from those sessions — the record here is the human's
+  contemporaneous account of what `cron.log` showed, not a preserved raw
+  transcript.
+- **Repo-wide grep:** clean per §2, individually re-read and classified for
+  this doc rather than citing an earlier pass.
 
-**SC-001 is genuinely satisfied.** The one item `05-cron-verification.md`
-flagged as out of SC-001's scope and explicitly deferred to #14 — the
-Hermes/cron-leg `getUpdates` offset race on `check_approval.py`'s
-button-callback path — is a separate, already-tracked concern (see that
-doc's "Acceptance Criteria — Final Status," item 4) and is unaffected by
-anything in this doc; it is not part of what SC-001 measures.
+**NOT satisfied — a real, unresolved gap, not fixed by removing OpenClaw:**
+`check_approval.py`'s button-callback path. `05-cron-verification.md`
+already documented this as a confirmed (not probabilistic) `getUpdates`
+offset race between Hermes's continuous long-poll and the cron leg's
+once-a-minute poll, both against the same bot token — Hermes wins
+essentially every time, so a real button tap is very unlikely to reach the
+cron leg. Removing OpenClaw does not fix this: it only removes a *third*
+competitor for the same token: Hermes and the cron leg still both poll
+`getUpdates` against it exactly as before. **Do not read this doc's
+OpenClaw-removal work as resolving that race** — it doesn't touch it.
+
+That gap's only prior tracking was inline commentary on issues #13 and #14,
+both now closed — too fragile to rely on. Opened **issue #29** to track it
+on its own, durable and currently open, referencing the original discovery
+context (PR #21's review thread, 2026-08-21) and `05-cron-verification.md`'s
+own "Acceptance Criteria — Final Status" item 4.
+
+**Unverified, stated honestly rather than assumed either way:**
+`check_email`'s manual `/check_email` chat command. Issue #25 (open) flags
+that `email-agent`'s manual-command skill surface was never ported to
+Hermes's format, and states it is "likely non-functional" — that's #25's
+own hedge, not a confirmed result, and nothing in this PR verifies it either
+way. `check_email.py`'s cron-triggered path is unaffected either way (its
+own logic has zero OpenClaw dependency as of #24, per §1–§4 above) — the
+open question is specifically whether the manual, chat-driven `/check_email`
+invocation dispatches correctly under Hermes today. Left to #25 to verify
+and close, consistent with that issue's own acceptance criteria.
+
+**Net: SC-001 is satisfied for the OpenClaw-dependency-elimination and
+script-execution-health portions this doc covers. It is not fully
+satisfied** — the `check_approval` callback race (#29) and the
+`check_email` manual-command question (#25) are both real, open gaps against
+SC-001's full "no admin-visible behavior change" bar, and neither is
+resolved by anything in this PR.

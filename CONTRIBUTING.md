@@ -256,7 +256,7 @@ does it look right" without ever printing the value itself:
 
 ```bash
 grep -c '^TELEGRAM_BOT_TOKEN=' .env                       # is the key present?
-awk -F= '/^TELEGRAM_BOT_TOKEN=/{print length($2)}' .env   # how long is the value?
+awk '/^TELEGRAM_BOT_TOKEN=/{sub(/^[^=]*=/,""); print length}' .env   # how long is the value?
 ```
 
 Filed and closed as issue #27, after a sub-agent's raw byte-dump of a live

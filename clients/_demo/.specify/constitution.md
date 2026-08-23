@@ -4,10 +4,10 @@
 
 This constitution governs the Demo Client reference implementation. All values marked `[DEMO]` are placeholders — replace with real values when onboarding an actual client.
 
-**Last Updated:** 2026-05-05
+**Last Updated:** 2026-05-05 (AI Provider section amended 2026-08-23 — see PR #28)
 **Status:** Reference / Active
 **Deployment Model:** Mac Mini (on-premise, transferred to client after completion)
-**AI Provider:** OpenClaw (self-hosted, open-source)
+**AI Provider:** Hermes Agent (self-hosted runtime; Anthropic-backed per current model routing)
 **Development Approach:** Phased implementation
 
 ---
@@ -23,7 +23,7 @@ This constitution governs the Demo Client reference implementation. All values m
 - Client owns hardware and can maintain independently
 
 **Implications:**
-- Self-contained system — no cloud dependencies for AI inference
+- AI inference now routes to Anthropic's API via Hermes Agent — no longer self-contained for AI inference specifically; other data remains local
 - All data stored locally on Mac Mini
 - Client has full control and ownership
 - No recurring hosting costs
@@ -53,9 +53,10 @@ This constitution governs the Demo Client reference implementation. All values m
 - **Alert Threshold:** 75% of daily budget consumed
 - **Enforcement:** System automatically pauses AI operations when daily limit reached
 
-**OpenClaw Cost Model:**
-- Self-hosted on Mac Mini (one-time hardware cost, no per-API-call fees)
-- External API costs only for services that can't be self-hosted
+**Hermes Cost Model:**
+- Self-hosted Hermes Agent supervisor process (one-time hardware cost)
+- Per-token Anthropic API costs (see Gate 3 / Budget Constraints above)
+- External API costs only for other services that can't be self-hosted
 
 **Priority During Budget Constraints:**
 1. Email monitoring (must always run)
@@ -127,8 +128,8 @@ This constitution governs the Demo Client reference implementation. All values m
 - Dedicated Gmail account for agent email (`agent@[DEMO].com`)
 - macOS for deployment
 
-### OpenClaw Integration
-- Self-hosted LLM deployment on Mac Mini
+### Hermes Integration
+- Self-hosted Hermes Agent runtime on Mac Mini; model calls route to Anthropic's API
 - Model selection based on task complexity
 - Token usage monitoring for cost tracking
 
@@ -181,4 +182,4 @@ When conflicts arise, resolve in this order:
 *Authority: Demo Client (reference implementation)*
 *Framework: FieldKit*
 *Deployment: Mac Mini (on-premise)*
-*AI Provider: OpenClaw (self-hosted)*
+*AI Provider: Hermes Agent (Anthropic-backed)*

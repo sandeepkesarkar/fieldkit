@@ -81,7 +81,7 @@ sequenceDiagram
 
 [How does this connect to existing infrastructure?]
 
-**Output:** Integration tests + updated cron/OpenClaw config
+**Output:** Integration tests + updated cron/Hermes config
 
 ---
 
