@@ -7,7 +7,7 @@ This constitution establishes the governing principles, values, and constraints 
 **Last Updated:** [Date]
 **Status:** Draft
 **Deployment Model:** Mac Mini (on-premise, transferred to client after completion)
-**AI Provider:** OpenClaw (self-hosted, open-source)
+**AI Provider:** [Model provider — Hermes Agent runtime, Anthropic (default) or OpenAI (per-client choice); see the FieldKit framework constitution]
 **Development Approach:** Phased implementation
 
 ---
@@ -23,7 +23,7 @@ This constitution establishes the governing principles, values, and constraints 
 - [Client Name] owns hardware and can maintain independently
 
 **Implications:**
-- Self-contained system — no cloud dependencies for AI inference
+- AI inference now routes to a cloud model provider (Anthropic or OpenAI) via Hermes Agent — no longer self-contained for AI inference specifically; other data remains local
 - All data stored locally on Mac Mini
 - Client has full control and ownership
 - No recurring hosting costs
@@ -61,10 +61,10 @@ This constitution establishes the governing principles, values, and constraints 
 - **Alert Threshold:** [X]% of daily budget consumed (recommended: 75%)
 - **Enforcement:** System automatically pauses AI operations when daily limit reached
 
-**OpenClaw Cost Model:**
-- Self-hosted on Mac Mini (one-time hardware cost, no per-API-call fees)
-- Electricity costs (minimal for Mac Mini)
-- External API costs only for services that can't be self-hosted (e.g. computer vision, social APIs)
+**Hermes Cost Model:**
+- Self-hosted Hermes Agent supervisor process (one-time hardware cost)
+- Per-token API costs to the chosen model provider (Anthropic or OpenAI)
+- External API costs for other services that can't be self-hosted (e.g. computer vision, social APIs)
 
 **Priority During Budget Constraints:**
 1. [Highest priority feature — e.g. email monitoring]
@@ -152,8 +152,8 @@ This constitution establishes the governing principles, values, and constraints 
 - Gmail account for email workflows
 - macOS for deployment
 
-### OpenClaw Integration
-- Self-hosted LLM deployment on Mac Mini
+### Hermes Integration
+- Self-hosted Hermes Agent runtime on Mac Mini; model calls route to the chosen cloud provider (Anthropic or OpenAI)
 - Model selection based on task complexity
 - Token usage monitoring for cost tracking
 
@@ -219,4 +219,4 @@ By implementing this system, all stakeholders agree to:
 *Authority: [Client Name] Business Owner*
 *Framework: FieldKit*
 *Deployment: Mac Mini (on-premise)*
-*AI Provider: OpenClaw (self-hosted)*
+*AI Provider: [Hermes Agent — Anthropic or OpenAI per client]*

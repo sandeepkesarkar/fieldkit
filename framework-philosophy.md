@@ -76,11 +76,11 @@ FieldKit exists to democratize sophisticated business automation for small servi
 
 ### 8. Self-Hosted by Default
 
-**The client's data lives on the client's hardware.** FieldKit is designed to run on a dedicated Mac Mini at the client's location, powered by OpenClaw.
+**The client's data lives on the client's hardware.** FieldKit is designed to run on a dedicated Mac Mini at the client's location, running the Hermes Agent runtime.
 
-- No cloud dependency for AI inference
-- Predictable cost structure (no per-API-call fees)
-- Data never leaves the client's premises
+- AI inference now routes to a cloud model provider (Anthropic or OpenAI) via Hermes — no longer local-only; see `platform/.specify/003-hermes-runtime/spec.md` for the Mac Mini → Cloud pivot
+- Budget-governed cost structure (Gate 3) — now includes per-token API costs to the chosen model provider, not just hardware
+- Data never leaves the client's premises except for model calls to the chosen provider
 - Hardware transfers to client on project completion
 - Full independence from framework after handoff
 
