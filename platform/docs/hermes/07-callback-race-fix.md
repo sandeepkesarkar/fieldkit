@@ -28,10 +28,12 @@ Re-verified directly against this machine's installed Hermes source
 (`~/.hermes/hermes-agent`), not just against the issue's description:
 
 1. **Hermes-side recognition of `approve`/`reject` (issue's option b).**
-   `_handle_callback_query` matches a hardcoded, closed prefix set (`mp:`,
-   `cp:`, `gt:`, `ea:`, `sc:`, `cl:`, `update_prompt:`). Making it recognize
-   FieldKit's bare `"approve"`/`"reject"` payloads means editing that
-   function in an installed dependency, not a fieldkit-owned file.
+   `_handle_callback_query` matches a hardcoded, closed prefix set — read out
+   in full from the installed source rather than sampled: `mp:`, `mpg:`,
+   `mpv:`, `mm:`, `mc:`, `mb`, `mx`, `mg:`, `cp:`, `gt:`, `ea:`, `sc:`, `cl:`,
+   `update_prompt:`. None of them match FieldKit's bare `"approve"`/`"reject"`
+   payloads. Making the handler recognize them means editing that function in
+   an installed dependency, not a fieldkit-owned file.
 2. **Moving button-callback handling into a Hermes skill (issue's option c).**
    Hermes skills are Markdown files dispatched off slash commands / free-text
    matching (`agent/skill_commands.py::scan_skill_commands()`); there is no
@@ -45,12 +47,24 @@ Re-verified directly against this machine's installed Hermes source
    confirm this is structural, not a configuration gap — same conclusion
    FR-002a already reached, re-verified here rather than assumed.
 3. **A fourth option, not in the original issue text: filter Hermes's own
-   `getUpdates` to exclude `callback_query`, leaving the cron leg as sole
-   consumer of that update type.** Checked `plugins/platforms/telegram/adapter.py`
-   directly: `allowed_updates=Update.ALL_TYPES` is hardcoded at both call
-   sites (`_start_polling_once`, and the parallel path further down the
-   file) — not exposed via `config.yaml` or `plugin.yaml`. Same conclusion as
-   (1) and (2): requires patching Hermes's installed adapter code.
+   `getUpdates` to exclude `callback_query`.** Checked
+   `plugins/platforms/telegram/adapter.py` directly: `allowed_updates=Update.ALL_TYPES`
+   is hardcoded at both call sites (`_start_polling_once`, and the parallel
+   path further down the file) — not exposed via `config.yaml` or
+   `plugin.yaml`, so this alone already requires patching Hermes's installed
+   adapter code, same conclusion as (1) and (2). But even setting that aside,
+   filtering would not actually have made the cron leg "the safe sole
+   consumer" of `callback_query`, because Telegram's `getUpdates` offset is a
+   single monotonic counter **per bot token**, not per update type and not
+   per polling client — there is no way for two independent consumers of one
+   bot's update stream to hold separate offsets. If Hermes's own `getUpdates`
+   call later advanced past a *filtered-out* callback's `update_id` (which it
+   would, the moment any later, allowed-type update arrived and Hermes
+   confirmed receipt up to that higher offset), Telegram would drop the
+   earlier callback from the stream permanently — for every consumer of that
+   token, cron leg included. Filtering by update type changes *which* updates
+   Hermes acts on; it does not give the cron leg an independent offset. The
+   race would just become collateral instead of direct.
 4. **A second, dedicated bot token for the button-callback surface (issue's
    option a).** Fully achievable inside fieldkit's own repo/config — no
    Hermes patch, no dependency on Hermes's internals at all. Cost: the
@@ -103,6 +117,18 @@ from Hermes's `TELEGRAM_BOT_TOKEN`:
   `clients/_construction_co/src/photo-agent/` to document the new required
   variable and why it must be a *different* bot registration from
   `TELEGRAM_BOT_TOKEN`.
+- **Equal-token guard (`tools/telegram_api.py::_token()`).** The token split
+  only closes the race if the two env vars actually hold different values.
+  An operator who copies `TELEGRAM_BOT_TOKEN`'s value into
+  `TELEGRAM_APPROVAL_BOT_TOKEN` (e.g. while filling in `.env` quickly) would
+  otherwise run without any error while silently recreating the exact
+  shared-offset race this whole fix exists to eliminate — nothing about a
+  same-value token would look wrong until a real button tap failed to be
+  processed. `_token()` now raises immediately, before any HTTP call, if a
+  non-default `token_env_var` resolves to the same value as
+  `TELEGRAM_BOT_TOKEN`. Covered by `test_telegram_api.py`'s
+  `test_approval_token_equal_to_primary_token_raises` and its
+  before-any-request variant.
 
 Why this actually closes the race: Hermes's `getUpdates` long-poll and
 `check_approval.py`'s `getUpdates` poll now run against two different bot

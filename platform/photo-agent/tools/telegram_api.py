@@ -30,10 +30,26 @@ logger = logging.getLogger(__name__)
 
 
 def _token(token_env_var: str = "TELEGRAM_BOT_TOKEN") -> str:
-    """Return the bot token from the environment. Raises RuntimeError if unset."""
+    """Return the bot token from the environment. Raises RuntimeError if unset.
+
+    Also raises RuntimeError if a non-default token_env_var (e.g.
+    TELEGRAM_APPROVAL_BOT_TOKEN) resolves to the same value as
+    TELEGRAM_BOT_TOKEN. Issue #29's fix depends on the two bot roles never
+    sharing a token — an operator copying the same value into both env vars
+    would otherwise run without error while silently recreating the exact
+    shared-offset getUpdates race the token split exists to eliminate.
+    """
     token = os.environ.get(token_env_var, "")
     if not token:
         raise RuntimeError(f"{token_env_var} is not set")
+    if token_env_var != "TELEGRAM_BOT_TOKEN":
+        primary = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if primary and token == primary:
+            raise RuntimeError(
+                f"{token_env_var} must not be set to the same value as TELEGRAM_BOT_TOKEN "
+                "— they must be two different bot registrations, or Hermes's gateway and "
+                "this poll will share a getUpdates offset again (issue #29)"
+            )
     return token
 
 

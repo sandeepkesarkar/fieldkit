@@ -402,6 +402,34 @@ def test_custom_token_env_var_redacts_correct_token(monkeypatch):
     assert "approval_secret_xyz" not in str(exc_info.value)
 
 
+def test_approval_token_equal_to_primary_token_raises(monkeypatch):
+    """TELEGRAM_APPROVAL_BOT_TOKEN set to the SAME value as TELEGRAM_BOT_TOKEN raises
+    immediately, before any HTTP call — an operator copying the same token into both
+    env vars would otherwise run without error while silently recreating the exact
+    shared-offset getUpdates race issue #29 exists to eliminate."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "same_token_both")
+    monkeypatch.setenv(_APPROVAL_TOKEN_ENV, "same_token_both")
+    with pytest.raises(RuntimeError, match=_APPROVAL_TOKEN_ENV):
+        get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)
+
+
+def test_approval_token_equal_to_primary_token_raises_before_any_request(monkeypatch):
+    """The equal-tokens check fires before the HTTP layer is touched at all."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "same_token_both")
+    monkeypatch.setenv(_APPROVAL_TOKEN_ENV, "same_token_both")
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        with pytest.raises(RuntimeError):
+            get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)
+    mock_get.assert_not_called()
+
+
+def test_distinct_tokens_do_not_raise(approval_bot_token):
+    """Sanity check: genuinely distinct tokens never trip the equality guard."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _ok_response([])
+        get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)  # must not raise
+
+
 def test_malformed_non_dict_response_raises_runtime_error():
     """A response body that is valid JSON but not an object (e.g. Telegram returning
     null or a bare list) raises RuntimeError, not an unhandled AttributeError from

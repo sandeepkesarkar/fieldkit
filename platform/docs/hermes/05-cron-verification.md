@@ -327,10 +327,10 @@ them):
    *introduced* by this migration, but the literal criterion ("no runtime
    dependency on OpenClaw") is not satisfied by the current state of the
    code, and shouldn't be marked as passed.
-4. **`check_approval.py`'s button-callback role, under SC-001.** ✅ **Fixed
-   (issue #29), see [`07-callback-race-fix.md`](07-callback-race-fix.md).**
-   At the time this revision was written, there was a known, previously-
-   confirmed (not probabilistic — deterministic given
+4. **`check_approval.py`'s button-callback role, under SC-001.** ⚠️ **Fix
+   implemented in code (issue #29); pending live verification, see
+   [`07-callback-race-fix.md`](07-callback-race-fix.md).** There is a known,
+   previously-confirmed (not probabilistic — deterministic given
    `python-telegram-bot`'s `Updater._start_polling` behavior)
    offset-consumption race: Hermes's continuous `getUpdates` long-poll on
    the shared bot token would consume and advance past a real button-tap
@@ -341,8 +341,15 @@ them):
    explicitly out of scope for #13/#14 (both closed without touching it;
    tracked forward as #29) and is **not** fixed by OpenClaw's removal (see
    `06-openclaw-removal.md`'s SC-001 section) — only by giving the
-   button-callback surface its own dedicated bot token, done in #29. Full
-   source-level detail: [`04-check-approval-skill.md`](04-check-approval-skill.md)
+   button-callback surface its own dedicated bot token, implemented in #29's
+   PR. **Not yet marked resolved:** the second bot has not yet been
+   registered via BotFather, the live `.env` on the Mac Mini has not been
+   updated with `TELEGRAM_APPROVAL_BOT_TOKEN`, and no human has confirmed a
+   real button tap while both Hermes and the cron leg are running
+   simultaneously — `07-callback-race-fix.md`'s "Setup step" and
+   "Verification" sections spell out exactly what's still outstanding. This
+   item should be updated to ✅ only after that live check actually happens.
+   Full source-level detail: [`04-check-approval-skill.md`](04-check-approval-skill.md)
    ("Known follow-up risk"), `spec.md` FR-002a, and `07-callback-race-fix.md`
    for the fix itself, the options considered, and what's automatically
    tested vs. what still needs a live human tap to confirm.
