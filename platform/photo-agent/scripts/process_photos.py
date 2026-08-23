@@ -247,7 +247,11 @@ def main(argv=None) -> None:
 
         activity_log.log_uploaded(project_name, drive_video_file_id)
 
-        # Send approval message with inline keyboard
+        # Send approval message with inline keyboard. Sent via the dedicated
+        # approval bot token (issue #29) — check_approval.py's cron leg polls
+        # getUpdates for the tap on this same token, kept separate from
+        # Hermes's own TELEGRAM_BOT_TOKEN long-poll so the two never race for
+        # the same offset.
         folder_link_url = drive.folder_link(folder_id)
         try:
             msg_id = telegram_api.send_message_with_buttons(
@@ -255,6 +259,7 @@ def main(argv=None) -> None:
                 _approval_text(project_name, n, duration_sec, folder_link_url),
                 [("✅ Approve", "approve"), ("❌ Reject", "reject")],
                 parse_mode="Markdown",
+                token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN",
             )
         except RuntimeError as exc:
             _telegram_error(f"❌ {project_name}: failed to send approval message — {exc}")

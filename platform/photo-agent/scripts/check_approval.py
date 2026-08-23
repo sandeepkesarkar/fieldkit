@@ -13,6 +13,20 @@ Direct path: invoked by Hermes's /check_approval skill with --callback-data
 approve, getUpdates is bypassed entirely (see platform/photo-agent/skills/
 check-approval/SKILL.md — Hermes cannot dispatch off the raw button tap itself,
 so this path only ever fires from the manual /check_approval command).
+
+Bot-token split (issue #29): the entire button-callback surface — sending the
+approval message with its inline keyboard (process_photos.py), polling
+getUpdates for the tap, answering the callback query, and editing the message
+to remove the buttons — runs on TELEGRAM_APPROVAL_BOT_TOKEN, a bot token
+dedicated to this cron leg and never shared with Hermes's gateway. Hermes's
+own continuous getUpdates long-poll runs on TELEGRAM_BOT_TOKEN. Both tokens
+poll independently against Telegram's own servers, so there is no shared
+per-token offset for Hermes to advance past a real button tap before this
+cron leg's once-a-minute run sees it — the two bots simply never compete for
+the same update stream. Plain-text admin notifications (_notify_admin) also
+use the approval bot token so the whole approve/reject interaction — button,
+tap acknowledgement, and outcome message — stays in one Telegram
+conversation, separate from Hermes's own bot conversation.
 """
 
 import argparse
@@ -46,6 +60,10 @@ from tools import telegram_api
 _log = logging.getLogger(__name__)
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 _REPO_ROOT = Path(__file__).parents[3]
+
+# Dedicated bot token for the entire button-callback surface (issue #29) —
+# never the same token as Hermes's TELEGRAM_BOT_TOKEN gateway poll.
+_APPROVAL_TOKEN_ENV = "TELEGRAM_APPROVAL_BOT_TOKEN"
 
 
 def _try_acquire_check_lock() -> "IO | None":
@@ -83,7 +101,7 @@ def _notify_admin(message: str) -> None:
         _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot send admin notification")
         return
     try:
-        telegram_api.send_message(chat_id, message)
+        telegram_api.send_message(chat_id, message, token_env_var=_APPROVAL_TOKEN_ENV)
     except Exception as exc:
         _log.warning("failed to send admin notification: %s", exc)
 
@@ -207,7 +225,9 @@ def _acknowledge_tap(
     """
     if callback_query_id:
         try:
-            telegram_api.answer_callback_query(callback_query_id, text=_tap_toast(callback_data))
+            telegram_api.answer_callback_query(
+                callback_query_id, text=_tap_toast(callback_data), token_env_var=_APPROVAL_TOKEN_ENV
+            )
         except RuntimeError as exc:
             _log.warning("answer_callback_query failed (non-fatal): %s", exc)
     _remove_buttons(chat_id, message_id)
@@ -219,7 +239,7 @@ def _remove_buttons(chat_id: str, message_id: int) -> None:
         _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot remove approval buttons")
         return
     try:
-        telegram_api.edit_message_reply_markup(chat_id, message_id)
+        telegram_api.edit_message_reply_markup(chat_id, message_id, token_env_var=_APPROVAL_TOKEN_ENV)
     except RuntimeError as exc:
         _log.warning("edit_message_reply_markup failed (non-fatal): %s", exc)
 
@@ -330,7 +350,7 @@ def _run(args) -> None:
         offset = state.get_telegram_offset()
 
         try:
-            updates = telegram_api.get_updates(offset)
+            updates = telegram_api.get_updates(offset, token_env_var=_APPROVAL_TOKEN_ENV)
         except RuntimeError as exc:
             _log.error("get_updates failed — retrying on next run: %s", exc)
             return
@@ -356,7 +376,9 @@ def _run(args) -> None:
         # (leave state intact so the admin can re-tap the next approval message).
         try:
             _toast = _tap_toast(callback_data)
-            telegram_api.answer_callback_query(callback_query_id, text=_toast)
+            telegram_api.answer_callback_query(
+                callback_query_id, text=_toast, token_env_var=_APPROVAL_TOKEN_ENV
+            )
         except RuntimeError as exc:
             _log.error("answer_callback_query failed: %s", exc)
             state.set_telegram_offset(new_offset)

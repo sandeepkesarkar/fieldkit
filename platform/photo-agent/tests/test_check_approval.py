@@ -46,6 +46,7 @@ def env(monkeypatch):
     monkeypatch.setenv("AGENT_EMAIL", "agent@example.com")
     monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
+    monkeypatch.setenv("TELEGRAM_APPROVAL_BOT_TOKEN", "test_approval_token")
     monkeypatch.setenv("ADMIN_TELEGRAM_CHAT_ID", _CHAT_ID)
     # Defense in depth against a live FB_PAGE_ID leaking in from the ambient
     # environment (e.g. a real client .env already loaded in-process): force
@@ -600,10 +601,13 @@ def test_direct_path_does_not_call_get_updates(base):
 
 
 def test_direct_path_approve_calls_answer_callback_query(base):
-    """Direct approve path calls answer_callback_query with the provided ID and toast text."""
+    """Direct approve path calls answer_callback_query with the provided ID, toast text,
+    and the dedicated approval-bot token_env_var (issue #29)."""
     import scripts.check_approval as ca
     main(_DIRECT_ARGS)
-    ca.telegram_api.answer_callback_query.assert_called_once_with("cq_direct", text="✅ Approving...")
+    ca.telegram_api.answer_callback_query.assert_called_once_with(
+        "cq_direct", text="✅ Approving...", token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
+    )
 
 
 def test_direct_path_approve_sends_email(base):
@@ -818,7 +822,7 @@ def test_cron_approve_removes_buttons(base):
     ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
     main([])
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -828,7 +832,7 @@ def test_cron_reject_removes_buttons(base):
     ca.telegram_api.get_updates.return_value = [_REJECT_UPDATE]
     main([])
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -837,7 +841,7 @@ def test_direct_approve_removes_buttons(base):
     import scripts.check_approval as ca
     main(_DIRECT_ARGS)
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -846,7 +850,7 @@ def test_direct_reject_removes_buttons(base):
     import scripts.check_approval as ca
     main(_DIRECT_REJECT_ARGS)
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -855,7 +859,7 @@ def test_data_only_approve_removes_buttons(base):
     import scripts.check_approval as ca
     main(_DATA_ONLY_APPROVE)
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -864,7 +868,7 @@ def test_data_only_reject_removes_buttons(base):
     import scripts.check_approval as ca
     main(_DATA_ONLY_REJECT)
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -883,7 +887,32 @@ def test_direct_answer_failure_still_removes_buttons(base):
     ca.telegram_api.answer_callback_query.side_effect = RuntimeError("timeout")
     main(_DIRECT_ARGS)
     ca.telegram_api.edit_message_reply_markup.assert_called_once_with(
-        _CHAT_ID, _PENDING["telegram_message_id"]
+        _CHAT_ID, _PENDING["telegram_message_id"], token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dedicated approval-bot token isolation (issue #29) — the getUpdates offset
+# race fix. These assert the cron leg's Telegram calls never fall back to
+# Hermes's TELEGRAM_BOT_TOKEN, which is the entire point of the fix: the two
+# pollers must never share a token/offset.
+# ---------------------------------------------------------------------------
+
+def test_cron_get_updates_uses_approval_token(base):
+    """The cron leg's getUpdates call uses TELEGRAM_APPROVAL_BOT_TOKEN, not Hermes's token."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = []
+    main([])
+    ca.telegram_api.get_updates.assert_called_once_with(50, token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN")
+
+
+def test_cron_answer_callback_query_uses_approval_token(base):
+    """The cron leg's answer_callback_query call uses TELEGRAM_APPROVAL_BOT_TOKEN."""
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    main([])
+    ca.telegram_api.answer_callback_query.assert_called_once_with(
+        "cq_approve", text="✅ Approving...", token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
 
 
@@ -1028,11 +1057,14 @@ def test_approve_enqueue_failure_does_not_abort_approve_flow(base_fb):
 # never a real HTTP call — so no test here can reach live Telegram.
 
 def test_notify_admin_sends_via_telegram_api(env, mocker):
-    """_notify_admin() calls telegram_api.send_message with the configured chat_id and message."""
+    """_notify_admin() calls telegram_api.send_message with the configured chat_id, message,
+    and the dedicated approval-bot token_env_var (issue #29) — not Hermes's TELEGRAM_BOT_TOKEN."""
     import scripts.check_approval as ca
     mock_send = mocker.patch("scripts.check_approval.telegram_api.send_message")
     ca._notify_admin("hello admin")
-    mock_send.assert_called_once_with(_CHAT_ID, "hello admin")
+    mock_send.assert_called_once_with(
+        _CHAT_ID, "hello admin", token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
+    )
 
 
 def test_notify_admin_swallows_telegram_failure(env, mocker):
@@ -1055,21 +1087,26 @@ def test_notify_admin_no_chat_id_skips_send(monkeypatch, mocker):
 
 
 def test_notify_admin_does_not_leak_token_on_network_failure(env, mocker, caplog):
-    """The bot token must not appear in _notify_admin's warning log on a connection
-    failure. requests exceptions embed the request URL (including /bot<TOKEN>/...)
-    in their string representation — telegram_api.send_message must redact it
-    before _notify_admin logs the exception verbatim."""
+    """The approval bot token must not appear in _notify_admin's warning log on a
+    connection failure. requests exceptions embed the request URL (including
+    /bot<TOKEN>/...) in their string representation — telegram_api.send_message
+    must redact it before _notify_admin logs the exception verbatim.
+
+    _notify_admin uses TELEGRAM_APPROVAL_BOT_TOKEN (issue #29), not
+    TELEGRAM_BOT_TOKEN, so the simulated failure URL embeds the approval token —
+    matching what a real failed request through _notify_admin would contain.
+    """
     import requests
     import scripts.check_approval as ca
     mocker.patch(
         "scripts.check_approval.telegram_api.requests.post",
         side_effect=requests.exceptions.ConnectionError(
-            "Max retries exceeded with url: /bottest_token/sendMessage"
+            "Max retries exceeded with url: /bottest_approval_token/sendMessage"
         ),
     )
     with caplog.at_level("WARNING"):
         ca._notify_admin("hello admin")  # must not raise
-    assert "test_token" not in caplog.text
+    assert "test_approval_token" not in caplog.text
 
 
 def test_notify_admin_swallows_non_runtime_error(env, mocker):

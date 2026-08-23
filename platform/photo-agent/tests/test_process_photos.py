@@ -29,6 +29,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("ADMIN_TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root_folder_id")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
+    monkeypatch.setenv("TELEGRAM_APPROVAL_BOT_TOKEN", "test_approval_token")
     monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path))
     return tmp_path
 
@@ -432,6 +433,16 @@ def test_happy_path_approval_message_uses_markdown_parse_mode(happy, env):
     assert kwargs.get("parse_mode") == "Markdown"
 
 
+def test_happy_path_approval_message_uses_approval_bot_token(happy, env):
+    """send_message_with_buttons() uses TELEGRAM_APPROVAL_BOT_TOKEN (issue #29), not
+    Hermes's TELEGRAM_BOT_TOKEN — the button-bearing message must be sent by the same
+    bot that check_approval.py's cron leg will later poll for the tap."""
+    import scripts.process_photos as proc
+    main(["--project", _PROJECT])
+    kwargs = proc.telegram_api.send_message_with_buttons.call_args.kwargs
+    assert kwargs.get("token_env_var") == "TELEGRAM_APPROVAL_BOT_TOKEN"
+
+
 def test_happy_path_temp_dir_cleared_before_run(happy, env):
     """Stale project temp directory is removed and recreated at the start of each run."""
     project_tmp = env / _PROJECT
@@ -474,7 +485,13 @@ def test_happy_path_scrub_is_called(happy, env):
 # always mocked — never a real HTTP call — so no test here can reach live Telegram.
 
 def test_telegram_error_sends_via_telegram_api_and_exits(env, mocker):
-    """_telegram_error() calls telegram_api.send_message with chat_id + message, then exits 1."""
+    """_telegram_error() calls telegram_api.send_message with chat_id + message, then exits 1.
+
+    Deliberately stays on the default token (Hermes's TELEGRAM_BOT_TOKEN, not the
+    approval bot from issue #29) — pipeline-failure notifications aren't part of the
+    button-callback race and relaying them through Hermes's usual bot keeps error
+    visibility consistent with every other Hermes-relayed message.
+    """
     import scripts.process_photos as proc
     mock_send = mocker.patch("scripts.process_photos.telegram_api.send_message")
     with pytest.raises(SystemExit) as exc_info:
