@@ -21,6 +21,7 @@ env/
 
 # Environment — copy from .env.example, never commit the real thing
 .env
+.env.bak
 !.env.example
 
 # Omnigent per-session Codex home (auth.json copy, sqlite state) — created

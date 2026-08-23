@@ -213,6 +213,13 @@ Filed and closed as **issue #27**, remediated:
 
 Full incident record and the closing remediation comment: issue #27.
 
+One more gap found while writing this doc: the `.env` edits in §4's
+remediation left a `platform/email-agent/.env.bak` backup file sitting
+untracked in the working tree, and `.gitignore` didn't cover `.env.bak` —
+only `.env` itself. That's the same class of exposure this incident was
+about, just via `git add -A` instead of a transcript. Added `.env.bak` to
+`.gitignore` in this PR to close that gap.
+
 ## 6. Debugging-hygiene note added
 
 Issue #27's remaining acceptance item — a durable note instructing agents
