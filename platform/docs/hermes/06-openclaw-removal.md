@@ -21,15 +21,24 @@ record of what was already done and verified, not a new verification pass.
 1. OpenClaw's `launchd` gateway is stopped, durably disabled, and fully
    uninstalled from the Mac Mini — binary, global npm package, and config
    directory all gone, confirmed via follow-up checks.
-2. A repo-wide grep for `openclaw` references, re-run fresh for this doc,
-   confirms the only remaining hits are the two already-tracked,
-   deliberately out-of-scope items (#25, #26) plus expected historical
-   `.specify/` spec-kit records — nothing live or active.
+2. A repo-wide grep for `openclaw` references, re-run and individually
+   classified fresh for this doc, sorted every hit into four categories:
+   five active docs that needed real content fixes (fixed in this PR — see
+   §2), one orphaned unreferenced duplicate left as-is with justification
+   (root `constitution.md`), two already-tracked items deliberately left
+   out of this PR's scope (#25, #26), and the remaining historical
+   `.specify/` spec-kit records and dated docs. Nothing live/active and
+   undiscovered remains — see §2's "Acceptance criterion 3" note below for
+   what that criterion is and isn't claiming.
 3. A latent crontab regression in `check_email.py`'s entry (bare `python3`,
    same class of bug #22/#23 already fixed in the other two scripts' entries)
    was found and fixed during this same session.
-4. A `TELEGRAM_BOT_TOKEN` propagation gap from PR #24 was found, root-caused
-   as a one-cron-cycle timing issue rather than a code bug, and fixed.
+4. A `TELEGRAM_BOT_TOKEN` propagation gap from PR #24 was found and fixed.
+   Two distinct causes, not one: primarily, the real value was never
+   backfilled into the live `.env` after #24 added the key to
+   `.env.example` (this explains the warning repeating across every tick);
+   secondarily, a one-cron-cycle-old read explains the single further
+   warning logged immediately after the value was added. See §4.
 5. A security incident during that investigation — a sub-agent briefly
    printed the live Telegram bot token into its own session transcript via a
    raw byte-dump of `.env` — was caught immediately, remediated (token
@@ -139,11 +148,15 @@ model-routing pivot (Anthropic default / OpenAI per-client, from #6/FR-004):
   (AI Provider header, cost model, integration section, footer), not
   covered by any existing issue. Fixed directly in this PR (admin decision,
   since it mirrors #9's already-approved pattern) — scope limited to the
-  AI-provider/cloud-inference claims; the separate Mac-Mini
-  hardware-transfer/ownership content in this file was deliberately left
-  untouched, since that's the larger, still-undecided cloud-pivot ownership
-  question W3 is meant to resolve, not something this PR should
-  unilaterally settle.
+  AI-provider/cloud-inference claims, plus one small follow-on: its two
+  "all data stored locally on Mac Mini" bullets directly tied to the
+  AI-inference Implications/Gate-1-equivalent sections got the same
+  not-yet-re-confirmed-post-pivot caveat already used in the framework
+  constitution's Gate 1 fix (reused wording, not new judgment). The
+  separate Hardware Transfer Plan section and Data Storage/backup-ownership
+  content in this file were deliberately left untouched — that's the
+  larger, still-undecided cloud-pivot ownership question W3 is meant to
+  resolve, not something this PR should unilaterally settle.
 - `framework-philosophy.md` — root-level, unlinked from `README.md` but not
   historical/dated. Its "Self-Hosted by Default" principle claimed "powered
   by OpenClaw" and "no cloud dependency for AI inference." Fixed directly,
@@ -200,10 +213,26 @@ current claim:
   reference to issue #27's incident, in the debugging-hygiene note — a
   historical citation, not a current-runtime claim).
 
-No remaining hit represents a live, reachable OpenClaw dependency or an
-active doc still asserting OpenClaw is the current runtime. Acceptance
-criterion 3 of #14 ("Repo-wide grep confirms no remaining reference to
-OpenClaw in active code/config") is met.
+**Acceptance criterion 3 of #14, interpreted explicitly, not left implicit.**
+Criterion 3 literally reads "Repo-wide grep confirms no remaining reference
+to OpenClaw in active code/config." Taken completely literally, that's not
+true today: `platform/email-agent/SETUP.md`/`SKILL.md` (#25) and the three
+READMEs (#26) are still active references to OpenClaw as if it were current
+— deliberately deferred, not fixed, exactly as this same investigation
+already treated them when #13 closed (see that issue's acceptance criteria,
+which carry the identical "historical docs/specs may still mention it for
+context — that's fine and expected" carve-out this doc has been applying
+throughout §2). The claim this PR actually makes is narrower and is the one
+that matters for #14's real intent: **no new or previously-undiscovered
+active OpenClaw reference remains unfiled and untracked.** Every active hit
+this fresh grep found is already filed as #25 or #26, both open, both
+deliberately left out of this PR's scope — pulling either into this PR
+would turn a docs-only OpenClaw-removal closeout into a much larger,
+unrelated docs-migration PR (rewriting `email-agent`'s Hermes skill surface
+for #25, or the READMEs across three files for #26). Under that reading,
+criterion 3 is met: the grep surfaced nothing new, and everything it did
+surface already has an owner and a tracking issue. Under the fully literal
+reading, it is not yet met, and won't be until #25 and #26 close.
 
 ## 3. Crontab regression — `check_email.py` had the same bare-`python3` bug
 

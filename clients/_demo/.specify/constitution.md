@@ -23,8 +23,8 @@ This constitution governs the Demo Client reference implementation. All values m
 - Client owns hardware and can maintain independently
 
 **Implications:**
-- AI inference now routes to Anthropic's API via Hermes Agent — no longer self-contained for AI inference specifically; other data remains local
-- All data stored locally on Mac Mini
+- AI inference now routes to Anthropic's API via Hermes Agent — no longer self-contained for AI inference specifically
+- Non-AI data storage/ownership model is being redefined by the Mac Mini → Cloud pivot (see `platform/.specify/003-hermes-runtime/spec.md`) — "all data stored locally" is not yet re-confirmed post-pivot; replacement model not yet finalized
 - Client has full control and ownership
 - No recurring hosting costs
 - System continues running after FieldKit engagement ends
@@ -40,7 +40,7 @@ This constitution governs the Demo Client reference implementation. All values m
 **Implementation Requirements:**
 - [x] All metadata (GPS, timestamps, camera info) stripped from photos before posting
 - [x] Human verification required for all customer-facing content
-- [x] All customer data stored locally on Mac Mini (not cloud)
+- [x] All customer data stored locally on Mac Mini (not cloud) — pre-Mac-Mini-→-Cloud-pivot state; see note above, not yet re-confirmed post-pivot
 
 ---
 
