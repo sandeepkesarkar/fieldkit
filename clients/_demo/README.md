@@ -5,7 +5,7 @@
 **Location:** N/A
 **Status:** In Progress — Spec phase
 **Deployment:** Mac Mini (on-premise)
-**AI Provider:** OpenClaw (self-hosted)
+**AI Provider:** Hermes (self-hosted)
 
 ---
 

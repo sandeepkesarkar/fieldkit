@@ -24,7 +24,7 @@ FieldKit combines three things:
 
 **1. spec-kit** — a spec-driven development methodology. Requirements are fully specified before any code is written. Technology decisions come after specs are validated, not before.
 
-**2. OpenClaw** — a self-hosted, open-source AI agent runtime. Runs on a dedicated Mac Mini at the client's location. No per-API-call cloud costs. No vendor lock-in.
+**2. Hermes** — a self-hosted, open-source AI agent runtime. Runs on a dedicated Mac Mini at the client's location. No per-API-call cloud costs. No vendor lock-in.
 
 **3. This framework** — the structure, patterns, governance docs, and client template that tie everything together.
 
@@ -42,7 +42,7 @@ graph LR
 
     subgraph Mac["Mac Mini — client location"]
         direction TB
-        OC[OpenClaw]
+        OC[Hermes]
         Cron[System Cron]
 
         subgraph Scripts["Python Scripts"]
@@ -80,7 +80,7 @@ All processing runs locally on the Mac Mini. Nothing leaves the client's hardwar
 
 Before using FieldKit, you need the infrastructure layer in place:
 
-→ **[mac-mini-dev-setup](https://github.com/sandeepkesarkar/mac-mini-dev-setup)** — step-by-step guide to configuring a Mac Mini as a dedicated AI development and deployment machine, including OpenClaw installation.
+→ **[mac-mini-dev-setup](https://github.com/sandeepkesarkar/mac-mini-dev-setup)** — step-by-step guide to configuring a Mac Mini as a dedicated AI development and deployment machine, including Hermes installation.
 
 ---
 
@@ -158,7 +158,7 @@ LinkedIn: [Sandeep Kesarkar](https://www.linkedin.com/in/sandeepkesarkar)
 
 ## Methodology
 
-FieldKit uses [spec-kit](https://github.com/github/spec-kit) for spec-driven development and [OpenClaw](https://github.com/openclaw/openclaw) as the self-hosted AI agent runtime.
+FieldKit uses [spec-kit](https://github.com/github/spec-kit) for spec-driven development and [Hermes](https://github.com/NousResearch/hermes-agent) as the self-hosted AI agent runtime.
 
 ---
 
@@ -168,4 +168,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-*Built in public · Powered by [OpenClaw](https://github.com/openclaw/openclaw) · Methodology: [spec-kit](https://github.com/github/spec-kit)*
+*Built in public · Powered by [Hermes](https://github.com/NousResearch/hermes-agent) · Methodology: [spec-kit](https://github.com/github/spec-kit)*
