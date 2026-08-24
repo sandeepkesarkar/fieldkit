@@ -71,6 +71,12 @@ def _get_access_token() -> str:
 
     Reads credentials from the user credentials file — no gws process is spawned.
     Raises RuntimeError on any failure.
+
+    Deliberately reused as the Gmail-send credential too: check_approval.py's
+    _send_approval_email() calls this directly rather than minting a separate
+    Gmail token. The underlying refresh token must therefore carry both the
+    drive and gmail.send scopes — see scripts/setup_drive_auth.py's _SCOPE
+    (issue #35). Do not assume this token is Drive-only.
     """
     creds = _load_credentials()
     try:

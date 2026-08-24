@@ -1,5 +1,5 @@
 """
-setup_drive_auth.py — One-time Google Drive OAuth2 setup.
+setup_drive_auth.py — One-time Google OAuth2 setup for Drive + Gmail-send.
 
 Reads client_id and client_secret from ~/.config/gws/client_secret.json,
 opens a browser-based OAuth2 consent flow, exchanges the auth code for a
@@ -12,6 +12,15 @@ Usage:
 Run this whenever the stored refresh token stops working (HTTP 400/401 from
 drive.py's _get_access_token). It bypasses `gws auth export`, which can export
 stale credentials even after a fresh `gws auth login`.
+
+Scope (issue #35): _SCOPE requests both drive and gmail.send. This credential
+is deliberately shared — check_approval.py's _send_approval_email() reuses
+drive.py's _get_access_token() as its Gmail-send credential rather than
+maintaining a second OAuth2 flow, so the token this script mints must satisfy
+both APIs. Do NOT narrow this back to drive-only; that reintroduces the
+Gmail-send HTTP 403 that issue #35 fixed. If drive-only and gmail-send ever
+need separate credentials, give _send_approval_email its own token source
+instead of shrinking this one.
 """
 
 import json
@@ -26,7 +35,9 @@ _CLIENT_SECRET_FILE = Path("~/.config/gws/client_secret.json").expanduser()
 _USER_CREDENTIALS_FILE = Path("~/.config/gws/user_credentials.json").expanduser()
 _AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
-_SCOPE = "https://www.googleapis.com/auth/drive"
+# Space-separated per OAuth2 convention. Shared Drive + Gmail-send credential
+# — see the module docstring's "Scope (issue #35)" note before changing this.
+_SCOPE = "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/gmail.send"
 _REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 
 
