@@ -11,8 +11,9 @@ Estimated time: 25–30 minutes.
 Telegram /check_email
        │
        ▼
-OpenClaw agent (LLM)
-       │  reads SKILL.md body from workspace-native path
+Hermes gateway (LLM)
+       │  discovers skills/check-email/SKILL.md via
+       │  skills.external_dirs (no copy step, no stale cache)
        │  runs exactly one bash command:
        ▼
 python3 scripts/check_email.py
@@ -23,15 +24,12 @@ python3 scripts/check_email.py
        └── sends Telegram acks via a direct Telegram Bot API call
 ```
 
-> **Known gap (as of Part 1 of #14):** the diagram above and Steps 8–9
-> below still describe OpenClaw's skill-dispatch mechanism (`~/.openclaw/workspace/skills/`,
-> `openclaw gateway restart`, `openclaw skills list`). Unlike `process-photos` (#7) and
-> `check-approval` (#8), `email-agent`'s manual `/check_email` skill was never ported to
-> Hermes's skill format — this file's `SKILL.md` frontmatter is still OpenClaw-shaped
-> (`metadata: {"openclaw": ...}`). `check_email.py`'s cron path and its Telegram
-> notifications no longer depend on the openclaw binary at the code level, but the manual
-> `/check_email` chat command is likely non-functional under Hermes until this skill is
-> ported the same way #7/#8 ported the photo-agent skills. Tracked as #25.
+> As of #25, the manual `/check_email` skill is a Hermes-native skill at
+> `platform/email-agent/skills/check-email/SKILL.md` — see
+> `platform/docs/hermes/08-check-email-skill.md` for the full port writeup.
+> `check_email.py`'s cron path and its Telegram notifications have not
+> depended on the openclaw binary since #24; this closes the last remaining
+> OpenClaw-shaped surface in email-agent.
 
 The script is deterministic — no LLM involvement beyond dispatching the single
 bash command. All configuration lives in `.env`. Logs go to `~/src/fieldkit/logs/`,
@@ -156,24 +154,29 @@ mkdir -p ~/src/fieldkit/data/email-agent ~/src/fieldkit/logs
 
 ## 8 — Install the skill
 
-The SKILL.md must be placed directly in the OpenClaw workspace — this is what causes
-the skill body to be injected into the agent session. The `extraDirs` config approach
-lists the skill but does not inject the body (OpenClaw issue #65946).
+Hermes discovers this skill directly from the fieldkit repo via
+`skills.external_dirs` in `~/.hermes/config.yaml` — no copy step, no stale
+cache. Add `platform/email-agent/skills` alongside the existing
+`platform/photo-agent/skills` entry (this is a **new** directory the config
+does not list yet, even if `process-photos`/`check-approval` are already
+installed):
 
-```bash
-mkdir -p ~/.openclaw/workspace/skills/check_email
-cp ~/src/fieldkit/platform/email-agent/SKILL.md \
-   ~/.openclaw/workspace/skills/check_email/SKILL.md
+```yaml
+skills:
+  external_dirs:
+    - ~/src/fieldkit/platform/photo-agent/skills
+    - ~/src/fieldkit/platform/email-agent/skills
 ```
 
-Restart the gateway to load the new skill:
+Restart the gateway to pick it up:
 
 ```bash
-openclaw gateway restart
+hermes gateway restart
 ```
 
-> **Important:** any time SKILL.md changes in the repo, re-run the `cp` command and
-> restart the gateway. The workspace copy is not auto-synced from the repo.
+> Any time `SKILL.md` changes in the repo, `hermes gateway restart` is
+> enough to pick it up — no copy step, unlike OpenClaw's old
+> `~/.openclaw/workspace/skills/` flow.
 
 ---
 
@@ -191,8 +194,8 @@ gws gmail users messages list --params '{"userId": "me", "q": "is:unread"}'
 ls ~/src/fieldkit/data/email-agent ~/src/fieldkit/logs
 
 # Skill is registered and ready
-openclaw skills list | grep check_email
-# Must show: ✓ ready  📦 check_email  …  openclaw-workspace
+hermes skills list --source local | grep check-email
+# Must show check-email, source local, status enabled
 
 # Script runs without error (dry run — safe to run with no unread mail)
 cd ~/src/fieldkit/platform/email-agent
@@ -259,10 +262,9 @@ tail -f ~/src/fieldkit/logs/cron.log
 | `gcloud CLI not found` | Run Step 2, open a new terminal after install |
 | `No OAuth client configured` | Run Step 4 |
 | `gws auth login` fails | Re-run Step 5 — ensure you sign in with `$AGENT_EMAIL` |
-| `check_email` shows **needs setup** in `openclaw skills list` | The metadata `requires.bins` lists `gws` and `python3` — confirm both are on PATH. Run `which gws python3` to verify. |
-| `check_email` does not appear in `openclaw skills list` | The workspace copy is missing. Re-run the `cp` command in Step 8 and restart the gateway. |
-| `[skills] Skipping escaped skill path … reason=symlink-escape` | You used a symlink instead of a direct copy. Remove the symlink and re-run Step 8. |
-| LLM improvises instead of running the script | The skill body is not loaded. Confirm `~/.openclaw/workspace/skills/check_email/SKILL.md` exists (not a symlink), then run `openclaw gateway restart`. |
+| `check-email` missing required binary | `prerequisites.commands` lists `gws` and `python3` — confirm both are on PATH. Run `which gws python3` to verify. |
+| `check-email` does not appear in `hermes skills list --source local` | The `skills.external_dirs` entry for `platform/email-agent/skills` is missing from `~/.hermes/config.yaml`, or the gateway hasn't picked it up yet. Re-check Step 8 and restart the gateway. |
+| LLM improvises instead of running the script | The skill wasn't discovered. Confirm `platform/email-agent/skills/check-email/SKILL.md` exists and `~/.hermes/config.yaml`'s `skills.external_dirs` includes its parent directory, then run `hermes gateway restart`. |
 | `check_email: ADMIN_ALLOWLIST is empty` in Telegram | `.env` is missing or `ADMIN_ALLOWLIST` is blank. Check Step 7. |
 | `check_email: ADMIN_TELEGRAM_CHAT_ID is not set` | `.env` is missing `ADMIN_TELEGRAM_CHAT_ID`. Check Step 7. |
 | `gws gmail … failed` in Telegram | gws token may have expired. Re-run Step 6. |
