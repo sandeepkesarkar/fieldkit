@@ -179,13 +179,20 @@ live, a human must:
 - Full existing suite re-run green (see PR description for the count) —
   confirms this change doesn't regress any other flow.
 
-**Live-verified — 2026-08-23/24, Mac Mini, `_demo` client.** Requires a live
-human check, same posture as issue #7's dispatch-coverage precedent: whether
-a *real* Telegram button tap is correctly handled while both
+**Live-verified — 2026-08-24 (UTC), Mac Mini, `_demo` client.** Requires a
+live human check, same posture as issue #7's dispatch-coverage precedent:
+whether a *real* Telegram button tap is correctly handled while both
 `ai.hermes.gateway` and the cron leg are running simultaneously against the
 live bots. Unit tests mock the Telegram HTTP layer entirely and cannot
 observe Telegram's own per-token offset bookkeeping, which is the actual
 mechanism the race depended on and the fix removes.
+
+*Timestamp note: all times below are normalized to UTC. The underlying raw
+evidence mixes sources — `photo-agent.log` (the activity log) writes UTC
+natively; `cron.log`'s bare heartbeat lines are printed by the shell `date`
+command in the host's local time, EDT (UTC−4) on this date; `gateway.log`
+also logs in local time (EDT). Where a quoted log line originally showed
+EDT, its UTC equivalent is given alongside it.*
 
 **Setup confirmed:** `ai.hermes.gateway` running continuously throughout
 (pid 18785, uptime unbroken across the whole test — verified before and
@@ -195,41 +202,78 @@ entry, once a minute, no duplicates. `TELEGRAM_APPROVAL_BOT_TOKEN` and
 live `clients/_demo/src/photo-agent/.env`.
 
 **Run:** `scripts/run_e2e_test.py --duration 6` generated a real 2-photo
-test project (`e2e-test-20260824-024517`), uploaded it to Drive, and sent a
-real Telegram approval message via the dedicated approval bot
-(`APPROVAL_REQ project=e2e-test-20260824-024517 message_id=4` in the
-activity log) — confirmed arriving on the new approval bot, separate from
-Hermes's own bot conversation.
+test project (`e2e-test-20260824-024517`), uploaded it to Drive, and at
+`02:45:28 UTC` sent a real Telegram approval message via the dedicated
+approval bot (`APPROVAL_REQ project=e2e-test-20260824-024517 message_id=4`
+in the activity log) — confirmed arriving on the new approval bot, separate
+from Hermes's own bot conversation.
 
-**Three real button-tap callback events were generated and processed by the
-cron leg during this run**, `ai.hermes.gateway` running the entire time:
+**Three real button-tap callback events were generated during this run**,
+`ai.hermes.gateway` running the entire time — but only one of the three
+completed the full approve/reject flow. The other two failed at the
+`answerCallbackQuery` step itself, for a reason unrelated to this fix:
 
-1. **Approve tap (accidental), attempt 1** — `cron.log`:
+1. **Approve tap (accidental), attempt 1, ~02:46–02:47 UTC** (bounded by the
+   `02:45:00 UTC` / `22:45:00 EDT` and `02:50:00 UTC` / `22:50:00 EDT`
+   cron.log heartbeats either side) — `cron.log`:
    `ERROR:__main__:answer_callback_query failed: Telegram HTTP error 400: Bad
    Request: query is too old and response timeout expired or query ID is
    invalid`. Cron *did* find and attempt to process the tap (this is an
    explicit error, not a silent skip) — it lost a race against Telegram's
-   own callback-freshness window, not against Hermes. Tracked separately as
-   issue #31 (cron cadence vs. Telegram's callback-answer window) — out of
-   scope for this fix.
-2. **Approve tap, attempt 2 (Telegram redelivery)** — same `query is too
-   old` error, same cause.
-3. **Reject tap (deliberate retry)** — processed cleanly, no error. Activity
-   log: `2026-08-24 02:53 | REJECTED | project=e2e-test-20260824-024517`.
-   Full clean flow: Drive video file deleted, admin notified via the
-   approval bot, `pending_approval` cleared, `telegram_update_offset`
-   advanced.
+   own callback-freshness window, not against Hermes. This is a **race
+   check pass, not a full processing success**: `pending_approval` was left
+   set (not cleared) and no downstream effect (Drive delete, admin
+   notification) occurred for this attempt. Tracked separately as issue #31
+   (cron cadence vs. Telegram's callback-answer window) — out of scope for
+   this fix.
+2. **Approve tap, attempt 2 (Telegram redelivery), ~02:50 UTC / 22:50 EDT**
+   — same `query is too old` error, same cause, same partial outcome (race
+   check pass, processing failure).
+3. **Reject tap (deliberate retry), 02:53 UTC / 22:53 EDT** — the only one
+   of the three that completed end-to-end. Processed cleanly, no error.
+   Activity log: `2026-08-24 02:53 | REJECTED |
+   project=e2e-test-20260824-024517`. Full clean flow: Drive video file
+   deleted, admin notified via the approval bot, `pending_approval`
+   cleared, `telegram_update_offset` advanced.
+
+So this run produced **3 race-regression observations** (all 3 showed zero
+Hermes contention for the callback, see below) but only **1 successful
+end-to-end approval-processing flow** (the Reject). The two Approve
+failures are evidence the race-fix held even under a different,
+unrelated failure mode (#31) — not evidence that the approve path is
+unreliable on its own merits.
 
 **The regression check, for all three events:** `grep` across the entire
 `~/.hermes/logs/gateway.log` for this project name, `callback_query`, or
-`message_id=4` — **zero matches**, at any point. `grep` for `409`/`Conflict`
-restricted to the actual test window (`2026-08-24 02:40`–`02:59 UTC`) —
-**zero matches** (the log's only Conflict entries anywhere are from
-`2026-08-21` and `2026-08-23 15:07 EDT`, hours before Hermes's last restart
-at `21:33 EDT` that day and completely outside this test). Hermes never
-consumed, delayed, or raced for any of these three callbacks — confirming
-the two tokens never contended for the same `getUpdates` offset, which is
-exactly what this fix guarantees.
+`message_id=4` — **zero matches**, at any point. This is suggestive but
+**not dispositive by itself**: it would also show zero matches if Hermes
+*had* received the callback and silently discarded it, since Hermes's own
+`_handle_callback_query` (`plugins/platforms/telegram/adapter.py`,
+installed Hermes source) ends in a bare fallthrough — `if not
+data.startswith("update_prompt:"): return` — for any `callback_data` that
+doesn't match one of its known prefixes (`mp:`, `gt:`, `ea:`, `sc:`, etc.,
+per the "Options evaluated" section above), and that fallthrough emits no
+log line at all. FieldKit's `"approve"`/`"reject"` payloads would hit
+exactly this silent branch if Hermes ever saw them. The string-absence grep
+alone cannot distinguish "Hermes never received this update" from "Hermes
+received it and silently no-opped."
+
+The more defensible signal, restricted to the actual test window
+(`02:40`–`02:59 UTC`): **zero `409`/`Conflict` entries** anywhere in
+`gateway.log` (the log's only Conflict entries at all are from
+`2026-08-21` and `2026-08-23 15:07 EDT` / `19:07 UTC`, hours before
+Hermes's last restart at `21:33 EDT` / `01:33 UTC (Aug 24)` and completely
+outside this test) — a real, Telegram-reported error condition tied to
+concurrent `getUpdates` polling, rather than an inference from what isn't
+in a log. Even this isn't the core proof, though: the actual guarantee
+against the race is architectural, established at the code level in the
+"Why this actually closes the race" section above — Telegram scopes the
+`getUpdates` offset per bot token, and Hermes and the cron leg now poll two
+different tokens, so there is no shared resource for either process to race
+over regardless of what either one's logs show. What this live run adds on
+top of that architectural guarantee is confirmation that the token split is
+actually deployed and exercised in practice against real Telegram, with no
+unexpected cross-bot leakage observed.
 
 **Facebook safety, confirmed throughout:** `facebook_state.json` showed
 `pending_facebook_upload: null` and no key for this project's message_id at
@@ -238,11 +282,45 @@ attempts (which failed before `check_approval.py` ever reached the
 `_enqueue_facebook_upload` call) and after the final Reject. No live
 Facebook publish occurred at any point in this verification.
 
-**Verdict: PASS.** Three independent callback events (not a single one-off)
-processed by the cron leg with `ai.hermes.gateway` running continuously
-throughout, zero footprint in Hermes's logs for any of them, zero `409`
-conflicts in the test window. This satisfies the "repeat once to rule out a
-fluke" bar in the original steps below.
+**Test-artifact disposition:** the Drive folder created by this run
+(`folder_id` in `e2e_run_state.json`, containing the 2 source test photos)
+and the local `tmp/e2e-test-20260824-024517/` directory were **not** run
+through `scripts/run_e2e_test.py --cleanup`, and are still present as of
+this writing — the Reject path only deletes the generated slideshow video
+(`drive_video_file_id`), not the source-photo folder. The Telegram messages
+themselves remain in the approval-bot conversation, and the `APPROVAL_REQ`/
+`REJECTED` lines are mixed permanently into the real `photo-agent.log` and
+`cron.log` production logs (both are plain-text append logs; there's no
+retroactive tagging or removal). A future incident investigator reading
+either log should treat `e2e-test-20260824-024517` (and `e2e-test-*`
+project names generally) as known test data, not a real client run.
+
+**Verdict: PASS, with scope caveats.** Three independent callback events
+(not a single one-off) were generated by the cron leg with
+`ai.hermes.gateway` running continuously throughout, zero footprint in
+Hermes's logs for any of them, and zero `409` conflicts in the test window.
+
+This verification is real but narrow, and shouldn't be read as more general
+than it is. It covered exactly:
+- **One client configuration** — `_demo` only; `_construction_co` (Facebook
+  disabled, otherwise the same approval flow) was not exercised.
+- **One test project, one run** — a single approval message and its taps;
+  no test of two overlapping `pending_approval` records or concurrent
+  approvals across multiple projects/clients hitting the cron leg at once.
+- **One uninterrupted Hermes process lifetime** — `ai.hermes.gateway` did
+  not restart, reconnect, or fail over at any point during callback
+  processing. The fix's correctness doesn't depend on Hermes's uptime (the
+  two tokens are independent regardless), but a mid-processing Hermes
+  restart was not itself observed and could interact with cron in ways this
+  run didn't probe.
+- **No multi-client concurrency scenario** — only one client's cron leg and
+  one Hermes gateway were live; the design doc's guarantee (per-token
+  offset isolation) implies this generalizes, but that generalization
+  itself was not separately tested here.
+
+This satisfies the "repeat once to rule out a fluke" bar in the original
+steps below (3 independent observations, not 1), but is a single test
+session on one Mac Mini, not a claim of exhaustive coverage.
 
 **Side findings, tracked separately (out of scope for this fix):**
 - **#31** — `check_approval.py`'s once-a-minute cron cadence can lose the
