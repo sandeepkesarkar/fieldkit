@@ -6,7 +6,7 @@ This constitution establishes the governing principles, values, and constraints 
 
 **Last Updated:** [Date]
 **Status:** Draft
-**Deployment Model:** Mac Mini (on-premise, transferred to client after completion)
+**Deployment Model:** [e.g., on-premise hardware, cloud-hosted, hybrid — describe this client's deployment]
 **AI Provider:** [Model provider — Hermes Agent runtime, Anthropic (default) or OpenAI (per-client choice); see the FieldKit framework constitution]
 **Development Approach:** Phased implementation
 
@@ -14,20 +14,17 @@ This constitution establishes the governing principles, values, and constraints 
 
 ## Deployment Architecture
 
-### Mac Mini Model
+### [Deployment Model — e.g., On-Premise Hardware, Cloud-Hosted, Hybrid]
 
-**Hardware Ownership:**
-- FieldKit provides Mac Mini for development and deployment
-- Mac Mini runs 24/7 at developer location during development
-- Upon project completion, Mac Mini transferred to [Client Name]
-- [Client Name] owns hardware and can maintain independently
+**Hosting & Ownership:**
+- [Describe where the system runs and who owns/hosts the infrastructure]
+- [Describe any handoff or ownership transfer at project completion, if applicable]
 
 **Implications:**
-- AI inference now routes to a cloud model provider (Anthropic or OpenAI) via Hermes Agent — no longer self-contained for AI inference specifically; other data remains local
-- All data stored locally on Mac Mini
-- Client has full control and ownership
-- No recurring hosting costs
-- System continues running after FieldKit engagement ends
+- AI inference routes to a cloud model provider (Anthropic or OpenAI) via Hermes Agent
+- [Describe the data storage/residency model — local, cloud, hybrid]
+- [Describe the cost model — recurring hosting costs, one-time hardware cost, etc.]
+- [Describe what happens to the system after the FieldKit engagement ends]
 
 ---
 
@@ -47,7 +44,7 @@ This constitution establishes the governing principles, values, and constraints 
 - [ ] All metadata (GPS, timestamps, camera info) stripped from photos before posting
 - [ ] No [industry-specific identifying info] in published content
 - [ ] Human verification required for all customer-facing content
-- [ ] All customer data stored locally on Mac Mini (not cloud)
+- [ ] [Data storage/residency requirement — e.g., local-only, specific cloud region, no third-party storage]
 - [ ] [Add client-specific requirements]
 
 ---
@@ -112,13 +109,13 @@ This constitution establishes the governing principles, values, and constraints 
 
 ### 5. Data Integrity & Preservation
 
-**Principle:** Business data is valuable and should be preserved. Local storage ensures control.
+**Principle:** Business data is valuable and should be preserved. [Describe this client's approach to data control.]
 
 **Data Storage:**
-- All data stored on Mac Mini
-- No cloud storage (except necessary external services — list them)
+- [Data storage/residency model — e.g., local-only, cloud, hybrid]
+- [Cloud storage policy, if any — list any necessary external services]
 - Backup strategy: [Who is responsible? What is the approach?]
-- Data ownership: [Client name] owns all data on their Mac Mini
+- Data ownership: [Client name] owns all data — [describe where/how it's stored]
 
 **External Services Used:**
 - [ ] Gmail (email)
@@ -147,13 +144,13 @@ This constitution establishes the governing principles, values, and constraints 
 ## Technical Constraints
 
 ### Infrastructure Requirements
-- Mac Mini M-series
+- [Deployment hardware/platform — e.g., on-premise Mac Mini, cloud VM, managed service]
 - Reliable internet connection (always-on)
 - Gmail account for email workflows
-- macOS for deployment
+- [Operating system / platform requirement, if any]
 
 ### Hermes Integration
-- Self-hosted Hermes Agent runtime on Mac Mini; model calls route to the chosen cloud provider (Anthropic or OpenAI)
+- Hermes Agent runtime; model calls route to the chosen cloud provider (Anthropic or OpenAI)
 - Model selection based on task complexity
 - Token usage monitoring for cost tracking
 
@@ -192,13 +189,13 @@ When conflicts arise, resolve in this order:
 
 ---
 
-## Hardware Transfer Plan
+## Transition Plan
 
 **Upon Project Completion:**
 
 1. **System Validation** — all agreed features working, client satisfied
 2. **Knowledge Transfer** — training session, documentation handoff, admin guide
-3. **Physical Transfer** — Mac Mini delivered to client location, connectivity verified
+3. **Handoff** — [describe what's transferred — e.g., physical hardware, cloud account access, credentials — based on this client's deployment model]
 4. **Post-Transfer Support** — 30-day support period included
 5. **Long-Term** — client owns and operates system; source code provided
 
@@ -208,7 +205,7 @@ When conflicts arise, resolve in this order:
 
 By implementing this system, all stakeholders agree to:
 - Respect the privacy principles above
-- Maintain Mac Mini hardware properly
+- [Maintain deployment infrastructure properly, per the deployment model above]
 - Operate within budget constraints
 - Follow approval workflows
 - Prioritize customer satisfaction and business sustainability
@@ -218,5 +215,5 @@ By implementing this system, all stakeholders agree to:
 *Established: [Date]*
 *Authority: [Client Name] Business Owner*
 *Framework: FieldKit*
-*Deployment: Mac Mini (on-premise)*
+*Deployment: [on-premise / cloud-hosted / hybrid — per client]*
 *AI Provider: [Hermes Agent — Anthropic or OpenAI per client]*
