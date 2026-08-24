@@ -903,7 +903,9 @@ def test_cron_get_updates_uses_approval_token(base):
     import scripts.check_approval as ca
     ca.telegram_api.get_updates.return_value = []
     main([])
-    ca.telegram_api.get_updates.assert_called_once_with(50, token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN")
+    ca.telegram_api.get_updates.assert_called_once_with(
+        50, token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN", timeout=ca._LONG_POLL_TIMEOUT_SECONDS
+    )
 
 
 def test_cron_answer_callback_query_uses_approval_token(base):
@@ -914,6 +916,102 @@ def test_cron_answer_callback_query_uses_approval_token(base):
     ca.telegram_api.answer_callback_query.assert_called_once_with(
         "cq_approve", text="✅ Approving...", token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cron-vs-callback-freshness race (issue #31)
+#
+# Telegram expires a callback_query ~15s after the tap; the cron leg only
+# ran once a minute. A plain instant poll (timeout=0) could leave a tap
+# queued for up to that full minute before this leg ever saw it — already
+# stale by the time it was observed, no matter how fast the code that ran
+# afterward was. These tests simulate "answered late" (the old timeout=0
+# behaviour, reintroduced) vs "answered immediately" (long-poll + fast ack).
+# ---------------------------------------------------------------------------
+
+def test_cron_get_updates_long_polls_instead_of_instant_poll(base):
+    """Regression guard: the cron leg must not revert to an instant (timeout=0) poll.
+
+    timeout=0 is exactly the configuration that produced issue #31's race — a
+    tap landing between two cron ticks would sit queued, already stale, until
+    the next tick finally called get_updates.
+    """
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = []
+    main([])
+    used_timeout = ca.telegram_api.get_updates.call_args.kwargs["timeout"]
+    assert used_timeout > 0
+    assert used_timeout == ca._LONG_POLL_TIMEOUT_SECONDS
+
+
+def test_long_poll_timeout_stays_under_cron_cadence(base):
+    """_LONG_POLL_TIMEOUT_SECONDS must stay under the 60s cron cadence.
+
+    A poll that ran as long as (or longer than) the cron interval would
+    overlap the next cron tick indefinitely, defeating the margin the
+    long-poll is meant to leave before the next invocation's own poll opens.
+    """
+    import scripts.check_approval as ca
+    assert 0 < ca._LONG_POLL_TIMEOUT_SECONDS < 60
+
+
+def test_answer_callback_query_not_delayed_by_slow_approve_processing(base):
+    """Simulates a callback answered 'immediately': answer_callback_query must fire
+    right after get_updates returns, before the slow approval email send even starts —
+    the ordering that keeps a borderline-fresh callback from expiring while
+    processing runs. Uses wall-clock timestamps, not just call order, so a
+    regression that interleaves slow work before the ack is actually caught.
+    """
+    import time
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+
+    timestamps = {}
+
+    def _record_get_updates(*a, **kw):
+        timestamps["get_updates"] = time.monotonic()
+        return [_APPROVE_UPDATE]
+
+    def _record_answer(*a, **kw):
+        timestamps["answer"] = time.monotonic()
+
+    def _slow_email(*a, **kw):
+        # Simulates the "slower approve/reject processing" the issue's fix
+        # is meant to happen strictly after the ack, never before it.
+        time.sleep(0.05)
+        timestamps["email"] = time.monotonic()
+
+    ca.telegram_api.get_updates.side_effect = _record_get_updates
+    ca.telegram_api.answer_callback_query.side_effect = _record_answer
+    ca._send_approval_email.side_effect = _slow_email
+
+    main([])
+
+    assert timestamps["answer"] - timestamps["get_updates"] < 0.02, (
+        "answer_callback_query was delayed after get_updates returned"
+    )
+    assert timestamps["email"] - timestamps["answer"] >= 0.04, (
+        "slow approval processing did not run after the ack"
+    )
+
+
+def test_stale_callback_query_rejected_by_telegram_preserves_state_for_retry(base):
+    """Simulates a callback answered 'late': Telegram's actual issue #31 rejection
+    ('query is too old') is handled the same as any other answer_callback_query
+    failure — offset advances, pending approval is left intact so the admin can
+    re-tap, and no approve/reject side effect runs.
+    """
+    import scripts.check_approval as ca
+    ca.telegram_api.get_updates.return_value = [_APPROVE_UPDATE]
+    ca.telegram_api.answer_callback_query.side_effect = RuntimeError(
+        "Telegram API error: {'ok': False, 'error_code': 400, "
+        "'description': 'Bad Request: query is too old and response timeout expired or query id is invalid'}"
+    )
+    main([])
+    ca.state.set_telegram_offset.assert_called_once_with(101)
+    ca.state.clear_pending_approval.assert_not_called()
+    ca._send_approval_email.assert_not_called()
+    ca.drive.delete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -251,6 +251,46 @@ def test_get_updates_telegram_error_raises_runtime_error():
 
 
 # ---------------------------------------------------------------------------
+# get_updates — long-poll timeout (issue #31)
+#
+# A plain instant poll (timeout=0) can leave a callback_query queued for up
+# to a full cron cycle before check_approval.py's cron leg ever calls
+# get_updates, by which point Telegram has already expired it (~15s
+# freshness window). Passing a non-zero `timeout` makes Telegram hold the
+# connection open and deliver the update the moment it happens instead.
+# ---------------------------------------------------------------------------
+
+def test_get_updates_passes_nonzero_timeout_to_telegram_param():
+    """get_updates(timeout=N) sends N as the Telegram-side long-poll timeout param."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _ok_response([])
+        get_updates(0, timeout=45)
+    params = mock_get.call_args.kwargs["params"]
+    assert params["timeout"] == 45
+
+
+def test_get_updates_requests_socket_timeout_exceeds_telegram_timeout():
+    """The requests-level socket timeout always exceeds the Telegram long-poll timeout.
+
+    Regression guard: if the socket timeout were <= the Telegram `timeout` param,
+    a legitimate long poll waiting for an update would itself raise a spurious
+    requests.Timeout before Telegram ever got a chance to respond.
+    """
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _ok_response([])
+        get_updates(0, timeout=45)
+    assert mock_get.call_args.kwargs["timeout"] > 45
+
+
+def test_get_updates_zero_timeout_still_uses_short_socket_timeout():
+    """timeout=0 (the default) keeps the original short socket timeout behaviour."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _ok_response([])
+        get_updates(0)
+    assert mock_get.call_args.kwargs["timeout"] == 10
+
+
+# ---------------------------------------------------------------------------
 # Error handling — shared
 # ---------------------------------------------------------------------------
 
