@@ -9,11 +9,20 @@ Reads the pending VideoUploadJob from facebook_state.json, uploads the video
 to the linked Facebook Page via Graph API, and sends a Telegram confirmation.
 
 Retry and failure-recovery logic (US3):
+  - attempt_count/last_attempt_at are persisted BEFORE each Facebook API call
+    (not only after a failure), so a process killed mid-upload still leaves a
+    bounded, cooldown-gated trail instead of being retried immediately forever.
   - Cooldown: if the last attempt was within 60 seconds, exits silently.
   - Retry limit: 3 attempts. After the 3rd failure, marks the job as failed
     and sends a Telegram alert.
-  - Token expiry (FacebookTokenError): skips the retry budget entirely, marks
-    failed immediately, and alerts the admin to reconnect the Page.
+  - Token expiry (FacebookTokenError): marks failed immediately after just
+    this one attempt (does not wait for the retry budget to exhaust), and
+    alerts the admin to reconnect the Page.
+
+A resolved job (published, or terminally failed) always clears
+pending_facebook_upload (see tools/facebook_state.py) — main() additionally
+double-checks this before ever reprocessing a job, so a stale or pre-fix
+state file can't cause a duplicate Facebook post (issue #34).
 
 FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
@@ -104,6 +113,24 @@ def main(argv=None) -> None:
         _log.debug("no pending facebook upload — exiting")
         return
 
+    # Defense in depth: a resolved job (published, or terminally failed) must
+    # never reach _process_upload, which would call the Facebook API again for
+    # an already-published idempotency_key (real duplicate post) or spin the
+    # cron entrypoint forever on a job mark_failed already gave up on. This
+    # check is independent of facebook_state's own clearing on mark_published/
+    # mark_failed so it also self-heals a state file written before that fix.
+    idem_key = record.get("idempotency_key")
+    already_published = bool(idem_key) and facebook_state.is_published(idem_key)
+    already_terminal_failed = record.get("status") == "failed"
+    if already_published or already_terminal_failed:
+        _log.warning(
+            "stale pending facebook upload record found (published=%s failed=%s) "
+            "project=%s key=%s — clearing without reprocessing",
+            already_published, already_terminal_failed, record.get("project_name"), idem_key,
+        )
+        facebook_state.clear_pending_upload()
+        return
+
     _process_upload(record, page_token, page_id, chat_id)
 
 
@@ -131,8 +158,33 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         facebook_state.mark_failed(idem_key)
         return
 
+    # Attempt budget check: exhausted BEFORE calling the API again, not only inside the
+    # FacebookUploadError handler below. attempt_count is persisted before every API call (see
+    # below), so this bound holds even if prior attempts never reached that handler at all —
+    # e.g. the process was killed mid-upload (OOM, host restart) rather than the API cleanly
+    # raising FacebookUploadError. Without this, a job stuck crashing every tick could retry
+    # forever at the cooldown's pace instead of ever stopping.
+    if attempt_count >= _MAX_ATTEMPTS:
+        _log.error("attempt budget exhausted: project=%s attempt_count=%d", project_name, attempt_count)
+        facebook_state.mark_failed(idem_key)
+        facebook_logger.log_upload_exhausted(project_name)
+        _send_alert(
+            chat_id,
+            f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
+        )
+        return
+
     attempt_number = attempt_count + 1
     facebook_state.mark_uploading(idem_key)
+    # Persist the attempt (attempt_count + last_attempt_at) BEFORE calling the API, not only on
+    # failure: if this process is killed mid-upload (OOM, host restart, cron timeout) after
+    # facebook_api.upload_video() has already created the real post but before mark_published()
+    # runs, the next tick must still see an advanced attempt_count and a fresh cooldown window —
+    # otherwise a crashed-but-actually-succeeded attempt would be retried immediately and forever
+    # (attempt_count frozen, cooldown never engaged), which is the same real-duplicate-post risk
+    # issue #34 was about. This bounds that residual window to _MAX_ATTEMPTS cooldown-spaced
+    # retries before mark_failed alerts the admin, instead of an unbounded retry loop.
+    facebook_state.increment_attempt(idem_key)
     facebook_logger.log_upload_started(project_name, attempt_number)
 
     try:
@@ -148,10 +200,8 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         return
     except FacebookUploadError as exc:
         _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, exc)
-        facebook_state.increment_attempt(idem_key)
         facebook_logger.log_upload_attempt_failed(project_name, attempt_number, str(exc))
-        new_count = attempt_count + 1
-        if new_count >= _MAX_ATTEMPTS:
+        if attempt_number >= _MAX_ATTEMPTS:
             facebook_state.mark_failed(idem_key)
             facebook_logger.log_upload_exhausted(project_name)
             _send_alert(

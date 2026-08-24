@@ -8,14 +8,22 @@ US3 (T014): transient retry, cooldown, exhaustion, and token-expiry failure path
 
 All external calls (facebook_state, facebook_api, facebook_logger, telegram_api)
 are mocked. No real network or file-system access.
+
+Issue #34 (pending_facebook_upload reprocessing loop) regression tests below use
+the REAL tools.facebook_state read-modify-write state machine, redirected to an
+isolated tmp file via the `real_state` fixture — a fully-mocked facebook_state
+can't reproduce a bug that lives in how state is persisted between cron ticks.
+Only facebook_api/facebook_logger/telegram_api stay mocked there.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import ANY
 
 import pytest
 
+import tools.facebook_state as fb_state
 from scripts.upload_facebook import main
 
 _PROJECT = "test_project"
@@ -55,6 +63,8 @@ def base(mocker, env):
     mocker.patch.object(uf.facebook_state, "mark_published")
     mocker.patch.object(uf.facebook_state, "mark_failed")
     mocker.patch.object(uf.facebook_state, "increment_attempt")
+    mocker.patch.object(uf.facebook_state, "is_published", return_value=False)
+    mocker.patch.object(uf.facebook_state, "clear_pending_upload")
     mocker.patch.object(uf.facebook_api, "upload_video", return_value=_POST_ID)
     mocker.patch.object(uf.facebook_logger, "log_upload_started")
     mocker.patch.object(uf.facebook_logger, "log_upload_published")
@@ -353,7 +363,13 @@ def test_third_failure_sends_telegram_alert(base, tmp_path):
 
 
 def test_token_error_marks_failed_immediately(base, tmp_path):
-    """FacebookTokenError immediately marks status=failed without incrementing attempt_count."""
+    """FacebookTokenError immediately marks status=failed after just this one attempt — it does
+    not wait for the retry budget (_MAX_ATTEMPTS) to exhaust, unlike FacebookUploadError.
+
+    increment_attempt IS still called (persisted before the API call, alongside every attempt —
+    see _process_upload's crash-safety comment) but it has no bearing on when mark_failed fires
+    here: that's unconditional on FacebookTokenError, not attempt-count-gated.
+    """
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookTokenError
     video = tmp_path / "video.mp4"
@@ -365,7 +381,6 @@ def test_token_error_marks_failed_immediately(base, tmp_path):
     main([])
 
     uf.facebook_state.mark_failed.assert_called_once_with(_IDEM_KEY)
-    uf.facebook_state.increment_attempt.assert_not_called()
 
 
 def test_token_error_logs_token_expired(base, tmp_path):
@@ -399,3 +414,199 @@ def test_token_error_sends_telegram_alert(base, tmp_path):
     text = uf.telegram_api.send_message.call_args.args[1]
     assert "⚠️" in text
     assert "token" in text.lower() or "reconnect" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Issue #34 regression: pending_facebook_upload reprocessing loop
+#
+# main() used to check only `record is None` before reprocessing — never
+# published_idempotency_keys or status. Combined with mark_published/mark_failed
+# never clearing pending_facebook_upload, every cron tick after a resolved job
+# reprocessed the SAME job forever. In the live incident the video file was
+# already gone (deleted by the success-path cleanup), so it just spammed
+# "video file missing" + mark_failed — which stomped status to "failed" while
+# leaving the real, live fb_post_id attached. Had the file still existed, this
+# would have re-called facebook_api.upload_video and posted a REAL duplicate.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def real_state(tmp_path, monkeypatch, env, mocker):
+    """Redirect tools.facebook_state's on-disk file to an isolated tmp path and mock only
+    the external side effects (Facebook API, Telegram, structured logging) — facebook_state
+    itself stays real so these tests exercise its actual persisted state transitions.
+    """
+    import scripts.upload_facebook as uf
+    data_dir = tmp_path / "photo-agent"
+    data_dir.mkdir()
+    monkeypatch.setattr(fb_state, "DATA_DIR", data_dir)
+    monkeypatch.setattr(fb_state, "STATE_FILE", data_dir / "facebook_state.json")
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path))
+    mocker.patch.object(uf.facebook_api, "upload_video", return_value=_POST_ID)
+    mocker.patch.object(uf.facebook_logger, "log_upload_started")
+    mocker.patch.object(uf.facebook_logger, "log_upload_published")
+    mocker.patch.object(uf.facebook_logger, "log_upload_attempt_failed")
+    mocker.patch.object(uf.facebook_logger, "log_upload_exhausted")
+    mocker.patch.object(uf.facebook_logger, "log_token_expired")
+    mocker.patch.object(uf.telegram_api, "send_message")
+    return fb_state
+
+
+def test_reprocessing_after_publish_does_not_call_upload_video(real_state, tmp_path):
+    """The exact issue #34 incident, reproduced end-to-end: a second cron tick against state
+    left over from a successful publish must not call upload_video again. This is the actual
+    line of defense against a real duplicate Facebook post."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    real_state.set_pending_upload(record)
+
+    main([])  # first tick: succeeds, deletes the local file, must clear the pending job
+    assert real_state.get_pending_upload() is None
+    assert not video.exists()
+
+    uf.facebook_api.upload_video.reset_mock()
+    main([])  # second tick: nothing left to reprocess
+
+    uf.facebook_api.upload_video.assert_not_called()
+    assert real_state.get_pending_upload() is None
+
+
+def test_reprocessing_after_publish_does_not_mark_failed_again(real_state, tmp_path):
+    """A second tick against a resolved job must not call mark_failed either — the live incident
+    was this exact call stomping status to 'failed' while a real, live fb_post_id stayed attached."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    real_state.set_pending_upload(record)
+
+    main([])
+    idem_key = record["idempotency_key"]
+    assert real_state.is_published(idem_key) is True
+
+    main([])  # second tick must not touch state at all
+
+    data_after_first = json.loads(real_state.STATE_FILE.read_text())
+    assert data_after_first["pending_facebook_upload"] is None
+    assert idem_key in data_after_first["published_idempotency_keys"]
+
+
+def test_terminal_failure_does_not_retry_forever(real_state, tmp_path, monkeypatch):
+    """Once attempt_count reaches _MAX_ATTEMPTS and the job is marked failed, further cron ticks
+    must not keep calling upload_video with no backoff."""
+    import scripts.upload_facebook as uf
+    from tools.facebook_api import FacebookUploadError
+    monkeypatch.setattr(uf, "_COOLDOWN_SECONDS", 0)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    real_state.set_pending_upload(record)
+    uf.facebook_api.upload_video.side_effect = FacebookUploadError("server error")
+
+    for _ in range(uf._MAX_ATTEMPTS):
+        main([])
+
+    assert uf.facebook_api.upload_video.call_count == uf._MAX_ATTEMPTS
+    assert real_state.get_pending_upload() is None  # terminal: cleared, not left dangling
+
+    uf.facebook_api.upload_video.reset_mock()
+    main([])  # a 4th tick after exhaustion must not retry
+    uf.facebook_api.upload_video.assert_not_called()
+
+
+def test_stale_published_record_is_cleared_without_reprocessing(real_state, tmp_path):
+    """Defense in depth (main()'s explicit is_published check): even if pending_facebook_upload
+    is somehow non-null for a key already in published_idempotency_keys — e.g. a state file
+    written before this fix — main() must clear it and must never call upload_video, and must
+    never overwrite the real fb_post_id via mark_failed."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    stale_record = dict(
+        _PENDING_RECORD,
+        video_local_path=str(video),
+        status="published",
+        fb_post_id=_POST_ID,
+    )
+    real_state.STATE_FILE.write_text(json.dumps({
+        "pending_facebook_upload": stale_record,
+        "published_idempotency_keys": [_IDEM_KEY],
+    }))
+
+    main([])
+
+    uf.facebook_api.upload_video.assert_not_called()
+    data = json.loads(real_state.STATE_FILE.read_text())
+    assert data["pending_facebook_upload"] is None
+    assert _IDEM_KEY in data["published_idempotency_keys"]
+
+
+def test_crash_during_upload_leaves_attempt_persisted_before_the_call(real_state, tmp_path):
+    """A process that dies inside facebook_api.upload_video() (simulated here as an unhandled
+    exception propagating out of main()) must still have already persisted attempt_count/
+    last_attempt_at — they're written BEFORE the call, not only on a caught failure. Without
+    this, a crashed-but-possibly-succeeded attempt would be retried immediately (no cooldown)
+    and forever (attempt_count frozen), which is the same unbounded-reprocessing shape as the
+    original issue #34 bug, just triggered by a crash instead of a successful publish."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    real_state.set_pending_upload(record)
+    uf.facebook_api.upload_video.side_effect = RuntimeError("simulated process crash mid-upload")
+
+    with pytest.raises(RuntimeError):
+        main([])
+
+    pending = real_state.get_pending_upload()
+    assert pending is not None
+    assert pending["attempt_count"] == 1
+    assert pending["last_attempt_at"] is not None
+
+
+def test_crash_mid_upload_is_eventually_bounded_by_max_attempts(real_state, tmp_path, monkeypatch):
+    """A job stuck 'crashing' every tick (attempt_count advances but the process never reaches
+    the FacebookUploadError handler at all) must still stop retrying once _MAX_ATTEMPTS is
+    reached — checked proactively before calling the API again, so the bound holds regardless of
+    how prior attempts failed (crash vs. a caught API error)."""
+    import scripts.upload_facebook as uf
+    monkeypatch.setattr(uf, "_COOLDOWN_SECONDS", 0)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    real_state.set_pending_upload(record)
+    uf.facebook_api.upload_video.side_effect = RuntimeError("simulated process crash mid-upload")
+
+    for _ in range(uf._MAX_ATTEMPTS):
+        with pytest.raises(RuntimeError):
+            main([])
+
+    pending = real_state.get_pending_upload()
+    assert pending is not None
+    assert pending["attempt_count"] == uf._MAX_ATTEMPTS
+
+    uf.facebook_api.upload_video.reset_mock(side_effect=True)
+    uf.facebook_api.upload_video.side_effect = RuntimeError("would crash again if called")
+    main([])  # must be marked failed WITHOUT calling the API again
+
+    uf.facebook_api.upload_video.assert_not_called()
+    assert real_state.get_pending_upload() is None
+
+
+def test_stale_terminal_failed_record_is_cleared_without_reprocessing(real_state, tmp_path):
+    """Defense in depth: a dangling pending record already marked status='failed' (e.g. left over
+    from a state file written before this fix) must be cleared on the next tick, not reprocessed."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    stale_record = dict(_PENDING_RECORD, video_local_path=str(video), status="failed", attempt_count=3)
+    real_state.STATE_FILE.write_text(json.dumps({
+        "pending_facebook_upload": stale_record,
+        "published_idempotency_keys": [],
+    }))
+
+    main([])
+
+    uf.facebook_api.upload_video.assert_not_called()
+    assert real_state.get_pending_upload() is None

@@ -1,8 +1,16 @@
 """
 e2e_stage5_await_facebook.py — E2E Stage 5: Wait for Facebook upload to complete.
 
-Polls facebook_state.json until upload_facebook.py marks the job as 'published',
-then updates e2e_run_state.json with the fb_post_id.
+Polls facebook_state.json's published_history for this test's job, then
+updates e2e_run_state.json with the fb_post_id.
+
+published_history (not pending_facebook_upload) is the source of truth here:
+mark_published() clears pending_facebook_upload as soon as a job resolves
+(issue #34 — a cron entrypoint that keeps seeing a resolved job as pending
+reprocesses it forever), so a 'published' status is never observable on the
+pending record itself. facebook_state.find_published() searches the capped
+history by project_name, so an unrelated publish landing in between can't
+hide this run's own record.
 
 Run upload_facebook.py in another terminal while this polls, or wait for cron.
 
@@ -37,17 +45,15 @@ _POLL_INTERVAL = 10
 
 
 def _wait_for_facebook_post(test_name: str, timeout: int) -> str:
-    """Poll until upload_facebook.py marks the job as 'published'. Returns fb_post_id.
+    """Poll until upload_facebook.py publishes this test's job. Returns fb_post_id.
 
     Raises SystemExit on timeout.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        fb = facebook_state.get_pending_upload()
-        if (fb is not None
-                and fb.get("project_name") == test_name
-                and fb.get("status") == "published"):
-            return fb.get("fb_post_id", "")
+        found = facebook_state.find_published(test_name)
+        if found is not None:
+            return found.get("fb_post_id", "")
         time.sleep(_POLL_INTERVAL)
     raise SystemExit(f"Stage 5 timed out after {timeout}s waiting for Facebook post for {test_name}")
 

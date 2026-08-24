@@ -306,6 +306,24 @@ def test_wait_for_approval_returns_when_approval_cleared(mocker):
     mocker.patch.object(stage4.state, "get_pending_approval", return_value=None)
     mocker.patch.object(stage4.facebook_state, "get_pending_upload",
                         return_value={"project_name": "e2e-test-20260620-143000", "status": "pending"})
+    mocker.patch.object(stage4.facebook_state, "find_published", return_value=None)
+    mocker.patch("scripts.e2e_stage4_await_approval.time.sleep")
+    _wait_for_approval("e2e-test-20260620-143000", timeout=60)  # must not raise
+
+
+def test_wait_for_approval_returns_when_job_already_published(mocker):
+    """_wait_for_approval also returns if the job resolved before this poll ever saw it pending.
+
+    Reproduces the race the issue #34 fix introduced: mark_published() now clears
+    pending_facebook_upload as soon as a job resolves, so upload_facebook.py's cron leg can
+    race ahead of this poll and publish (clearing pending) before it's ever observed pending.
+    find_published() is the fallback success signal for exactly that race.
+    """
+    import scripts.e2e_stage4_await_approval as stage4
+    mocker.patch.object(stage4.state, "get_pending_approval", return_value=None)
+    mocker.patch.object(stage4.facebook_state, "get_pending_upload", return_value=None)
+    mocker.patch.object(stage4.facebook_state, "find_published",
+                        return_value={"project_name": "e2e-test-20260620-143000", "fb_post_id": "post_abc"})
     mocker.patch("scripts.e2e_stage4_await_approval.time.sleep")
     _wait_for_approval("e2e-test-20260620-143000", timeout=60)  # must not raise
 
@@ -316,6 +334,7 @@ def test_wait_for_approval_exits_on_timeout(mocker):
     mocker.patch.object(stage4.state, "get_pending_approval",
                         return_value={"project_name": "e2e-test-20260620-143000"})
     mocker.patch.object(stage4.facebook_state, "get_pending_upload", return_value=None)
+    mocker.patch.object(stage4.facebook_state, "find_published", return_value=None)
     mocker.patch("scripts.e2e_stage4_await_approval.time.sleep")
     mocker.patch("scripts.e2e_stage4_await_approval.time.time", side_effect=[0, 0, 70])
     with pytest.raises((SystemExit, RuntimeError)):
@@ -323,11 +342,16 @@ def test_wait_for_approval_exits_on_timeout(mocker):
 
 
 def test_wait_for_facebook_post_returns_post_id_on_success(mocker):
-    """_wait_for_facebook_post returns the post_id when status becomes 'published'."""
+    """_wait_for_facebook_post returns the post_id once find_published matches the test name.
+
+    Polls published_history (via find_published) rather than pending_facebook_upload:
+    mark_published() clears the pending record as soon as a job resolves (issue #34), so
+    'published' is never observable on the pending record itself.
+    """
     import scripts.e2e_stage5_await_facebook as stage5
-    mocker.patch.object(stage5.facebook_state, "get_pending_upload",
+    mocker.patch.object(stage5.facebook_state, "find_published",
                         return_value={"project_name": "e2e-test-20260620-143000",
-                                      "status": "published", "fb_post_id": "post_abc"})
+                                      "fb_post_id": "post_abc"})
     mocker.patch("scripts.e2e_stage5_await_facebook.time.sleep")
     result = _wait_for_facebook_post("e2e-test-20260620-143000", timeout=60)
     assert result == "post_abc"
@@ -336,9 +360,7 @@ def test_wait_for_facebook_post_returns_post_id_on_success(mocker):
 def test_wait_for_facebook_post_exits_on_timeout(mocker):
     """_wait_for_facebook_post raises SystemExit (or RuntimeError) when timeout elapses."""
     import scripts.e2e_stage5_await_facebook as stage5
-    mocker.patch.object(stage5.facebook_state, "get_pending_upload",
-                        return_value={"project_name": "e2e-test-20260620-143000",
-                                      "status": "pending", "fb_post_id": None})
+    mocker.patch.object(stage5.facebook_state, "find_published", return_value=None)
     mocker.patch("scripts.e2e_stage5_await_facebook.time.sleep")
     mocker.patch("scripts.e2e_stage5_await_facebook.time.time", side_effect=[0, 0, 70])
     with pytest.raises((SystemExit, RuntimeError)):

@@ -3,7 +3,13 @@ State manager for the Facebook video upload pipeline.
 
 Manages:
   $FIELDKIT_DATA_DIR/photo-agent/facebook_state.json
-    — pending VideoUploadJob record + published idempotency keys
+    — pending VideoUploadJob record, published idempotency keys, and a capped
+      history of publish outcomes (published_history)
+
+pending_facebook_upload is always cleared (set back to null) once a job
+resolves — via mark_published() or mark_failed(), both terminal. A cron
+entrypoint must never reprocess a job it finds in this file; the resolved
+state lives in published_idempotency_keys / published_history instead.
 
 All read-modify-write operations acquire an exclusive file lock (fcntl.LOCK_EX)
 before reading and release it after writing, mirroring the pattern in state.py.
@@ -29,11 +35,13 @@ STATE_FILE = DATA_DIR / "facebook_state.json"
 __all__ = [
     "get_pending_upload",
     "set_pending_upload",
+    "clear_pending_upload",
     "mark_uploading",
     "mark_published",
     "mark_failed",
     "increment_attempt",
     "is_published",
+    "find_published",
 ]
 
 _REQUIRED_UPLOAD_KEYS = frozenset({
@@ -48,7 +56,15 @@ _REQUIRED_UPLOAD_KEYS = frozenset({
     "fb_post_id",
 })
 
-_DEFAULTS = {"pending_facebook_upload": None, "published_idempotency_keys": []}
+_DEFAULTS = {
+    "pending_facebook_upload": None,
+    "published_idempotency_keys": [],
+    "published_history": [],
+}
+
+# Cap on published_history so facebook_state.json doesn't grow without bound over a client's
+# lifetime. Only the most recent _PUBLISH_HISTORY_LIMIT publishes are kept.
+_PUBLISH_HISTORY_LIMIT = 100
 
 
 def _read(file_obj) -> dict:
@@ -117,6 +133,20 @@ def set_pending_upload(record: dict) -> None:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+def clear_pending_upload() -> None:
+    """Clear pending_facebook_upload back to null, leaving published_idempotency_keys intact."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            data["pending_facebook_upload"] = None
+            _write(f, data)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    logger.info("clear_pending_upload")
+
+
 def _update_pending(idempotency_key: str, updater) -> None:
     """Read, apply updater(record, data), then write — under exclusive lock."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -141,21 +171,44 @@ def mark_uploading(idempotency_key: str) -> None:
 
 
 def mark_published(idempotency_key: str, post_id: str) -> None:
-    """Set status=published, store post_id, and append the key to published_idempotency_keys."""
+    """Record the publish (published_idempotency_keys, published_history), then clear
+    pending_facebook_upload.
+
+    A published job is terminal: clearing pending here is what stops the cron
+    entrypoint from ever calling get_pending_upload() and finding this job again.
+    published_history preserves project_name/fb_post_id for callers (e.g. the
+    e2e test rig's find_published()) that need to observe the outcome of a
+    specific publish after the pending record is gone — a capped list rather
+    than a single last-one slot, so an unrelated publish landing in between
+    can't hide an earlier one a caller is still polling for.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
     def _update(record, data):
-        record["status"] = "published"
-        record["fb_post_id"] = post_id
         keys = data.setdefault("published_idempotency_keys", [])
         if idempotency_key not in keys:
             keys.append(idempotency_key)
+        history = data.setdefault("published_history", [])
+        history.append({
+            "project_name": record.get("project_name"),
+            "idempotency_key": idempotency_key,
+            "fb_post_id": post_id,
+            "published_at": now,
+        })
+        del history[:-_PUBLISH_HISTORY_LIMIT]
+        data["pending_facebook_upload"] = None
     _update_pending(idempotency_key, _update)
     logger.info("mark_published: key=%s post_id=%s", idempotency_key, post_id)
 
 
 def mark_failed(idempotency_key: str) -> None:
-    """Transition the pending record's status to 'failed'."""
+    """Clear pending_facebook_upload — every call site treats a failure as terminal (no further
+    retries follow it), so clearing here stops the cron entrypoint from reprocessing this job
+    forever with no backoff. Nothing needs the failed record's fields afterward, so status is
+    not written anywhere (the record itself is discarded, not persisted with status='failed').
+    """
     def _update(record, data):
-        record["status"] = "failed"
+        data["pending_facebook_upload"] = None
     _update_pending(idempotency_key, _update)
     logger.error("mark_failed: key=%s", idempotency_key)
 
@@ -169,6 +222,28 @@ def increment_attempt(idempotency_key: str) -> None:
         record["last_attempt_at"] = now
     _update_pending(idempotency_key, _update)
     logger.info("increment_attempt: key=%s", idempotency_key)
+
+
+def find_published(project_name: str) -> dict | None:
+    """Return the most recent published_history entry for project_name ({project_name,
+    idempotency_key, fb_post_id, published_at}), or None if that project has never been
+    published (within the retained history — see _PUBLISH_HISTORY_LIMIT).
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_FILE, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                data = _read(f)
+                history = data.get("published_history", [])
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return None
+    for entry in reversed(history):
+        if entry.get("project_name") == project_name:
+            return entry
+    return None
 
 
 def is_published(idempotency_key: str) -> bool:

@@ -149,13 +149,18 @@ def test_mark_uploading_preserves_other_fields(valid_record):
 
 # --- mark_published ---
 
-def test_mark_published_sets_status_and_post_id(valid_record):
-    """mark_published() sets status=published and stores fb_post_id."""
+def test_mark_published_clears_pending_upload(valid_record):
+    """mark_published() clears pending_facebook_upload back to null (issue #34 regression).
+
+    Before this fix, the pending record was never cleared after a successful
+    publish, so get_pending_upload() kept returning the same resolved job on
+    every subsequent cron tick — see test_upload_facebook.py's
+    test_reprocessing_after_publish_does_not_call_upload_video for the
+    end-to-end reprocessing-loop regression this closes.
+    """
     fb_state.set_pending_upload(valid_record)
     fb_state.mark_published(valid_record["idempotency_key"], "fb_post_999")
-    record = fb_state.get_pending_upload()
-    assert record["status"] == "published"
-    assert record["fb_post_id"] == "fb_post_999"
+    assert fb_state.get_pending_upload() is None
 
 
 def test_mark_published_adds_key_to_published_list(valid_record):
@@ -180,23 +185,76 @@ def test_mark_published_appends_to_existing_keys(valid_record):
     assert valid_record["idempotency_key"] in data["published_idempotency_keys"]
 
 
+# --- find_published ---
+
+def test_find_published_returns_none_when_nothing_published():
+    """find_published() returns None when no job has ever been published."""
+    assert fb_state.find_published("some_project") is None
+
+
+def test_find_published_returns_project_and_post_id(valid_record):
+    """find_published() reflects a mark_published() call for that project_name.
+
+    Callers that need to observe a publish's outcome (e.g. the e2e test rig's
+    Stage 5, scripts/e2e_stage5_await_facebook.py) must use this instead of
+    polling get_pending_upload(), since mark_published() clears the pending
+    record as soon as the job resolves (issue #34).
+    """
+    fb_state.set_pending_upload(valid_record)
+    fb_state.mark_published(valid_record["idempotency_key"], "fb_post_999")
+    found = fb_state.find_published(valid_record["project_name"])
+    assert found["project_name"] == valid_record["project_name"]
+    assert found["idempotency_key"] == valid_record["idempotency_key"]
+    assert found["fb_post_id"] == "fb_post_999"
+
+
+def test_find_published_ignores_a_different_projects_publish(valid_record):
+    """find_published() only matches its own project_name, not whatever published most recently.
+
+    A single overwritable 'last published' slot would let an unrelated publish landing in
+    between hide an earlier one a caller is still polling for — published_history is a capped
+    list precisely so find_published() can search by project_name instead.
+    """
+    fb_state.set_pending_upload(valid_record)
+    fb_state.mark_published(valid_record["idempotency_key"], "fb_post_first")
+
+    second_record = dict(valid_record, project_name="second_project", idempotency_key="99")
+    fb_state.set_pending_upload(second_record)
+    fb_state.mark_published("99", "fb_post_second")
+
+    found = fb_state.find_published(valid_record["project_name"])
+    assert found["fb_post_id"] == "fb_post_first"
+    assert fb_state.find_published("second_project")["fb_post_id"] == "fb_post_second"
+    assert fb_state.find_published("no_such_project") is None
+
+
+def test_mark_published_caps_published_history(valid_record):
+    """mark_published() trims published_history to _PUBLISH_HISTORY_LIMIT entries."""
+    for i in range(fb_state._PUBLISH_HISTORY_LIMIT + 5):
+        record = dict(valid_record, project_name=f"project_{i}", idempotency_key=str(i))
+        fb_state.set_pending_upload(record)
+        fb_state.mark_published(str(i), f"fb_post_{i}")
+
+    data = json.loads(fb_state.STATE_FILE.read_text())
+    assert len(data["published_history"]) == fb_state._PUBLISH_HISTORY_LIMIT
+    # oldest entries were trimmed; the most recent ones survive
+    assert fb_state.find_published("project_0") is None
+    assert fb_state.find_published(f"project_{fb_state._PUBLISH_HISTORY_LIMIT + 4}") is not None
+
+
 # --- mark_failed ---
 
-def test_mark_failed_sets_status(valid_record):
-    """mark_failed() transitions status to 'failed'."""
-    fb_state.set_pending_upload(valid_record)
-    fb_state.mark_failed(valid_record["idempotency_key"])
-    record = fb_state.get_pending_upload()
-    assert record["status"] == "failed"
+def test_mark_failed_clears_pending_upload(valid_record):
+    """mark_failed() clears pending_facebook_upload back to null (issue #34 regression).
 
-
-def test_mark_failed_preserves_attempt_count(valid_record):
-    """mark_failed() does not reset attempt_count."""
+    Every call site treats mark_failed as terminal (no further retries follow
+    it). Before this fix, a terminally-failed job kept being reprocessed by
+    the cron entrypoint forever with no backoff.
+    """
     valid_record["attempt_count"] = 2
     fb_state.set_pending_upload(valid_record)
     fb_state.mark_failed(valid_record["idempotency_key"])
-    record = fb_state.get_pending_upload()
-    assert record["attempt_count"] == 2
+    assert fb_state.get_pending_upload() is None
 
 
 # --- increment_attempt ---
