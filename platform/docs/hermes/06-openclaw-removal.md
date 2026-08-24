@@ -48,8 +48,9 @@ record of what was already done and verified, not a new verification pass.
    in full, as of this doc's original writing**: `check_approval`'s
    Hermes-vs-cron `getUpdates` race (newly tracked in issue #29) and
    `check_email`'s manual-command status (#25, unverified) remained open.
-   **`check_email`'s gap is resolved as of PR #40** — see "SC-001 — Final
-   Status" below for the update; the `check_approval` race is still open.
+   **`check_email`'s gap is addressed by PR #40 (open as of this writing;
+   closes #25 on merge)** — see "SC-001 — Final Status" below for the
+   update; the `check_approval` race is still open.
 
 ## 1. OpenClaw removed from the Mac Mini (2026-08-23)
 
@@ -188,7 +189,8 @@ purpose, not missed:
   `process-photos` and `check-approval`, #7/#8). `check_email.py`'s own
   logic no longer depends on the `openclaw` binary as of #24 — this is
   purely the manual-invocation doc/skill surface.
-  **Resolved (PR #40):** `check-email` is now a Hermes-native skill at
+  **Addressed by PR #40 (open as of this writing; closes #25 on merge):**
+  `check-email` is now a Hermes-native skill at
   `platform/email-agent/skills/check-email/SKILL.md`; the old
   OpenClaw-format `SKILL.md` is removed and `SETUP.md` describes Hermes's
   `skills.external_dirs` flow. See
@@ -246,8 +248,8 @@ surface already has an owner and a tracking issue. Under the fully literal
 reading, it was not yet met at the time of this doc's writing, and would
 not be until #25 and #26 closed.
 
-**Update:** #25's code/docs are fixed via PR #40 (closes #25 on merge) —
-`platform/email-agent/SETUP.md` and
+**Update:** #25's code/docs are addressed by PR #40 (open as of this
+writing; closes #25 on merge) — `platform/email-agent/SETUP.md` and
 `SKILL.md` (now at `platform/email-agent/skills/check-email/SKILL.md`) no
 longer reference OpenClaw as a current mechanism; see
 [`08-check-email-skill.md`](08-check-email-skill.md). Under the fully
@@ -442,7 +444,8 @@ discovery context (PR #21's review thread, 2026-08-21) and
 `05-cron-verification.md`'s own "Acceptance Criteria — Final Status" item 4.
 
 **Was unverified as of this doc's original writing, stated honestly rather
-than assumed either way — now resolved:** `check_email`'s manual
+than assumed either way — addressed by PR #40 (open as of this writing;
+closes #25 on merge):** `check_email`'s manual
 `/check_email` chat command. Issue #25 (open at the time) flagged that
 `email-agent`'s manual-command skill surface was never ported to Hermes's
 format, and stated it was "likely non-functional" — that was #25's own
@@ -452,8 +455,9 @@ either way. `check_email.py`'s cron-triggered path was unaffected either way
 the open question was specifically whether the manual, chat-driven
 `/check_email` invocation dispatches correctly under Hermes.
 
-**Resolved by PR #40 (closes issue #25 on merge):** `check-email` is now a
-Hermes-native skill at `platform/email-agent/skills/check-email/SKILL.md`,
+**Addressed by PR #40 (open as of this writing; closes #25 on merge):**
+`check-email` is now a Hermes-native skill at
+`platform/email-agent/skills/check-email/SKILL.md`,
 verified both structurally and against Hermes's real dispatch-resolution
 code (`scan_skill_commands()`, `resolve_skill_command_key()`, and
 `hermes_cli.commands._sanitize_telegram_name()`, all run against this
@@ -464,11 +468,15 @@ a live Telegram `/check_email` round-trip against the *running* gateway,
 both gated on the admin applying the `SETUP.md` `external_dirs` config
 change — not on anything this doc or #25 left undone at the code/test level.
 
-**Net: SC-001 is satisfied for the OpenClaw-dependency-elimination,
-script-execution-health, and (as of PR #40) `check_email` manual-command
-portions.** It is not yet fully satisfied — the `check_approval`
-callback-race portion has a code fix implemented in issue #29's PR but is
-not yet resolved (the second bot still needs to be registered and a real
-button tap still needs to be verified live, per `07-callback-race-fix.md`).
-That is the one remaining gap; the `check_email` manual-command question
-that was open when this doc was first written is no longer a gap.
+**Net: SC-001 is satisfied for the OpenClaw-dependency-elimination and
+script-execution-health portions.** The `check_email` manual-command
+portion is addressed by PR #40 at the code/test level, pending merge (see
+above) — not yet satisfied in the fully-merged sense, but no longer an
+open question at the code level either. Separately, SC-001 is **not yet
+fully satisfied** on the `check_approval` callback-race portion — it has a
+code fix implemented in issue #29's PR but is not yet resolved (the second
+bot still needs to be registered and a real button tap still needs to be
+verified live, per `07-callback-race-fix.md`). That remains the one open
+gap this doc did not address; the `check_email` manual-command question
+that was open when this doc was first written is handled by PR #40, pending
+that PR's merge.

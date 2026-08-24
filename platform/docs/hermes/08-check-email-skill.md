@@ -51,8 +51,12 @@ the part worth being precise about, since an earlier draft of this doc
 conflated them (flagged in #40's cross-review):**
 
 - `/check-email` is Hermes's **internal canonical command key**
-  (`agent.skill_commands`'s bookkeeping) — never typed by anyone, never
-  seen by Telegram.
+  (`agent.skill_commands`'s bookkeeping), and also a resolvable *input*
+  spelling outside Telegram — `resolve_skill_command_key("check-email")`
+  accepts it directly, as this skill's own dispatch test confirms. What it
+  is **not** is registered with or emitted by Telegram: Telegram's bot
+  command list, and what a real inbound Telegram message actually carries,
+  never contain the hyphenated form.
 - `/check_email` (underscored) is the **actual registered Telegram bot
   command** — what shows up in the bot's command list and what the admin
   actually types. `hermes_cli.commands._sanitize_telegram_name()` converts
