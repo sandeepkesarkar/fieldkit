@@ -14,12 +14,15 @@ from tools.telegram_api import (
     answer_callback_query,
     edit_message_reply_markup,
     get_updates,
+    send_message,
     send_message_with_buttons,
 )
 
 _TOKEN = "test_bot_token_123"
 _CHAT_ID = "987654321"
 _BUTTONS = [("✅ Approve", "approve"), ("❌ Reject", "reject")]
+_APPROVAL_TOKEN_ENV = "TELEGRAM_APPROVAL_BOT_TOKEN"
+_APPROVAL_TOKEN = "approval_bot_token_456"
 
 
 @pytest.fixture(autouse=True)
@@ -313,6 +316,118 @@ def test_network_error_redacts_token_from_message(monkeypatch):
         with pytest.raises(RuntimeError) as exc_info:
             send_message_with_buttons(_CHAT_ID, "text", _BUTTONS)
     assert "super_secret_token" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# token_env_var — dedicated approval-bot token (issue #29)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def approval_bot_token(monkeypatch):
+    """Set TELEGRAM_APPROVAL_BOT_TOKEN, distinct from TELEGRAM_BOT_TOKEN."""
+    monkeypatch.setenv(_APPROVAL_TOKEN_ENV, _APPROVAL_TOKEN)
+
+
+def test_send_message_default_token_env_var_unchanged():
+    """send_message() with no token_env_var still uses TELEGRAM_BOT_TOKEN."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response(True)
+        send_message(_CHAT_ID, "text")
+    url = mock_post.call_args.args[0]
+    assert _TOKEN in url
+
+
+def test_send_message_with_buttons_custom_token_env_var(approval_bot_token):
+    """send_message_with_buttons(token_env_var=...) uses that env var's token, not the default."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response({"message_id": 1})
+        send_message_with_buttons(_CHAT_ID, "text", _BUTTONS, token_env_var=_APPROVAL_TOKEN_ENV)
+    url = mock_post.call_args.args[0]
+    assert _APPROVAL_TOKEN in url
+    assert _TOKEN not in url
+
+
+def test_get_updates_custom_token_env_var(approval_bot_token):
+    """get_updates(token_env_var=...) polls using that env var's token, not the default."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _ok_response([])
+        get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)
+    url = mock_get.call_args.args[0]
+    assert _APPROVAL_TOKEN in url
+    assert _TOKEN not in url
+
+
+def test_answer_callback_query_custom_token_env_var(approval_bot_token):
+    """answer_callback_query(token_env_var=...) uses that env var's token, not the default."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response(True)
+        answer_callback_query("cq_id", token_env_var=_APPROVAL_TOKEN_ENV)
+    url = mock_post.call_args.args[0]
+    assert _APPROVAL_TOKEN in url
+    assert _TOKEN not in url
+
+
+def test_edit_message_reply_markup_custom_token_env_var(approval_bot_token):
+    """edit_message_reply_markup(token_env_var=...) uses that env var's token, not the default."""
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.return_value = _ok_response(True)
+        edit_message_reply_markup(_CHAT_ID, 42, token_env_var=_APPROVAL_TOKEN_ENV)
+    url = mock_post.call_args.args[0]
+    assert _APPROVAL_TOKEN in url
+    assert _TOKEN not in url
+
+
+def test_custom_token_env_var_missing_raises_with_that_var_name(monkeypatch):
+    """A custom token_env_var that is unset raises RuntimeError naming THAT var, not TELEGRAM_BOT_TOKEN.
+
+    TELEGRAM_BOT_TOKEN itself may be set (from the autouse fixture) — the error
+    must still name the missing approval-token var, not fall back silently.
+    """
+    monkeypatch.delenv(_APPROVAL_TOKEN_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=_APPROVAL_TOKEN_ENV):
+        get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)
+
+
+def test_custom_token_env_var_redacts_correct_token(monkeypatch):
+    """A connection failure on the approval-token path redacts the approval token,
+    not (only) the default TELEGRAM_BOT_TOKEN — the two must never be conflated."""
+    monkeypatch.setenv(_APPROVAL_TOKEN_ENV, "approval_secret_xyz")
+    with patch("tools.telegram_api.requests.post") as mock_post:
+        mock_post.side_effect = requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(host='api.telegram.org', port=443): "
+            "Max retries exceeded with url: /botapproval_secret_xyz/getUpdates"
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            answer_callback_query("cq_id", token_env_var=_APPROVAL_TOKEN_ENV)
+    assert "approval_secret_xyz" not in str(exc_info.value)
+
+
+def test_approval_token_equal_to_primary_token_raises(monkeypatch):
+    """TELEGRAM_APPROVAL_BOT_TOKEN set to the SAME value as TELEGRAM_BOT_TOKEN raises
+    immediately, before any HTTP call — an operator copying the same token into both
+    env vars would otherwise run without error while silently recreating the exact
+    shared-offset getUpdates race issue #29 exists to eliminate."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "same_token_both")
+    monkeypatch.setenv(_APPROVAL_TOKEN_ENV, "same_token_both")
+    with pytest.raises(RuntimeError, match=_APPROVAL_TOKEN_ENV):
+        get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)
+
+
+def test_approval_token_equal_to_primary_token_raises_before_any_request(monkeypatch):
+    """The equal-tokens check fires before the HTTP layer is touched at all."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "same_token_both")
+    monkeypatch.setenv(_APPROVAL_TOKEN_ENV, "same_token_both")
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        with pytest.raises(RuntimeError):
+            get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)
+    mock_get.assert_not_called()
+
+
+def test_distinct_tokens_do_not_raise(approval_bot_token):
+    """Sanity check: genuinely distinct tokens never trip the equality guard."""
+    with patch("tools.telegram_api.requests.get") as mock_get:
+        mock_get.return_value = _ok_response([])
+        get_updates(0, token_env_var=_APPROVAL_TOKEN_ENV)  # must not raise
 
 
 def test_malformed_non_dict_response_raises_runtime_error():

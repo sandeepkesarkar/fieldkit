@@ -65,6 +65,22 @@ FR-002 / FR-002a):
   events... dropped at the connector." Button taps continue to be handled
   exclusively by `check_approval.py`'s pre-existing cron leg (unchanged, FR-003)
   -- this skill covers ONLY the manual `/check_approval` command trigger.
+- **Follow-up (issue #29, fixed):** the cron leg above shared a bot token
+  with Hermes's own continuous `getUpdates` long-poll, so Hermes would
+  consume and offset-past a real button tap before the cron leg's
+  once-a-minute run ever saw it -- a guaranteed race, not a probabilistic
+  one (`python-telegram-bot`'s `Updater._start_polling` unconditionally
+  advances the shared per-token offset for every update, whether or not its
+  own handler recognized the `callback_data`). Fixed by giving the entire
+  button-callback surface -- the approval message/buttons, the getUpdates
+  poll, `answerCallbackQuery`, and the outcome notification -- a second,
+  dedicated bot token (`TELEGRAM_APPROVAL_BOT_TOKEN`), so it never shares an
+  offset with Hermes's `TELEGRAM_BOT_TOKEN` gateway poll. See
+  `platform/docs/hermes/07-callback-race-fix.md` for the full writeup;
+  patching Hermes itself (recognizing `approve`/`reject`, or excluding
+  `callback_query` from its hardcoded `allowed_updates=Update.ALL_TYPES`)
+  was considered and rejected as out of fieldkit's scope, same posture as
+  the button-callback-dispatch finding above.
 - Discovery / sync: same as process-photos -- Hermes's `skills.external_dirs`
   config points at this file's parent directory inside the fieldkit repo
   directly, no copy step.

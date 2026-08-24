@@ -390,22 +390,34 @@ health.**
 - **Repo-wide grep:** clean per §2, individually re-read and classified for
   this doc rather than citing an earlier pass.
 
-**NOT satisfied — a real, unresolved gap, not fixed by removing OpenClaw:**
-`check_approval.py`'s button-callback path. `05-cron-verification.md`
-already documented this as a confirmed (not probabilistic) `getUpdates`
-offset race between Hermes's continuous long-poll and the cron leg's
-once-a-minute poll, both against the same bot token — Hermes wins
-essentially every time, so a real button tap is very unlikely to reach the
-cron leg. Removing OpenClaw does not fix this: it only removes a *third*
-competitor for the same token: Hermes and the cron leg still both poll
-`getUpdates` against it exactly as before. **Do not read this doc's
-OpenClaw-removal work as resolving that race** — it doesn't touch it.
+**Previously NOT satisfied; code fix implemented separately in issue #29's
+PR, live verification still pending — recorded here for continuity, not
+re-verified by this doc:** `check_approval.py`'s button-callback path.
+`05-cron-verification.md` documented this as a confirmed (not probabilistic)
+`getUpdates` offset race between Hermes's continuous long-poll and the cron
+leg's once-a-minute poll, both against the same bot token — Hermes won
+essentially every time, so a real button tap was very unlikely to reach the
+cron leg. Removing OpenClaw did not fix this: it only removed a *third*
+competitor for the same token; Hermes and the cron leg still both polled
+`getUpdates` against it exactly as before. This doc's own OpenClaw-removal
+work never touched that race. Issue #29's PR gives the button-callback
+surface (approval message, polling, answering, and the outcome notification)
+a second, dedicated bot token so it no longer shares an offset with Hermes's
+gateway poll at all — but that PR ships code and docs only; it cannot
+register a live Telegram bot or edit the Mac Mini's `.env` itself. See
+[`07-callback-race-fix.md`](07-callback-race-fix.md) for the fix, the
+alternatives considered (including patching Hermes itself, rejected as
+outside fieldkit's scope, consistent with FR-002a's existing posture), the
+manual BotFather/`.env` setup step still required, and what's automatically
+tested vs. what still needs a live human button tap to confirm. Do not treat
+this gap as closed until that live tap is confirmed and `07-callback-race-fix.md`'s
+own Verification section is updated to say so.
 
-That gap's only prior tracking was inline commentary on issues #13 and #14,
-both now closed — too fragile to rely on. Opened **issue #29** to track it
-on its own, durable and currently open, referencing the original discovery
-context (PR #21's review thread, 2026-08-21) and `05-cron-verification.md`'s
-own "Acceptance Criteria — Final Status" item 4.
+That gap's only prior tracking, before #29 existed, was inline commentary on
+issues #13 and #14, both now closed — too fragile to rely on, which is why
+issue #29 was opened to track it on its own, referencing the original
+discovery context (PR #21's review thread, 2026-08-21) and
+`05-cron-verification.md`'s own "Acceptance Criteria — Final Status" item 4.
 
 **Unverified, stated honestly rather than assumed either way:**
 `check_email`'s manual `/check_email` chat command. Issue #25 (open) flags
@@ -420,7 +432,9 @@ and close, consistent with that issue's own acceptance criteria.
 
 **Net: SC-001 is satisfied for the OpenClaw-dependency-elimination and
 script-execution-health portions this doc covers. It is not fully
-satisfied** — the `check_approval` callback race (#29) and the
-`check_email` manual-command question (#25) are both real, open gaps against
-SC-001's full "no admin-visible behavior change" bar, and neither is
-resolved by anything in this PR.
+satisfied** — the `check_approval` callback-race portion has a code fix
+implemented in issue #29's PR but is not yet resolved (the second bot
+still needs to be registered and a real button tap still needs to be
+verified live, per `07-callback-race-fix.md`), and the `check_email`
+manual-command question (#25) remains a separate, real, open gap. Neither
+is resolved by anything in this doc.

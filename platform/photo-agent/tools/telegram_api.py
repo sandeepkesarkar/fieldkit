@@ -5,7 +5,13 @@ Handles every Telegram operation the photo-agent scripts need: plain-text
 messages, inline keyboards (reply_markup), callback dismissal, and update
 polling.
 
-Bot token is read from TELEGRAM_BOT_TOKEN in the environment.
+Bot token is read from TELEGRAM_BOT_TOKEN in the environment by default.
+Every function accepts an optional token_env_var to read a different bot
+token instead — used by check_approval.py's button-callback flow to poll a
+second, dedicated bot (TELEGRAM_APPROVAL_BOT_TOKEN) so its getUpdates offset
+never shares a token with Hermes's own continuous long-poll (issue #29: the
+two would otherwise race for the same offset, and Hermes wins every time).
+
 All functions raise RuntimeError on HTTP error, network failure, or
 non-OK Telegram response.
 
@@ -23,25 +29,41 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-def _token() -> str:
-    """Return the bot token from the environment. Raises RuntimeError if unset."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+def _token(token_env_var: str = "TELEGRAM_BOT_TOKEN") -> str:
+    """Return the bot token from the environment. Raises RuntimeError if unset.
+
+    Also raises RuntimeError if a non-default token_env_var (e.g.
+    TELEGRAM_APPROVAL_BOT_TOKEN) resolves to the same value as
+    TELEGRAM_BOT_TOKEN. Issue #29's fix depends on the two bot roles never
+    sharing a token — an operator copying the same value into both env vars
+    would otherwise run without error while silently recreating the exact
+    shared-offset getUpdates race the token split exists to eliminate.
+    """
+    token = os.environ.get(token_env_var, "")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+        raise RuntimeError(f"{token_env_var} is not set")
+    if token_env_var != "TELEGRAM_BOT_TOKEN":
+        primary = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if primary and token == primary:
+            raise RuntimeError(
+                f"{token_env_var} must not be set to the same value as TELEGRAM_BOT_TOKEN "
+                "— they must be two different bot registrations, or Hermes's gateway and "
+                "this poll will share a getUpdates offset again (issue #29)"
+            )
     return token
 
 
-def _url(method: str) -> str:
-    return f"https://api.telegram.org/bot{_token()}/{method}"
+def _url(method: str, token_env_var: str = "TELEGRAM_BOT_TOKEN") -> str:
+    return f"https://api.telegram.org/bot{_token(token_env_var)}/{method}"
 
 
-def _redact_token(text: str) -> str:
+def _redact_token(text: str, token_env_var: str = "TELEGRAM_BOT_TOKEN") -> str:
     """Strip the bot token out of a message before it is raised or logged.
 
     requests exceptions on connection failures embed the full request URL
     (including /bot<TOKEN>/...) in their string representation.
     """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token = os.environ.get(token_env_var, "")
     return text.replace(token, "***REDACTED***") if token else text
 
 
@@ -63,19 +85,19 @@ def _check(response: requests.Response) -> dict:
     return data
 
 
-def send_message(chat_id: str, text: str) -> None:
+def send_message(chat_id: str, text: str, token_env_var: str = "TELEGRAM_BOT_TOKEN") -> None:
     """Send a plain-text message to chat_id. Raises RuntimeError on failure."""
     if not chat_id:
         raise RuntimeError("send_message: chat_id must not be empty")
     logger.debug("send_message: sending")
     try:
         response = requests.post(
-            _url("sendMessage"),
+            _url("sendMessage", token_env_var),
             json={"chat_id": chat_id, "text": text},
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc))}") from exc
+        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc), token_env_var)}") from exc
     _check(response)
     logger.debug("send_message: ok")
 
@@ -85,6 +107,7 @@ def send_message_with_buttons(
     text: str,
     buttons: list[tuple[str, str]],
     parse_mode: str | None = None,
+    token_env_var: str = "TELEGRAM_BOT_TOKEN",
 ) -> int:
     """Send a message with an inline keyboard. Returns the Telegram message_id.
 
@@ -104,12 +127,12 @@ def send_message_with_buttons(
     logger.debug("send_message_with_buttons: sending")
     try:
         response = requests.post(
-            _url("sendMessage"),
+            _url("sendMessage", token_env_var),
             json=payload,
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc))}") from exc
+        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc), token_env_var)}") from exc
     data = _check(response)
     try:
         message_id: int = data["result"]["message_id"]
@@ -119,7 +142,9 @@ def send_message_with_buttons(
     return message_id
 
 
-def answer_callback_query(callback_query_id: str, text: str = "") -> None:
+def answer_callback_query(
+    callback_query_id: str, text: str = "", token_env_var: str = "TELEGRAM_BOT_TOKEN"
+) -> None:
     """Dismiss the spinner on the admin's button tap.
 
     If text is given (max ~200 chars), Telegram shows a brief toast notification
@@ -130,14 +155,16 @@ def answer_callback_query(callback_query_id: str, text: str = "") -> None:
     if text:
         payload["text"] = text
     try:
-        response = requests.post(_url("answerCallbackQuery"), json=payload, timeout=10)
+        response = requests.post(_url("answerCallbackQuery", token_env_var), json=payload, timeout=10)
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc))}") from exc
+        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc), token_env_var)}") from exc
     _check(response)
     logger.debug("answer_callback_query: ok")
 
 
-def edit_message_reply_markup(chat_id: str, message_id: int) -> None:
+def edit_message_reply_markup(
+    chat_id: str, message_id: int, token_env_var: str = "TELEGRAM_BOT_TOKEN"
+) -> None:
     """Remove all inline keyboard buttons from a message.
 
     Called immediately after a button tap to prevent the admin from tapping again
@@ -147,17 +174,17 @@ def edit_message_reply_markup(chat_id: str, message_id: int) -> None:
     logger.debug("edit_message_reply_markup: message_id=%d", message_id)
     try:
         response = requests.post(
-            _url("editMessageReplyMarkup"),
+            _url("editMessageReplyMarkup", token_env_var),
             json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc))}") from exc
+        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc), token_env_var)}") from exc
     _check(response)
     logger.debug("edit_message_reply_markup: ok")
 
 
-def get_updates(offset: int) -> list[dict]:
+def get_updates(offset: int, token_env_var: str = "TELEGRAM_BOT_TOKEN") -> list[dict]:
     """Poll getUpdates with the given offset. Returns the raw list of update objects.
 
     The Telegram timeout param is fixed at 0 (return immediately). The requests
@@ -167,12 +194,12 @@ def get_updates(offset: int) -> list[dict]:
     logger.debug("get_updates: offset=%d", offset)
     try:
         response = requests.get(
-            _url("getUpdates"),
+            _url("getUpdates", token_env_var),
             params={"offset": offset, "timeout": 0},
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc))}") from exc
+        raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc), token_env_var)}") from exc
     data = _check(response)
     updates: list[dict] = data.get("result", [])
     logger.info("get_updates: offset=%d count=%d", offset, len(updates))

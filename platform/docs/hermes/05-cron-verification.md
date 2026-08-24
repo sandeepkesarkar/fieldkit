@@ -327,22 +327,32 @@ them):
    *introduced* by this migration, but the literal criterion ("no runtime
    dependency on OpenClaw") is not satisfied by the current state of the
    code, and shouldn't be marked as passed.
-4. **`check_approval.py`'s button-callback role, under SC-001.** ❌ **Not
-   met. Deferred to #14.** There is a known, previously-confirmed (not
-   probabilistic — deterministic given `python-telegram-bot`'s
-   `Updater._start_polling` behavior) offset-consumption race: Hermes's
-   continuous `getUpdates` long-poll on the shared bot token will consume
-   and advance past a real button-tap callback before the cron leg's
-   once-a-minute poll sees it, essentially every time. This is not a
-   theoretical edge case that might occur under contention — it is the
-   default outcome of running Hermes's gateway and the cron leg
-   simultaneously against the same token, and it will reproduce on the next
-   real button tap. Full source-level detail:
-   [`04-check-approval-skill.md`](04-check-approval-skill.md) ("Known
-   follow-up risk") and `spec.md` FR-002a. Fixing this is explicitly #14's
-   scope, not this issue's; recording it as "not verified" (as PR #22 did)
-   understated it — it should be recorded as a known-failing, deferred
-   criterion, since the race is confirmed, not merely unverified.
+4. **`check_approval.py`'s button-callback role, under SC-001.** ⚠️ **Fix
+   implemented in code (issue #29); pending live verification, see
+   [`07-callback-race-fix.md`](07-callback-race-fix.md).** There is a known,
+   previously-confirmed (not probabilistic — deterministic given
+   `python-telegram-bot`'s `Updater._start_polling` behavior)
+   offset-consumption race: Hermes's continuous `getUpdates` long-poll on
+   the shared bot token would consume and advance past a real button-tap
+   callback before the cron leg's once-a-minute poll saw it, essentially
+   every time. That was not a theoretical edge case that might occur under
+   contention — it was the default outcome of running Hermes's gateway and
+   the cron leg simultaneously against the same token. Fixing this was
+   explicitly out of scope for #13/#14 (both closed without touching it;
+   tracked forward as #29) and is **not** fixed by OpenClaw's removal (see
+   `06-openclaw-removal.md`'s SC-001 section) — only by giving the
+   button-callback surface its own dedicated bot token, implemented in #29's
+   PR. **Not yet marked resolved:** the second bot has not yet been
+   registered via BotFather, the live `.env` on the Mac Mini has not been
+   updated with `TELEGRAM_APPROVAL_BOT_TOKEN`, and no human has confirmed a
+   real button tap while both Hermes and the cron leg are running
+   simultaneously — `07-callback-race-fix.md`'s "Setup step" and
+   "Verification" sections spell out exactly what's still outstanding. This
+   item should be updated to ✅ only after that live check actually happens.
+   Full source-level detail: [`04-check-approval-skill.md`](04-check-approval-skill.md)
+   ("Known follow-up risk"), `spec.md` FR-002a, and `07-callback-race-fix.md`
+   for the fix itself, the options considered, and what's automatically
+   tested vs. what still needs a live human tap to confirm.
 
 Neither OpenClaw nor `launchd` was touched during this or the original
 verification session. `launchctl list` still shows both gateways loaded:

@@ -41,6 +41,7 @@ _VALID_ENV = {
     "FB_PAGE_ID": "123456789",
     "DRIVE_ROOT_FOLDER_ID": "root_folder",
     "TELEGRAM_BOT_TOKEN": "bot_token",
+    "TELEGRAM_APPROVAL_BOT_TOKEN": "approval_bot_token",
     "ADMIN_TELEGRAM_CHAT_ID": "chat_id",
 }
 
