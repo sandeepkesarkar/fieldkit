@@ -104,9 +104,9 @@
 ## Constraints & Assumptions
 
 **Constraints:**
-- Runs on a Mac Mini (on-premise, transferred to client after completion)
+- [Deployment/runtime environment for this feature]
 - Must operate within daily AI budget limit
-- No cloud storage — all data stays on Mac Mini
+- [Data storage/residency requirements]
 - [Feature-specific constraints]
 
 **Assumptions:**
