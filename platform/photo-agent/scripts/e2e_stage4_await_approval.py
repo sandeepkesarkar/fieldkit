@@ -4,6 +4,12 @@ e2e_stage4_await_approval.py — E2E Stage 4: Wait for Telegram approval.
 Polls state.json and facebook_state.json until check_approval.py has cleared
 the pending_approval and enqueued a Facebook upload for this test run.
 
+A pending enqueue (facebook_state.get_pending_upload()) is one success signal,
+but not the only one: upload_facebook.py's cron leg can race ahead and publish
+the job — clearing pending_facebook_upload (issue #34) — before this poll ever
+samples the brief window it was pending in. facebook_state.find_published() is
+checked as a second, equally-valid success signal for exactly that race.
+
 Tap Approve in Telegram while this script is polling. If not using cron,
 run check_approval.py in another terminal to process the approval.
 
@@ -38,16 +44,20 @@ _POLL_INTERVAL = 10
 
 
 def _wait_for_approval(test_name: str, timeout: int) -> None:
-    """Poll until pending_approval is cleared and a matching FB upload is enqueued.
+    """Poll until pending_approval is cleared and a matching FB upload is enqueued (or has
+    already resolved — see module docstring).
 
     Raises SystemExit on timeout.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         pending = state.get_pending_approval()
-        fb = facebook_state.get_pending_upload()
-        if pending is None and fb is not None and fb.get("project_name") == test_name:
-            return
+        if pending is None:
+            fb = facebook_state.get_pending_upload()
+            if fb is not None and fb.get("project_name") == test_name:
+                return
+            if facebook_state.find_published(test_name) is not None:
+                return
         time.sleep(_POLL_INTERVAL)
     raise SystemExit(f"Stage 4 timed out after {timeout}s waiting for approval of {test_name}")
 
