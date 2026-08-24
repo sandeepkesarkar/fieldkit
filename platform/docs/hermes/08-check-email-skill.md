@@ -44,32 +44,72 @@ already required for their own first install.
 Named `check-email` (hyphenated) from the start — no rename step, same
 posture #8 took for `check-approval`. Verified empirically against this
 machine's real Hermes install (`~/.hermes/hermes-agent`), not assumed by
-analogy to #7/#8's finding:
+analogy to #7/#8's finding.
+
+**Two different names are in play here, at two different layers — this is
+the part worth being precise about, since an earlier draft of this doc
+conflated them (flagged in #40's cross-review):**
+
+- `/check-email` is Hermes's **internal canonical command key**
+  (`agent.skill_commands`'s bookkeeping) — never typed by anyone, never
+  seen by Telegram.
+- `/check_email` (underscored) is the **actual registered Telegram bot
+  command** — what shows up in the bot's command list and what the admin
+  actually types. `hermes_cli.commands._sanitize_telegram_name()` converts
+  the internal hyphenated key back to this underscored form at
+  *registration* time, specifically because Telegram itself restricts bot
+  command names to `[a-z0-9_]` (no hyphens allowed).
+
+So the fact that `resolve_skill_command_key('check_email')` *also* resolves
+to `/check-email` below is a separate, earlier step: it's Hermes's lookup
+resolver treating hyphens/underscores as interchangeable when mapping any
+typed form back to the internal key. It is not evidence of what the
+registered Telegram command looks like — that's `_sanitize_telegram_name`'s
+job, checked separately below. Both steps land on the same practical
+outcome #7/#8 established (the admin's `/check_email` muscle memory is
+unaffected), but they are two different functions solving two different
+problems, not one.
+
+Captured on this issue's worktree (`.worktrees/issue-25-check-email-skill`),
+with `skills.external_dirs` in the probe's own patch pointed at that
+worktree's `skills/` directory rather than the real `~/.hermes/config.yaml`
+— the skill isn't merged to `main` yet, same technique #18's doc used for
+`process-photos`:
 
 ```
 $ ~/.hermes/hermes-agent/venv/bin/python -c "
 from pathlib import Path
 from unittest.mock import patch
 from agent import skill_commands, skill_utils
+from hermes_cli.commands import _sanitize_telegram_name
 
-skills_dir = Path('~/src/fieldkit/platform/email-agent/skills')
+skills_dir = Path('~/src/fieldkit/.worktrees/issue-25-check-email-skill/platform/email-agent/skills').expanduser()
 with patch.object(skill_utils, 'get_external_skills_dirs', return_value=[skills_dir]):
     commands = skill_commands.scan_skill_commands()
     print(commands['/check-email']['skill_md_path'])
     print(skill_commands.resolve_skill_command_key('check_email'))
     print(skill_commands.resolve_skill_command_key('check-email'))
+print(_sanitize_telegram_name('check-email'))
 "
-/Users/.../platform/email-agent/skills/check-email/SKILL.md
+/Users/sandeep_a_k/src/fieldkit/.worktrees/issue-25-check-email-skill/platform/email-agent/skills/check-email/SKILL.md
 /check-email
 /check-email
+check_email
 ```
 
-Both the underscored and hyphenated forms resolve to the same
-`/check-email` command key, scanned from this skill's actual `SKILL.md` —
-reproduced automatically by `test_check_email_dispatch.py`. The
-Telegram-facing command the admin types stays `/check_email` (Telegram's own
-underscore-only restriction on bot command names, unaffected by the
-frontmatter's hyphenated spelling).
+Reading this bottom-to-top against the two-layer explanation above: the
+first three lines are the internal-key layer (`scan_skill_commands()` finds
+this exact file and registers it as `/check-email`; both the underscored and
+hyphenated *input* forms resolve back to that same internal key). The final
+line, `check_email`, is `_sanitize_telegram_name`'s output — the layer that
+actually determines the Telegram-registered command, confirming it comes out
+underscored as expected. The internal-key resolution is reproduced
+automatically by `test_check_email_dispatch.py`; the `_sanitize_telegram_name`
+call is reproduced automatically by
+`test_sanitize_telegram_name_converts_the_internal_key_to_the_registered_command`
+in the same file (added after this
+review round specifically to cover this boundary directly, rather than only
+by inference from #7/#8's precedent).
 
 ## OpenClaw → Hermes mapping
 
@@ -113,19 +153,28 @@ check:
   fields, prerequisites, verbatim-relay and no-improvisation instructions
   present, the old top-level `SKILL.md` is actually gone).
 - `platform/email-agent/tests/test_check_email_dispatch.py` — real
-  dispatch-path coverage. Runs Hermes's own `scan_skill_commands()` /
-  `resolve_skill_command_key()` (imported from the local Hermes install,
-  executed via Hermes's own venv interpreter) against this skill's actual
-  files, confirming Hermes discovers this exact file, registers it under
-  `/check-email`, and resolves both the Telegram-sanitized `/check_email`
-  form and `/check-email` back to it. No LLM call — deterministic and fast.
-  Skipped automatically where Hermes isn't installed.
+  dispatch-path coverage, covering both layers described in "Naming" above
+  separately rather than conflating them:
+  - `scan_skill_commands()` / `resolve_skill_command_key()` (imported from
+    the local Hermes install, executed via Hermes's own venv interpreter)
+    against this skill's actual files, confirming Hermes discovers this
+    exact file and registers it under the internal key `/check-email`, and
+    that both `check_email` and `check-email` as *input* resolve back to
+    that same internal key.
+  - `hermes_cli.commands._sanitize_telegram_name('check-email') ==
+    'check_email'` directly, confirming what the actually-registered
+    Telegram bot command comes out as — the boundary the two functions
+    above don't by themselves prove, added after #40's cross-review flagged
+    the earlier draft of this doc for conflating the two.
+  No LLM call — deterministic and fast. Skipped automatically where Hermes
+  isn't installed.
 - Manual verification (below).
 
-- [x] Dispatch-resolution probe (above) run directly against this machine's
-  real Hermes install and this skill's actual files — passed.
+- [x] Dispatch-resolution and Telegram-sanitization probes (above) run
+  directly against this machine's real Hermes install and this skill's
+  actual files — passed.
 - [x] `test_check_email_dispatch.py` passes locally against the same
-  install (13/13 tests green across both new test files).
+  install (14/14 tests green across both new test files).
 - [ ] `hermes skills list --source local` against the *running* gateway —
   **not captured this pass**. Requires the `external_dirs` config addition
   documented above and a `hermes gateway restart`, which per #8's precedent

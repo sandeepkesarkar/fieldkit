@@ -18,6 +18,23 @@ messages with callback_data -- so there is no negative-path probe needed
 here, only the manual-command positive path (the same shape as
 process-photos's dispatch test).
 
+This module covers two distinct layers -- conflating them is what prompted
+a cross-review round on #40 against an earlier draft of the accompanying
+doc (platform/docs/hermes/08-check-email-skill.md), so they are tested
+(and named) separately here:
+
+1. `scan_skill_commands()` / `resolve_skill_command_key()` -- Hermes's
+   internal bookkeeping. `/check-email` is the internal canonical command
+   key; `resolve_skill_command_key` treats a `check_email`/`check-email`
+   *input* as interchangeable when mapping it back to that key. Neither of
+   these ever touches Telegram.
+2. `hermes_cli.commands._sanitize_telegram_name()` -- the function that
+   actually determines the registered Telegram bot command (converting the
+   internal hyphenated key back to Telegram's required underscored form,
+   since Telegram restricts bot command names to `[a-z0-9_]`). This is the
+   only one of the two layers that says anything about what the admin
+   actually sees/types in Telegram.
+
 The probe runs under Hermes's own venv interpreter
 (~/.hermes/hermes-agent/venv/bin/python), not fieldkit's -- see
 test_process_photos_dispatch.py's module docstring for the full rationale
@@ -82,6 +99,13 @@ print(json.dumps({
 }))
 """
 
+# Layer 2 (see module docstring): what Hermes actually registers as the
+# Telegram bot command, independent of the internal-key resolution above.
+_TELEGRAM_NAME_PROBE = """
+from hermes_cli.commands import _sanitize_telegram_name
+print(_sanitize_telegram_name("check-email"))
+"""
+
 
 @pytest.fixture(scope="module")
 def dispatch_result():
@@ -99,6 +123,24 @@ def dispatch_result():
         f"stdout={proc.stdout}\nstderr={proc.stderr}"
     )
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture(scope="module")
+def telegram_command_name():
+    """Run Hermes's real _sanitize_telegram_name() once and cache the
+    registered Telegram command name it produces for this skill."""
+    proc = subprocess.run(
+        [str(_HERMES_VENV_PYTHON), "-c", _TELEGRAM_NAME_PROBE],
+        capture_output=True,
+        text=True,
+        cwd=str(_HERMES_AGENT_DIR),
+        timeout=30,
+    )
+    assert proc.returncode == 0, (
+        f"Hermes Telegram-name probe failed (exit {proc.returncode}):\n"
+        f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    )
+    return proc.stdout.strip()
 
 
 def _frontmatter_name() -> str:
@@ -120,13 +162,15 @@ def test_hermes_registers_the_skill_under_the_expected_command_key(dispatch_resu
     assert dispatch_result["skill_md_paths"]["/check-email"] == str(_SKILL_MD)
 
 
-def test_hermes_resolves_the_telegram_form_of_the_command(dispatch_result):
-    """Telegram sanitizes hyphens to underscores when it registers the bot
-    command (hermes_cli.commands._sanitize_telegram_name), so `/check_email`
-    -- not `/check-email` -- is what actually arrives at the gateway from a
-    real Telegram message. Confirm Hermes's own resolver
-    (agent.skill_commands.resolve_skill_command_key) still routes that
-    underscored form to this skill."""
+def test_hermes_resolves_the_underscored_input_form_to_the_same_internal_key(dispatch_result):
+    """Layer 1 (see module docstring): agent.skill_commands.resolve_skill_command_key
+    treats a `check_email`/`check-email` *input* as interchangeable, both
+    mapping back to the same internal canonical key `/check-email`. This is
+    Hermes's internal lookup bookkeeping -- it does NOT by itself say
+    anything about what Telegram registers as the actual bot command; that
+    is verified separately by test_sanitize_telegram_name_converts_the_internal_key_to_the_registered_command
+    below (Layer 2), since an earlier draft conflated the two (#40
+    cross-review)."""
     assert dispatch_result["resolved_underscore"] == "/check-email"
     assert dispatch_result["resolved_hyphen"] == "/check-email"
 
@@ -136,3 +180,19 @@ def test_frontmatter_name_is_the_source_of_the_registered_command(dispatch_resul
     actually this file's own frontmatter `name`, not a coincidence of the
     directory name."""
     assert dispatch_result["names"]["/check-email"] == _frontmatter_name()
+
+
+def test_sanitize_telegram_name_converts_the_internal_key_to_the_registered_command(
+    telegram_command_name,
+):
+    """Layer 2 (see module docstring): hermes_cli.commands._sanitize_telegram_name
+    is what actually determines the Telegram-registered bot command --
+    converting the internal hyphenated key `check-email` back to the
+    underscored `check_email` Telegram requires (bot command names are
+    restricted to `[a-z0-9_]`, no hyphens). This is the boundary
+    test_hermes_resolves_the_underscored_input_form_to_the_same_internal_key
+    above does NOT cover -- that test only shows Hermes's internal resolver
+    treats both spellings as equivalent *input*, not what gets registered
+    with Telegram. Added directly in response to #40's cross-review, which
+    flagged the accompanying doc for conflating the two."""
+    assert telegram_command_name == "check_email"
