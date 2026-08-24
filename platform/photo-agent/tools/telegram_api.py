@@ -3,7 +3,7 @@ Telegram Bot API wrapper for the photo-video agent.
 
 Handles every Telegram operation the photo-agent scripts need: plain-text
 messages, inline keyboards (reply_markup), callback dismissal, and update
-polling.
+polling (optionally long-polling, via get_updates' `timeout` — see issue #31).
 
 Bot token is read from TELEGRAM_BOT_TOKEN in the environment by default.
 Every function accepts an optional token_env_var to read a different bot
@@ -184,23 +184,29 @@ def edit_message_reply_markup(
     logger.debug("edit_message_reply_markup: ok")
 
 
-def get_updates(offset: int, token_env_var: str = "TELEGRAM_BOT_TOKEN") -> list[dict]:
+def get_updates(offset: int, token_env_var: str = "TELEGRAM_BOT_TOKEN", timeout: int = 0) -> list[dict]:
     """Poll getUpdates with the given offset. Returns the raw list of update objects.
 
-    The Telegram timeout param is fixed at 0 (return immediately). The requests
-    socket timeout (10 s) must exceed the Telegram timeout param to avoid a
-    spurious Timeout exception.
+    timeout is the Telegram long-poll duration in seconds: Telegram holds the
+    connection open and returns as soon as an update is available, or after
+    `timeout` seconds if none arrives. Defaults to 0 (return immediately with
+    whatever is already queued), which preserves the historical behaviour for
+    any caller that doesn't pass it.
+
+    The requests socket timeout is always `timeout + 10`, so it comfortably
+    exceeds the Telegram-side timeout param and a legitimate long poll is
+    never mistaken for a network failure.
     """
-    logger.debug("get_updates: offset=%d", offset)
+    logger.debug("get_updates: offset=%d timeout=%d", offset, timeout)
     try:
         response = requests.get(
             _url("getUpdates", token_env_var),
-            params={"offset": offset, "timeout": 0},
-            timeout=10,
+            params={"offset": offset, "timeout": timeout},
+            timeout=timeout + 10,
         )
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"Telegram request failed: {_redact_token(str(exc), token_env_var)}") from exc
     data = _check(response)
     updates: list[dict] = data.get("result", [])
-    logger.info("get_updates: offset=%d count=%d", offset, len(updates))
+    logger.info("get_updates: offset=%d timeout=%d count=%d", offset, timeout, len(updates))
     return updates

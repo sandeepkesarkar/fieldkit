@@ -27,6 +27,19 @@ the same update stream. Plain-text admin notifications (_notify_admin) also
 use the approval bot token so the whole approve/reject interaction — button,
 tap acknowledgement, and outcome message — stays in one Telegram
 conversation, separate from Hermes's own bot conversation.
+
+Fast-ack / long-poll fix (issue #31): a callback_query's freshness window
+(~15s, Telegram-side) is far shorter than cron's once-a-minute cadence. The
+cron leg's getUpdates call already answered a matched callback before any
+approve/reject processing (see _LONG_POLL_TIMEOUT_SECONDS below and the
+answer_callback_query call in _run) — but with a plain instant poll
+(timeout=0), a tap landing between two cron ticks could sit queued for up to
+~60s before this leg ever saw it, already stale by the time it was observed.
+getUpdates now long-polls for up to _LONG_POLL_TIMEOUT_SECONDS: Telegram
+holds the connection open and delivers the tap the moment it happens, so
+answer_callback_query fires within a fraction of a second of the tap for any
+tap landing while the poll is open, instead of waiting for the next minute
+boundary.
 """
 
 import argparse
@@ -64,6 +77,13 @@ _REPO_ROOT = Path(__file__).parents[3]
 # Dedicated bot token for the entire button-callback surface (issue #29) —
 # never the same token as Hermes's TELEGRAM_BOT_TOKEN gateway poll.
 _APPROVAL_TOKEN_ENV = "TELEGRAM_APPROVAL_BOT_TOKEN"
+
+# Telegram long-poll duration (seconds) for the cron leg's getUpdates call
+# (issue #31). Telegram's own recommended ceiling for a single getUpdates
+# long-poll is ~50s; kept a little under both that and cron's 60s cadence so
+# this invocation's poll has normally finished (or been serviced) before the
+# next cron tick fires and finds the check_approval.lock still held.
+_LONG_POLL_TIMEOUT_SECONDS = 45
 
 
 def _try_acquire_check_lock() -> "IO | None":
@@ -350,7 +370,9 @@ def _run(args) -> None:
         offset = state.get_telegram_offset()
 
         try:
-            updates = telegram_api.get_updates(offset, token_env_var=_APPROVAL_TOKEN_ENV)
+            updates = telegram_api.get_updates(
+                offset, token_env_var=_APPROVAL_TOKEN_ENV, timeout=_LONG_POLL_TIMEOUT_SECONDS
+            )
         except RuntimeError as exc:
             _log.error("get_updates failed — retrying on next run: %s", exc)
             return
