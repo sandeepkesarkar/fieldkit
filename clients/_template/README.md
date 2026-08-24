@@ -5,7 +5,7 @@
 **Location:** [City, State]
 **Status:** 📝 [Current phase]
 **Deployment:** Mac Mini (on-premise, transferred to client after completion)
-**AI Provider:** OpenClaw (self-hosted)
+**AI Provider:** Hermes (self-hosted)
 
 ---
 
