@@ -12,7 +12,7 @@
 
 - ALL metadata (GPS, timestamps, camera info, faces) stripped from media before any output
 - No customer-identifying information (addresses, license plates, names) in published content
-- Customer data storage ownership model is being redefined by the Mac Mini → Cloud pivot (see `platform/.specify/003-hermes-runtime/spec.md`) — the pre-pivot "Mac-Mini-only, never uploaded to external cloud storage" guarantee no longer holds as stated; the replacement model is not yet finalized
+- Customer data storage ownership model is being redefined by the Mac Mini → Cloud pivot (see `platform/.specify/003-hermes-runtime/spec.md`) — the pre-pivot "Mac-Mini-only, never uploaded to external cloud storage" guarantee no longer holds as stated; W3 will define the replacement model
 - Consent must be established before using any customer data or photos
 
 ### Gate 2 — Human-in-the-Loop
@@ -32,7 +32,7 @@
 ### Gate 4 — Client Ownership
 
 - All code and data owned by the client — no proprietary lock-in
-- Hardware/deployment ownership model is being redefined by the Mac Mini → Cloud pivot (see `platform/.specify/003-hermes-runtime/spec.md`) — the replacement for "Mac Mini hardware transferred to client upon project completion" is not yet finalized
+- Hardware/deployment ownership model is being redefined by the Mac Mini → Cloud pivot (see `platform/.specify/003-hermes-runtime/spec.md`) — the replacement for "Mac Mini hardware transferred to client upon project completion" is not yet finalized; W3 will define the replacement ownership/deployment model
 - Full test suite included in client handoff
 - System continues operating after FieldKit engagement ends
 
@@ -60,7 +60,7 @@ When conflicts arise, resolve in this order:
 
 ## Architecture Constraints
 
-- **Runtime:** Hermes Agent (self-hosted supervisor process on Mac Mini)
+- **Runtime:** Hermes Agent (self-hosted on Mac Mini; see dev-infrastructure plan-of-record for the cloud roadmap)
 - **Platform:** macOS (Mac Mini M-series), Python 3.11+
 - **Testing:** pytest + pytest-mock
 - **Model routing:** cloud inference via Anthropic (default) or OpenAI (explicit per-client choice) — the earlier "no cloud AI inference, all LLM work runs locally" constraint no longer holds
@@ -84,4 +84,4 @@ Every feature must produce all of the following before implementation starts:
 
 ---
 
-**Version:** 1.1 | **Ratified:** 2026-05-20 | **Amended:** 2026-08-23 (issue #9 — Architecture Constraints updated for the Hermes runtime and the Mac Mini → Cloud pivot; see `platform/.specify/003-hermes-runtime/spec.md`) | **Framework:** FieldKit
+**Version:** 1.2 | **Ratified:** 2026-05-20 | **Amended:** 2026-08-24 (issue #9 — Architecture Constraints corrected to match full acceptance criteria: Runtime now references the dev-infrastructure plan-of-record for the cloud roadmap, and Gates 1/4 note that W3 will define the replacement ownership/deployment model; see `platform/.specify/003-hermes-runtime/spec.md`) | **Framework:** FieldKit
