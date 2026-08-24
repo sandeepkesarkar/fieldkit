@@ -8,14 +8,25 @@ Usage:
 Reads the pending VideoUploadJob from facebook_state.json, uploads the video
 to the linked Facebook Page via Graph API, and sends a Telegram confirmation.
 
+Cron re-entrancy lock (issue #34 follow-up): upload_facebook.lock, acquired
+non-blocking and held for the ENTIRE duration of processing a claimed job —
+mirrors check_approval.py's _try_acquire_check_lock. This is the actual
+guarantee against two overlapping cron invocations both calling the Facebook
+API for the same job: a lease-timeout-based reclaim alone (see
+claim_pending_upload()) cannot distinguish a crashed holder from a merely
+slow-but-still-live one — flock is what can, since the OS releases it
+automatically on process death but never on a process that's simply still
+running. A second invocation that can't acquire this lock exits immediately,
+before ever touching facebook_state.
+
 Retry and failure-recovery logic (US3):
   - Claiming (tools/facebook_state.py's claim_pending_upload()) is a single
     atomic exclusive-lock transaction that checks staleness, cooldown, and the
     attempt budget, and transitions the job to 'uploading' — all before this
-    script ever calls the Facebook API. That atomicity is what stops two
-    overlapping cron invocations (e.g. a slow upload still running when the
-    next minute's tick starts) from both claiming the same job and both
-    posting a real duplicate (issue #34 follow-up).
+    script ever calls the Facebook API. Combined with the re-entrancy lock
+    above, this is what stops two overlapping cron invocations (e.g. a slow
+    upload still running when the next minute's tick starts) from both
+    claiming the same job and both posting a real duplicate (issue #34).
   - attempt_count/last_attempt_at are persisted by the claim itself, BEFORE
     the Facebook API call — not only after a failure — so a process killed
     mid-upload still leaves a bounded, cooldown-gated trail instead of being
@@ -37,6 +48,7 @@ FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
 
 import argparse
+import fcntl
 import logging
 import os
 import sys
@@ -68,6 +80,29 @@ _COOLDOWN_SECONDS = 60
 # See claim_pending_upload()'s docstring for the full tradeoff.
 _UPLOAD_LEASE_SECONDS = 900
 _REPO_ROOT = Path(__file__).parents[3]
+
+
+def _try_acquire_upload_lock() -> "IO | None":
+    """Try to acquire upload_facebook.lock exclusively (non-blocking).
+
+    Mirrors check_approval.py's _try_acquire_check_lock: this is the actual mutual-exclusion
+    guarantee for a claimed job's ENTIRE processing (claim through mark_published/mark_failed/
+    release_claim), not just the state-file transitions in between — see the module docstring
+    for why the lease-timeout reclaim in claim_pending_upload() cannot substitute for this.
+
+    Returns the open lock file object on success, or None if another upload_facebook instance
+    is already running. The caller must close the returned file object to release the lock.
+    """
+    data_dir = Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / "upload_facebook.lock"
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
 
 
 def _get_tmp_root() -> Path:
@@ -123,12 +158,20 @@ def main(argv=None) -> None:
         _log.error("FB_PAGE_ACCESS_TOKEN and FB_PAGE_ID are required")
         sys.exit(1)
 
-    record = facebook_state.get_pending_upload()
-    if record is None:
-        _log.debug("no pending facebook upload — exiting")
+    lock_f = _try_acquire_upload_lock()
+    if lock_f is None:
+        _log.debug("another upload_facebook instance is running — exiting")
         return
+    try:
+        record = facebook_state.get_pending_upload()
+        if record is None:
+            _log.debug("no pending facebook upload — exiting")
+            return
 
-    _process_upload(record, page_token, page_id, chat_id)
+        _process_upload(record, page_token, page_id, chat_id)
+    finally:
+        fcntl.flock(lock_f, fcntl.LOCK_UN)
+        lock_f.close()
 
 
 def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -> None:

@@ -67,6 +67,9 @@ def base(mocker, env):
     each outcome.
     """
     import scripts.upload_facebook as uf
+    mock_lock = mocker.MagicMock()
+    mocker.patch.object(uf, "_try_acquire_upload_lock", return_value=mock_lock)
+    mocker.patch.object(uf.fcntl, "flock")
     mocker.patch.object(uf.facebook_state, "get_pending_upload", return_value=None)
     mocker.patch.object(uf.facebook_state, "claim_pending_upload", return_value="claimed")
     mocker.patch.object(uf.facebook_state, "release_claim")
@@ -228,6 +231,24 @@ def test_missing_fb_page_id_exits_with_code_1(monkeypatch):
     with pytest.raises(SystemExit) as exc_info:
         main([])
     assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Cron re-entrancy lock (issue #34 follow-up) — mirrors check_approval.py's
+# test_cron_lock_contention_exits_silently
+# ---------------------------------------------------------------------------
+
+def test_lock_contention_exits_silently_without_touching_state(base):
+    """If upload_facebook.lock is held by another instance, main() exits without ever reading
+    or touching facebook_state at all — not just without calling the Facebook API twice."""
+    import scripts.upload_facebook as uf
+    uf._try_acquire_upload_lock.return_value = None
+
+    main([])
+
+    uf.facebook_state.get_pending_upload.assert_not_called()
+    uf.facebook_state.claim_pending_upload.assert_not_called()
+    uf.facebook_api.upload_video.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -495,12 +516,17 @@ def real_state(tmp_path, monkeypatch, env, mocker):
     """Redirect tools.facebook_state's on-disk file to an isolated tmp path and mock only
     the external side effects (Facebook API, Telegram, structured logging) — facebook_state
     itself stays real so these tests exercise its actual persisted state transitions.
+
+    FIELDKIT_DATA_DIR is also redirected here (not just fb_state.DATA_DIR/STATE_FILE), since
+    upload_facebook.py's real _try_acquire_upload_lock() reads it directly to place
+    upload_facebook.lock — these tests use the real lock too, not a mocked one.
     """
     import scripts.upload_facebook as uf
     data_dir = tmp_path / "photo-agent"
     data_dir.mkdir()
     monkeypatch.setattr(fb_state, "DATA_DIR", data_dir)
     monkeypatch.setattr(fb_state, "STATE_FILE", data_dir / "facebook_state.json")
+    monkeypatch.setenv("FIELDKIT_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path))
     mocker.patch.object(uf.facebook_api, "upload_video", return_value=_POST_ID)
     mocker.patch.object(uf.facebook_logger, "log_upload_started")
@@ -684,23 +710,29 @@ def test_stale_terminal_failed_record_is_cleared_without_reprocessing(real_state
     assert real_state.get_pending_upload() is None
 
 
-def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tmp_path):
-    """The exact check/use race a cross-review flagged against the first version of this fix:
-    two overlapping cron invocations of upload_facebook.py (e.g. a slow video upload still
-    running when the next minute's tick starts) must not both call facebook_api.upload_video()
-    for the same job — a real duplicate Facebook post.
+def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tmp_path, mocker):
+    """The exact check/use race a cross-review flagged: two overlapping cron invocations of
+    upload_facebook.py (e.g. a slow video upload still running when the next minute's tick
+    starts) must not both call facebook_api.upload_video() for the same job — a real duplicate
+    Facebook post.
 
-    Reproduced end-to-end with two real threads racing against the real, fcntl-locked
-    facebook_state: thread 1 is held INSIDE upload_video() (simulating a slow upload) while
-    thread 2 runs main() to completion. Thread 2 must be declined (claim_pending_upload()
-    returns 'in_flight') without ever calling upload_video() itself.
+    Reproduced end-to-end with two real threads: thread 1 is held INSIDE upload_video()
+    (simulating a slow upload) while thread 2 runs main() to completion. thread 2 must be
+    declined by the upload_facebook.lock re-entrancy lock BEFORE it ever reads
+    facebook_state at all — a lease-timeout-based reclaim alone (see
+    facebook_state.claim_pending_upload) cannot tell a merely-slow-but-live holder from a
+    crashed one, so the OS-level flock (not the state-level claim) is what must block thread 2
+    here. get_pending_upload is spied (real implementation still runs) to prove thread 2 never
+    reaches it, not just that it never called upload_video.
     """
     import threading
     import scripts.upload_facebook as uf
+    get_pending_spy = mocker.spy(real_state, "get_pending_upload")
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
     record = dict(_PENDING_RECORD, video_local_path=str(video))
     real_state.set_pending_upload(record)
+    get_pending_spy.reset_mock()  # ignore the set_pending_upload-adjacent setup above
 
     call_started = threading.Event()
     release_call = threading.Event()
@@ -720,6 +752,11 @@ def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tm
     thread2.start()
     thread2.join(timeout=5)
     assert not thread2.is_alive(), "thread2 (should have been declined) is still running"
+
+    # thread2 must have been blocked by the OS lock, not by reaching claim_pending_upload and
+    # losing a state-level race — only thread1's own call should be recorded here (thread2 must
+    # never have read facebook_state at all).
+    assert get_pending_spy.call_count == 1, "thread2 read facebook_state before being declined"
 
     release_call.set()
     thread1.join(timeout=5)

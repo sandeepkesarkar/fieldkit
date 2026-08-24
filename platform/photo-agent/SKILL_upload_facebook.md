@@ -59,16 +59,26 @@ python3 platform/photo-agent/scripts/upload_facebook.py --source cron
 
 ## Behavior
 
+0. Acquires `data/photo-agent/upload_facebook.lock` (non-blocking). If another instance is
+   already running — e.g. a slow upload from the previous minute's tick still in progress —
+   exits silently (0) without touching `facebook_state.json` at all. Held for the entire
+   duration of steps 1–8; released (and the OS also releases it automatically if the process
+   crashes) before exiting.
 1. Reads `data/photo-agent/facebook_state.json` for a `pending` or `uploading` job.
 2. If none → exits silently (0).
-3. Checks 60-second retry cooldown — exits silently if too soon.
+3. Atomically claims the job (staleness check, 60-second retry cooldown, attempt-budget check,
+   and the `uploading` status transition, all in one step) — exits silently if declined.
 4. Checks that the video file exists — marks `failed` if not.
-5. Marks status `uploading`, calls Facebook Graph API (`POST /{page_id}/videos`).
+5. Calls Facebook Graph API (`POST /{page_id}/videos`).
 6. On success: marks `published`, sends Telegram confirmation with the post URL.
-7. On `FacebookUploadError`: increments `attempt_count`; after 3 failures marks `failed`
-   and sends Telegram alert.
+7. On `FacebookUploadError`: below 3 attempts, releases the claim for a cooldown-gated retry;
+   on the 3rd failure marks `failed` and sends Telegram alert.
 8. On `FacebookTokenError` (token invalid/expired): marks `failed` immediately and
    sends Telegram alert to reconnect the Page.
+
+If `upload_facebook.lock` is ever left behind by a hard crash (kill -9, host power loss), it is
+harmless: `flock` releases automatically when the holding process dies, so the next cron tick
+acquires it normally. Nothing needs cleaning up manually.
 
 ---
 
