@@ -2,9 +2,11 @@
 Tests for tools/facebook_state.py — the Facebook upload state manager.
 
 Covers: set_pending_upload (success, missing keys, idempotency check),
-get_pending_upload, mark_uploading, mark_published, mark_failed,
-increment_attempt, is_published, fcntl exclusive locking, and FIELDKIT_DATA_DIR
-env override.
+get_pending_upload, claim_pending_upload (including the concurrent-claim
+regression for issue #34's check/use race), clear_pending_upload
+(compare-and-clear, including the exact stale-clear-destroys-a-newer-job
+regression), mark_published, find_published, mark_failed, is_published,
+fcntl exclusive locking, and FIELDKIT_DATA_DIR env override.
 """
 
 import json
@@ -128,23 +130,276 @@ def test_set_pending_upload_preserves_published_keys(valid_record):
     assert "100" in data["published_idempotency_keys"]
 
 
-# --- mark_uploading ---
+# --- claim_pending_upload ---
 
-def test_mark_uploading_sets_status(valid_record):
-    """mark_uploading() transitions the pending record's status to 'uploading'."""
+def test_claim_pending_upload_claims_a_fresh_job(valid_record):
+    """claim_pending_upload() transitions a fresh job to 'uploading' and advances
+    attempt_count/last_attempt_at, all as part of the single 'claimed' transaction."""
     fb_state.set_pending_upload(valid_record)
-    fb_state.mark_uploading(valid_record["idempotency_key"])
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "claimed"
     record = fb_state.get_pending_upload()
     assert record["status"] == "uploading"
+    assert record["attempt_count"] == 1
+    assert record["last_attempt_at"] is not None
+    from datetime import datetime
+    datetime.fromisoformat(record["last_attempt_at"])
 
 
-def test_mark_uploading_preserves_other_fields(valid_record):
-    """mark_uploading() does not alter fields other than status."""
+def test_claim_pending_upload_preserves_other_fields(valid_record):
+    """claim_pending_upload() does not alter fields other than status/attempt_count/last_attempt_at."""
     fb_state.set_pending_upload(valid_record)
-    fb_state.mark_uploading(valid_record["idempotency_key"])
+    fb_state.claim_pending_upload(valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900)
     record = fb_state.get_pending_upload()
     assert record["project_name"] == valid_record["project_name"]
     assert record["idempotency_key"] == valid_record["idempotency_key"]
+
+
+def test_claim_pending_upload_mismatch_when_nothing_pending():
+    """claim_pending_upload() returns 'mismatch' when there is no pending record at all."""
+    assert fb_state.claim_pending_upload("some_key", cooldown_seconds=60, max_attempts=3, lease_seconds=900) == "mismatch"
+
+
+def test_claim_pending_upload_mismatch_when_key_differs(valid_record):
+    """claim_pending_upload() returns 'mismatch' (and does not touch state) if the current
+    pending record's idempotency_key differs from the one the caller expects — e.g. the caller's
+    snapshot is stale because the job already resolved and a different job was enqueued."""
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload("some_other_key", cooldown_seconds=60, max_attempts=3, lease_seconds=900)
+    assert result == "mismatch"
+    assert fb_state.get_pending_upload() == valid_record
+
+
+def test_claim_pending_upload_in_flight_when_already_uploading(valid_record):
+    """claim_pending_upload() declines ('in_flight') a job whose status is already 'uploading'
+    and whose lease hasn't expired — this is the actual fix for issue #34's check/use race: a
+    second overlapping invocation must not be able to claim a job another still-running
+    invocation already claimed."""
+    from datetime import datetime, timedelta, timezone
+    recent = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    valid_record["status"] = "uploading"
+    valid_record["last_attempt_at"] = recent
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "in_flight"
+    record = fb_state.get_pending_upload()
+    assert record["attempt_count"] == 0  # untouched — not double-counted
+
+
+def test_claim_pending_upload_reclaims_after_lease_expires(valid_record):
+    """A claim stuck at status='uploading' (e.g. the claiming process crashed without calling
+    release_claim()/mark_published()/mark_failed()) becomes reclaimable once lease_seconds has
+    elapsed — otherwise a crashed process would wedge the job at 'in_flight' forever, never
+    retried and never alerting anyone. Reclaiming is still gated by the normal attempt budget.
+    """
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(seconds=1000)).isoformat()
+    valid_record["status"] = "uploading"
+    valid_record["attempt_count"] = 1
+    valid_record["last_attempt_at"] = old
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "claimed"
+    record = fb_state.get_pending_upload()
+    assert record["attempt_count"] == 2
+
+
+def test_claim_pending_upload_lease_expired_but_exhausted_clears(valid_record):
+    """A crashed claim whose lease has expired AND whose attempt_count is already at the cap is
+    cleared as exhausted, not reclaimed — the lease only re-opens the normal attempt-budget path,
+    it doesn't grant extra retries."""
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(seconds=1000)).isoformat()
+    valid_record["status"] = "uploading"
+    valid_record["attempt_count"] = 3
+    valid_record["last_attempt_at"] = old
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "exhausted"
+    assert fb_state.get_pending_upload() is None
+
+
+# --- release_claim ---
+
+def test_release_claim_resets_status_to_pending(valid_record):
+    """release_claim() resets status back to 'pending' after a claim, without touching
+    attempt_count/last_attempt_at, so the next claim_pending_upload() call is gated by the
+    short cooldown rather than the long abandoned-claim lease."""
+    fb_state.set_pending_upload(valid_record)
+    fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    fb_state.release_claim(valid_record["idempotency_key"])
+    record = fb_state.get_pending_upload()
+    assert record["status"] == "pending"
+    assert record["attempt_count"] == 1
+
+
+def test_release_claim_does_not_destroy_a_newer_job(valid_record):
+    """release_claim() is compare-and-update: a stale caller must not reset a DIFFERENT, newer
+    job's status."""
+    fb_state.set_pending_upload(valid_record)
+    fb_state.mark_published(valid_record["idempotency_key"], "fb_post_A")
+
+    job_b = dict(valid_record, project_name="job_b", idempotency_key="99")
+    fb_state.set_pending_upload(job_b)
+
+    fb_state.release_claim(valid_record["idempotency_key"])  # stale caller, A's key
+
+    assert fb_state.get_pending_upload() == job_b
+
+
+def test_claim_pending_upload_concurrent_calls_only_one_claims(valid_record):
+    """Two overlapping claim_pending_upload() calls for the SAME job must not both succeed.
+
+    This directly reproduces the issue #34 follow-up finding: two overlapping cron invocations
+    (e.g. a slow upload still running when the next minute's tick starts) could otherwise both
+    observe an unclaimed job and both call the Facebook API — a real duplicate post. The fix is
+    that the read + staleness check + status transition all happen under ONE exclusive-lock
+    acquisition, so the second concurrent caller's read-modify-write sees the FIRST caller's
+    already-'uploading' status, not a stale earlier snapshot.
+    """
+    fb_state.set_pending_upload(valid_record)
+    results = []
+    barrier = threading.Barrier(2)
+
+    def do_claim():
+        barrier.wait()
+        results.append(fb_state.claim_pending_upload(
+            valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+        ))
+
+    threads = [threading.Thread(target=do_claim) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(results) == ["claimed", "in_flight"]
+    record = fb_state.get_pending_upload()
+    assert record["attempt_count"] == 1  # only the winning claim advanced it
+
+
+def test_claim_pending_upload_cooldown_blocks_recent_attempt(valid_record):
+    """claim_pending_upload() declines ('cooldown') and does not touch state if the last attempt
+    was within cooldown_seconds."""
+    from datetime import datetime, timedelta, timezone
+    recent = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+    valid_record["attempt_count"] = 1
+    valid_record["last_attempt_at"] = recent
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "cooldown"
+    assert fb_state.get_pending_upload()["attempt_count"] == 1
+
+
+def test_claim_pending_upload_proceeds_after_cooldown_elapsed(valid_record):
+    """claim_pending_upload() claims successfully once cooldown_seconds has elapsed."""
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    valid_record["attempt_count"] = 1
+    valid_record["last_attempt_at"] = old
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "claimed"
+    assert fb_state.get_pending_upload()["attempt_count"] == 2
+
+
+def test_claim_pending_upload_unparseable_last_attempt_at_proceeds(valid_record):
+    """claim_pending_upload() treats an unparseable last_attempt_at as if cooldown had elapsed."""
+    valid_record["attempt_count"] = 1
+    valid_record["last_attempt_at"] = "not-a-real-timestamp"
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "claimed"
+
+
+def test_claim_pending_upload_stale_published_clears(valid_record):
+    """claim_pending_upload() returns 'stale_published' and clears the pending slot if the
+    idempotency_key is already in published_idempotency_keys — self-healing a stale/pre-fix
+    state file instead of ever calling the Facebook API again for it."""
+    fb_state.STATE_FILE.write_text(json.dumps({
+        "pending_facebook_upload": valid_record,
+        "published_idempotency_keys": [valid_record["idempotency_key"]],
+    }))
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "stale_published"
+    assert fb_state.get_pending_upload() is None
+
+
+def test_claim_pending_upload_stale_failed_clears(valid_record):
+    """claim_pending_upload() returns 'stale_failed' and clears the pending slot if status is
+    already 'failed'."""
+    valid_record["status"] = "failed"
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "stale_failed"
+    assert fb_state.get_pending_upload() is None
+
+
+def test_claim_pending_upload_exhausted_clears(valid_record):
+    """claim_pending_upload() returns 'exhausted' and clears the pending slot if attempt_count
+    already reached max_attempts — no further claim is ever handed out for it."""
+    valid_record["attempt_count"] = 3
+    fb_state.set_pending_upload(valid_record)
+    result = fb_state.claim_pending_upload(
+        valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert result == "exhausted"
+    assert fb_state.get_pending_upload() is None
+
+
+# --- clear_pending_upload ---
+
+def test_clear_pending_upload_clears_when_key_matches(valid_record):
+    """clear_pending_upload() clears the pending slot when the expected key still matches."""
+    fb_state.set_pending_upload(valid_record)
+    cleared = fb_state.clear_pending_upload(valid_record["idempotency_key"])
+    assert cleared is True
+    assert fb_state.get_pending_upload() is None
+
+
+def test_clear_pending_upload_noop_when_nothing_pending():
+    """clear_pending_upload() returns False and does nothing when there is no pending record."""
+    assert fb_state.clear_pending_upload("some_key") is False
+
+
+def test_clear_pending_upload_does_not_destroy_a_newer_job(valid_record):
+    """Compare-and-clear regression (issue #34 follow-up): a caller holding an earlier
+    snapshot's idempotency_key must not be able to destroy a DIFFERENT, newer job that's since
+    taken the pending slot's place.
+
+    Reproduces the exact interleaving: job A resolves (mark_published clears pending), a new
+    job B is enqueued, and only THEN does a stale caller try to clear using A's key.
+    """
+    fb_state.set_pending_upload(valid_record)  # job A
+    fb_state.mark_published(valid_record["idempotency_key"], "fb_post_A")  # pending now null
+
+    job_b = dict(valid_record, project_name="job_b", idempotency_key="99")
+    fb_state.set_pending_upload(job_b)  # a NEW job B takes the pending slot
+
+    cleared = fb_state.clear_pending_upload(valid_record["idempotency_key"])  # stale caller, A's key
+
+    assert cleared is False
+    assert fb_state.get_pending_upload() == job_b  # B survives untouched
 
 
 # --- mark_published ---
@@ -257,31 +512,18 @@ def test_mark_failed_clears_pending_upload(valid_record):
     assert fb_state.get_pending_upload() is None
 
 
-# --- increment_attempt ---
-
-def test_increment_attempt_increments_count(valid_record):
-    """increment_attempt() increments attempt_count by 1."""
+def test_mark_failed_does_not_destroy_a_newer_job(valid_record):
+    """mark_failed() is also compare-and-update (via _update_pending): a stale caller acting on
+    an old idempotency_key must not clear a different, newer job enqueued in its place."""
     fb_state.set_pending_upload(valid_record)
-    fb_state.increment_attempt(valid_record["idempotency_key"])
-    assert fb_state.get_pending_upload()["attempt_count"] == 1
+    fb_state.mark_published(valid_record["idempotency_key"], "fb_post_A")
 
+    job_b = dict(valid_record, project_name="job_b", idempotency_key="99")
+    fb_state.set_pending_upload(job_b)
 
-def test_increment_attempt_sets_last_attempt_at(valid_record):
-    """increment_attempt() sets last_attempt_at to a non-null ISO-8601 string."""
-    fb_state.set_pending_upload(valid_record)
-    fb_state.increment_attempt(valid_record["idempotency_key"])
-    record = fb_state.get_pending_upload()
-    assert record["last_attempt_at"] is not None
-    from datetime import datetime
-    datetime.fromisoformat(record["last_attempt_at"])
+    fb_state.mark_failed(valid_record["idempotency_key"])  # stale caller, A's key
 
-
-def test_increment_attempt_twice_accumulates(valid_record):
-    """Calling increment_attempt() twice yields attempt_count == 2."""
-    fb_state.set_pending_upload(valid_record)
-    fb_state.increment_attempt(valid_record["idempotency_key"])
-    fb_state.increment_attempt(valid_record["idempotency_key"])
-    assert fb_state.get_pending_upload()["attempt_count"] == 2
+    assert fb_state.get_pending_upload() == job_b
 
 
 # --- is_published ---
@@ -323,7 +565,7 @@ def test_is_published_true_after_mark_published(valid_record):
 # --- fcntl exclusive locking ---
 
 def test_concurrent_read_write_does_not_corrupt(valid_record):
-    """Concurrent get_pending_upload and increment_attempt leave the state file valid."""
+    """Concurrent get_pending_upload and claim_pending_upload leave the state file valid."""
     fb_state.set_pending_upload(valid_record)
     errors = []
 
@@ -335,7 +577,9 @@ def test_concurrent_read_write_does_not_corrupt(valid_record):
 
     def do_write():
         try:
-            fb_state.increment_attempt(valid_record["idempotency_key"])
+            fb_state.claim_pending_upload(
+                valid_record["idempotency_key"], cooldown_seconds=60, max_attempts=3, lease_seconds=900
+            )
         except Exception as exc:
             errors.append(exc)
 

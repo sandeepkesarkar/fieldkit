@@ -17,7 +17,6 @@ Only facebook_api/facebook_logger/telegram_api stay mocked there.
 """
 
 import json
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import ANY
 
@@ -56,15 +55,23 @@ def env(monkeypatch):
 
 @pytest.fixture
 def base(mocker, env):
-    """Common mocks for upload_facebook tests. Default: no pending job."""
+    """Common mocks for upload_facebook tests. Default: no pending job.
+
+    claim_pending_upload defaults to 'claimed' — irrelevant to tests where get_pending_upload
+    returns None (main() returns before _process_upload is ever reached), and the right default
+    for tests that DO set a pending record and want to exercise the upload attempt itself.
+    Override claim_pending_upload's return_value/side_effect directly to test the other claim
+    outcomes (mismatch/in_flight/cooldown/stale_published/stale_failed/exhausted) — that
+    decision logic lives in facebook_state.claim_pending_upload() and is covered directly in
+    test_facebook_state.py; these tests only need to verify upload_facebook.py's own dispatch on
+    each outcome.
+    """
     import scripts.upload_facebook as uf
     mocker.patch.object(uf.facebook_state, "get_pending_upload", return_value=None)
-    mocker.patch.object(uf.facebook_state, "mark_uploading")
+    mocker.patch.object(uf.facebook_state, "claim_pending_upload", return_value="claimed")
+    mocker.patch.object(uf.facebook_state, "release_claim")
     mocker.patch.object(uf.facebook_state, "mark_published")
     mocker.patch.object(uf.facebook_state, "mark_failed")
-    mocker.patch.object(uf.facebook_state, "increment_attempt")
-    mocker.patch.object(uf.facebook_state, "is_published", return_value=False)
-    mocker.patch.object(uf.facebook_state, "clear_pending_upload")
     mocker.patch.object(uf.facebook_api, "upload_video", return_value=_POST_ID)
     mocker.patch.object(uf.facebook_logger, "log_upload_started")
     mocker.patch.object(uf.facebook_logger, "log_upload_published")
@@ -98,18 +105,25 @@ def test_no_pending_job_exits_silently(base):
 
 
 def test_no_pending_job_does_not_modify_state(base):
-    """When there is no pending job, mark_uploading and mark_published are not called."""
+    """When there is no pending job, claim_pending_upload and mark_published are not called."""
     import scripts.upload_facebook as uf
     main([])
-    uf.facebook_state.mark_uploading.assert_not_called()
+    uf.facebook_state.claim_pending_upload.assert_not_called()
     uf.facebook_state.mark_published.assert_not_called()
 
 
-def test_happy_path_marks_uploading(with_pending):
-    """Happy-path upload calls mark_uploading with the idempotency key."""
+def test_happy_path_calls_claim_pending_upload(with_pending):
+    """Happy-path upload claims the job (atomically, via claim_pending_upload) before ever
+    calling the Facebook API — see the issue #34 follow-up regression tests below for why this
+    must be the ONE atomic gate rather than separate get_pending_upload/mark_uploading calls."""
     import scripts.upload_facebook as uf
     main([])
-    uf.facebook_state.mark_uploading.assert_called_once_with(_IDEM_KEY)
+    uf.facebook_state.claim_pending_upload.assert_called_once_with(
+        _IDEM_KEY,
+        cooldown_seconds=uf._COOLDOWN_SECONDS,
+        max_attempts=uf._MAX_ATTEMPTS,
+        lease_seconds=uf._UPLOAD_LEASE_SECONDS,
+    )
 
 
 def test_happy_path_calls_upload_video(with_pending):
@@ -218,10 +232,15 @@ def test_missing_fb_page_id_exits_with_code_1(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # T014: US3 — Retry and failure-recovery paths
+#
+# Cooldown/attempt-budget/claiming decisions now live entirely in
+# facebook_state.claim_pending_upload() (covered directly in test_facebook_state.py) — these
+# tests drive claim_pending_upload's mocked return value to verify upload_facebook.py's OWN
+# dispatch on each outcome, rather than simulating cooldown via the pending record's fields.
 # ---------------------------------------------------------------------------
 
-def test_upload_error_first_attempt_increments_count(base, tmp_path):
-    """FacebookUploadError on attempt 1 increments attempt_count to 1."""
+def test_upload_error_logs_attempt_failed(base, tmp_path):
+    """A FacebookUploadError (claim succeeded, below the attempt budget) logs the failed attempt."""
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookUploadError
     video = tmp_path / "video.mp4"
@@ -232,106 +251,154 @@ def test_upload_error_first_attempt_increments_count(base, tmp_path):
 
     main([])
 
-    uf.facebook_state.increment_attempt.assert_called_once_with(_IDEM_KEY)
-
-
-def test_upload_error_first_attempt_sets_last_attempt_at(base, tmp_path):
-    """FacebookUploadError on attempt 1 logs the failure attempt."""
-    import scripts.upload_facebook as uf
-    from tools.facebook_api import FacebookUploadError
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00" * 64)
-    record = dict(_PENDING_RECORD, video_local_path=str(video))
-    uf.facebook_state.get_pending_upload.return_value = record
-    uf.facebook_api.upload_video.side_effect = FacebookUploadError("timeout")
-
-    main([])
-
     uf.facebook_logger.log_upload_attempt_failed.assert_called_once()
 
 
-def test_upload_error_first_attempt_does_not_send_alert(base, tmp_path):
-    """After the 1st failure, no Telegram alert is sent (more retries remain)."""
+def test_upload_error_below_max_releases_claim_and_does_not_send_alert(base, tmp_path):
+    """A FacebookUploadError with retries remaining (attempt_number < _MAX_ATTEMPTS) releases the
+    claim (so the next attempt is cooldown-gated, not lease-gated — see release_claim's
+    docstring) and does not send a Telegram alert or mark the job failed."""
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookUploadError
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
-    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    record = dict(_PENDING_RECORD, video_local_path=str(video), attempt_count=0)
     uf.facebook_state.get_pending_upload.return_value = record
     uf.facebook_api.upload_video.side_effect = FacebookUploadError("timeout")
 
     main([])
 
+    uf.facebook_state.release_claim.assert_called_once_with(_IDEM_KEY)
+    uf.facebook_state.mark_failed.assert_not_called()
     uf.telegram_api.send_message.assert_not_called()
 
 
-def test_cooldown_not_elapsed_exits_without_uploading(base, tmp_path):
-    """If last_attempt_at is within the last 60s, upload_video is not called."""
+def test_claim_cooldown_does_not_call_upload(base, tmp_path):
+    """When claim_pending_upload() declines with 'cooldown', upload_video is never called."""
     import scripts.upload_facebook as uf
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
-    recent = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
-    record = dict(_PENDING_RECORD,
-                  video_local_path=str(video),
-                  attempt_count=1,
-                  last_attempt_at=recent)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
     uf.facebook_state.get_pending_upload.return_value = record
+    uf.facebook_state.claim_pending_upload.return_value = "cooldown"
 
     main([])
 
     uf.facebook_api.upload_video.assert_not_called()
-    uf.facebook_state.increment_attempt.assert_not_called()
+    uf.facebook_state.mark_published.assert_not_called()
+    uf.facebook_state.mark_failed.assert_not_called()
 
 
-def test_cooldown_elapsed_proceeds_to_upload(base, tmp_path):
-    """If last_attempt_at is older than 60s, the upload is attempted."""
+def test_claim_mismatch_does_not_call_upload(base, tmp_path):
+    """When claim_pending_upload() declines with 'mismatch' (the job changed since main()'s
+    snapshot), upload_video is never called."""
     import scripts.upload_facebook as uf
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
-    old = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    record = dict(_PENDING_RECORD,
-                  video_local_path=str(video),
-                  attempt_count=1,
-                  last_attempt_at=old)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
     uf.facebook_state.get_pending_upload.return_value = record
+    uf.facebook_state.claim_pending_upload.return_value = "mismatch"
 
     main([])
 
-    uf.facebook_api.upload_video.assert_called_once()
+    uf.facebook_api.upload_video.assert_not_called()
+
+
+def test_claim_in_flight_does_not_call_upload(base, tmp_path):
+    """When claim_pending_upload() declines with 'in_flight' (another invocation already
+    claimed it — the actual issue #34 check/use race fix), upload_video is never called."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    uf.facebook_state.get_pending_upload.return_value = record
+    uf.facebook_state.claim_pending_upload.return_value = "in_flight"
+
+    main([])
+
+    uf.facebook_api.upload_video.assert_not_called()
+
+
+def test_claim_stale_published_does_not_call_upload_or_mark_failed(base, tmp_path):
+    """When claim_pending_upload() declines with 'stale_published' (already self-healed
+    internally), upload_video is never called and mark_failed is never called either — the
+    exact protection against silently stomping a real, live fb_post_id (issue #34)."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    uf.facebook_state.get_pending_upload.return_value = record
+    uf.facebook_state.claim_pending_upload.return_value = "stale_published"
+
+    main([])
+
+    uf.facebook_api.upload_video.assert_not_called()
+    uf.facebook_state.mark_failed.assert_not_called()
+
+
+def test_claim_stale_failed_does_not_call_upload(base, tmp_path):
+    """When claim_pending_upload() declines with 'stale_failed' (already self-healed
+    internally), upload_video is never called."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    uf.facebook_state.get_pending_upload.return_value = record
+    uf.facebook_state.claim_pending_upload.return_value = "stale_failed"
+
+    main([])
+
+    uf.facebook_api.upload_video.assert_not_called()
+
+
+def test_claim_exhausted_alerts_without_calling_upload_or_mark_failed(base, tmp_path):
+    """When claim_pending_upload() declines with 'exhausted' (attempt_count already at the cap
+    from a prior tick — cleared internally by the claim itself), upload_facebook.py still logs
+    and alerts, but never calls upload_video, and never calls mark_failed again (already
+    cleared — calling it again would be a stale-caller/compare-and-update no-op regardless, but
+    there's no reason to call it at all)."""
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    uf.facebook_state.get_pending_upload.return_value = record
+    uf.facebook_state.claim_pending_upload.return_value = "exhausted"
+
+    main([])
+
+    uf.facebook_api.upload_video.assert_not_called()
+    uf.facebook_state.mark_failed.assert_not_called()
+    uf.facebook_logger.log_upload_exhausted.assert_called_once_with(_PROJECT)
+    uf.telegram_api.send_message.assert_called_once()
+    text = uf.telegram_api.send_message.call_args.args[1]
+    assert "⚠️" in text
+    assert _PROJECT in text
 
 
 def test_third_failure_marks_failed(base, tmp_path):
-    """After 3 failed attempts, status transitions to failed."""
+    """A FacebookUploadError on the attempt that reaches _MAX_ATTEMPTS (claim succeeded — this
+    IS attempt 3) marks the job failed."""
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookUploadError
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
-    old = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    record = dict(_PENDING_RECORD,
-                  video_local_path=str(video),
-                  attempt_count=2,
-                  last_attempt_at=old)
+    record = dict(_PENDING_RECORD, video_local_path=str(video), attempt_count=2)
     uf.facebook_state.get_pending_upload.return_value = record
     uf.facebook_api.upload_video.side_effect = FacebookUploadError("server error")
-    # increment_attempt increments the count in the real impl; mock needs to simulate count=3
-    uf.facebook_state.get_pending_upload.return_value = dict(record)
 
     main([])
 
     uf.facebook_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    uf.facebook_state.release_claim.assert_not_called()
 
 
 def test_third_failure_logs_exhausted(base, tmp_path):
-    """After 3 failed attempts, log_upload_exhausted is called."""
+    """After the 3rd failed attempt, log_upload_exhausted is called."""
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookUploadError
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
-    old = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    record = dict(_PENDING_RECORD,
-                  video_local_path=str(video),
-                  attempt_count=2,
-                  last_attempt_at=old)
+    record = dict(_PENDING_RECORD, video_local_path=str(video), attempt_count=2)
     uf.facebook_state.get_pending_upload.return_value = record
     uf.facebook_api.upload_video.side_effect = FacebookUploadError("server error")
 
@@ -341,16 +408,12 @@ def test_third_failure_logs_exhausted(base, tmp_path):
 
 
 def test_third_failure_sends_telegram_alert(base, tmp_path):
-    """After 3 failed attempts, a Telegram alert is sent to the admin."""
+    """After the 3rd failed attempt, a Telegram alert is sent to the admin."""
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookUploadError
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
-    old = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    record = dict(_PENDING_RECORD,
-                  video_local_path=str(video),
-                  attempt_count=2,
-                  last_attempt_at=old)
+    record = dict(_PENDING_RECORD, video_local_path=str(video), attempt_count=2)
     uf.facebook_state.get_pending_upload.return_value = record
     uf.facebook_api.upload_video.side_effect = FacebookUploadError("server error")
 
@@ -363,13 +426,10 @@ def test_third_failure_sends_telegram_alert(base, tmp_path):
 
 
 def test_token_error_marks_failed_immediately(base, tmp_path):
-    """FacebookTokenError immediately marks status=failed after just this one attempt — it does
-    not wait for the retry budget (_MAX_ATTEMPTS) to exhaust, unlike FacebookUploadError.
-
-    increment_attempt IS still called (persisted before the API call, alongside every attempt —
-    see _process_upload's crash-safety comment) but it has no bearing on when mark_failed fires
-    here: that's unconditional on FacebookTokenError, not attempt-count-gated.
-    """
+    """FacebookTokenError immediately marks the job failed after just this one attempt — it does
+    not wait for the retry budget (_MAX_ATTEMPTS) to exhaust, unlike FacebookUploadError, and
+    does not release the claim for a future retry either (mark_failed is unconditional here, not
+    attempt-count-gated)."""
     import scripts.upload_facebook as uf
     from tools.facebook_api import FacebookTokenError
     video = tmp_path / "video.mp4"
@@ -381,6 +441,7 @@ def test_token_error_marks_failed_immediately(base, tmp_path):
     main([])
 
     uf.facebook_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    uf.facebook_state.release_claim.assert_not_called()
 
 
 def test_token_error_logs_token_expired(base, tmp_path):
@@ -472,10 +533,16 @@ def test_reprocessing_after_publish_does_not_call_upload_video(real_state, tmp_p
     assert real_state.get_pending_upload() is None
 
 
-def test_reprocessing_after_publish_does_not_mark_failed_again(real_state, tmp_path):
+def test_reprocessing_after_publish_does_not_mark_failed_again(real_state, tmp_path, mocker):
     """A second tick against a resolved job must not call mark_failed either — the live incident
-    was this exact call stomping status to 'failed' while a real, live fb_post_id stayed attached."""
+    was this exact call stomping status to 'failed' while a real, live fb_post_id stayed attached.
+
+    Spies on facebook_state.mark_failed (real implementation still runs) rather than only
+    asserting on the resulting persisted state, so this actually proves the call itself never
+    happens on the second tick — not just that its effects didn't happen to show up.
+    """
     import scripts.upload_facebook as uf
+    mark_failed_spy = mocker.spy(real_state, "mark_failed")
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
     record = dict(_PENDING_RECORD, video_local_path=str(video))
@@ -484,9 +551,11 @@ def test_reprocessing_after_publish_does_not_mark_failed_again(real_state, tmp_p
     main([])
     idem_key = record["idempotency_key"]
     assert real_state.is_published(idem_key) is True
+    mark_failed_spy.assert_not_called()
 
     main([])  # second tick must not touch state at all
 
+    mark_failed_spy.assert_not_called()
     data_after_first = json.loads(real_state.STATE_FILE.read_text())
     assert data_after_first["pending_facebook_upload"] is None
     assert idem_key in data_after_first["published_idempotency_keys"]
@@ -516,10 +585,10 @@ def test_terminal_failure_does_not_retry_forever(real_state, tmp_path, monkeypat
 
 
 def test_stale_published_record_is_cleared_without_reprocessing(real_state, tmp_path):
-    """Defense in depth (main()'s explicit is_published check): even if pending_facebook_upload
-    is somehow non-null for a key already in published_idempotency_keys — e.g. a state file
-    written before this fix — main() must clear it and must never call upload_video, and must
-    never overwrite the real fb_post_id via mark_failed."""
+    """Defense in depth (claim_pending_upload()'s stale_published check): even if
+    pending_facebook_upload is somehow non-null for a key already in published_idempotency_keys
+    — e.g. a state file written before this fix — the claim must clear it and never call
+    upload_video, and must never overwrite the real fb_post_id via mark_failed."""
     import scripts.upload_facebook as uf
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
@@ -567,11 +636,14 @@ def test_crash_during_upload_leaves_attempt_persisted_before_the_call(real_state
 
 def test_crash_mid_upload_is_eventually_bounded_by_max_attempts(real_state, tmp_path, monkeypatch):
     """A job stuck 'crashing' every tick (attempt_count advances but the process never reaches
-    the FacebookUploadError handler at all) must still stop retrying once _MAX_ATTEMPTS is
-    reached — checked proactively before calling the API again, so the bound holds regardless of
-    how prior attempts failed (crash vs. a caught API error)."""
+    the FacebookUploadError handler at all — so release_claim() never runs, leaving status
+    stuck at 'uploading') must still stop retrying once _MAX_ATTEMPTS is reached. Each crashed
+    tick leaves the claim looking 'in_flight' until _UPLOAD_LEASE_SECONDS elapses (patched to 0
+    here so the test doesn't sleep) — that's the lease-expiry path that lets an abandoned claim
+    become reclaimable again, subject to the same attempt-budget check as any other retry."""
     import scripts.upload_facebook as uf
     monkeypatch.setattr(uf, "_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(uf, "_UPLOAD_LEASE_SECONDS", 0)
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
     record = dict(_PENDING_RECORD, video_local_path=str(video))
@@ -610,3 +682,49 @@ def test_stale_terminal_failed_record_is_cleared_without_reprocessing(real_state
 
     uf.facebook_api.upload_video.assert_not_called()
     assert real_state.get_pending_upload() is None
+
+
+def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tmp_path):
+    """The exact check/use race a cross-review flagged against the first version of this fix:
+    two overlapping cron invocations of upload_facebook.py (e.g. a slow video upload still
+    running when the next minute's tick starts) must not both call facebook_api.upload_video()
+    for the same job — a real duplicate Facebook post.
+
+    Reproduced end-to-end with two real threads racing against the real, fcntl-locked
+    facebook_state: thread 1 is held INSIDE upload_video() (simulating a slow upload) while
+    thread 2 runs main() to completion. Thread 2 must be declined (claim_pending_upload()
+    returns 'in_flight') without ever calling upload_video() itself.
+    """
+    import threading
+    import scripts.upload_facebook as uf
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    real_state.set_pending_upload(record)
+
+    call_started = threading.Event()
+    release_call = threading.Event()
+
+    def slow_upload_video(*args, **kwargs):
+        call_started.set()
+        assert release_call.wait(timeout=5), "test deadlocked waiting to release upload_video"
+        return _POST_ID
+
+    uf.facebook_api.upload_video.side_effect = slow_upload_video
+
+    thread1 = threading.Thread(target=main, args=([],))
+    thread1.start()
+    assert call_started.wait(timeout=5), "thread1 never entered upload_video"
+
+    thread2 = threading.Thread(target=main, args=([],))
+    thread2.start()
+    thread2.join(timeout=5)
+    assert not thread2.is_alive(), "thread2 (should have been declined) is still running"
+
+    release_call.set()
+    thread1.join(timeout=5)
+    assert not thread1.is_alive(), "thread1 never finished"
+
+    assert uf.facebook_api.upload_video.call_count == 1
+    assert real_state.get_pending_upload() is None  # thread1 published successfully
+    assert real_state.is_published(_IDEM_KEY) is True

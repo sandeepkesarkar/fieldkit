@@ -9,10 +9,18 @@ Reads the pending VideoUploadJob from facebook_state.json, uploads the video
 to the linked Facebook Page via Graph API, and sends a Telegram confirmation.
 
 Retry and failure-recovery logic (US3):
-  - attempt_count/last_attempt_at are persisted BEFORE each Facebook API call
-    (not only after a failure), so a process killed mid-upload still leaves a
-    bounded, cooldown-gated trail instead of being retried immediately forever.
-  - Cooldown: if the last attempt was within 60 seconds, exits silently.
+  - Claiming (tools/facebook_state.py's claim_pending_upload()) is a single
+    atomic exclusive-lock transaction that checks staleness, cooldown, and the
+    attempt budget, and transitions the job to 'uploading' — all before this
+    script ever calls the Facebook API. That atomicity is what stops two
+    overlapping cron invocations (e.g. a slow upload still running when the
+    next minute's tick starts) from both claiming the same job and both
+    posting a real duplicate (issue #34 follow-up).
+  - attempt_count/last_attempt_at are persisted by the claim itself, BEFORE
+    the Facebook API call — not only after a failure — so a process killed
+    mid-upload still leaves a bounded, cooldown-gated trail instead of being
+    retried immediately forever.
+  - Cooldown: if the last attempt was within 60 seconds, the claim declines.
   - Retry limit: 3 attempts. After the 3rd failure, marks the job as failed
     and sends a Telegram alert.
   - Token expiry (FacebookTokenError): marks failed immediately after just
@@ -20,9 +28,10 @@ Retry and failure-recovery logic (US3):
     alerts the admin to reconnect the Page.
 
 A resolved job (published, or terminally failed) always clears
-pending_facebook_upload (see tools/facebook_state.py) — main() additionally
-double-checks this before ever reprocessing a job, so a stale or pre-fix
-state file can't cause a duplicate Facebook post (issue #34).
+pending_facebook_upload (see tools/facebook_state.py) — claim_pending_upload()
+additionally self-heals a stale or pre-fix state file (an already-published
+idempotency_key, or a status already 'failed', found still sitting in
+pending_facebook_upload) by clearing it instead of reprocessing (issue #34).
 
 FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
@@ -31,7 +40,6 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -52,6 +60,13 @@ _log = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 3
 _COOLDOWN_SECONDS = 60
+# How long a claim (status='uploading') is presumed still genuinely in-progress before
+# claim_pending_upload() treats it as an abandoned/crashed attempt and allows reclaiming it.
+# Deliberately much longer than _COOLDOWN_SECONDS and any realistic video upload duration for
+# these short social-media clips — a lease that expires while a legitimate upload is still
+# running would let a second cron tick reclaim and re-call the Facebook API for the same job.
+# See claim_pending_upload()'s docstring for the full tradeoff.
+_UPLOAD_LEASE_SECONDS = 900
 _REPO_ROOT = Path(__file__).parents[3]
 
 
@@ -113,78 +128,61 @@ def main(argv=None) -> None:
         _log.debug("no pending facebook upload — exiting")
         return
 
-    # Defense in depth: a resolved job (published, or terminally failed) must
-    # never reach _process_upload, which would call the Facebook API again for
-    # an already-published idempotency_key (real duplicate post) or spin the
-    # cron entrypoint forever on a job mark_failed already gave up on. This
-    # check is independent of facebook_state's own clearing on mark_published/
-    # mark_failed so it also self-heals a state file written before that fix.
-    idem_key = record.get("idempotency_key")
-    already_published = bool(idem_key) and facebook_state.is_published(idem_key)
-    already_terminal_failed = record.get("status") == "failed"
-    if already_published or already_terminal_failed:
-        _log.warning(
-            "stale pending facebook upload record found (published=%s failed=%s) "
-            "project=%s key=%s — clearing without reprocessing",
-            already_published, already_terminal_failed, record.get("project_name"), idem_key,
-        )
-        facebook_state.clear_pending_upload()
-        return
-
     _process_upload(record, page_token, page_id, chat_id)
 
 
 def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -> None:
-    """Attempt to upload the video described by record. Handles retry cooldown and failures."""
+    """Claim and attempt to upload the video described by record.
+
+    record is only a snapshot (from main()'s get_pending_upload()) used here for its immutable
+    fields — project_name/video_local_path/page_id/idempotency_key never change across a
+    record's lifetime, only status/attempt_count/last_attempt_at/fb_post_id do. Every decision
+    about whether and how to proceed (staleness, cooldown, attempt budget, claiming) is made by
+    claim_pending_upload() against the CURRENT, freshly-locked state under one exclusive-lock
+    transaction — not by reasoning from this possibly-stale snapshot — so two overlapping
+    invocations of this script can never both observe an unclaimed job and both call the
+    Facebook API (issue #34 follow-up).
+    """
     project_name = record["project_name"]
     video_path = record["video_local_path"]
     idem_key = record["idempotency_key"]
-    attempt_count = record.get("attempt_count", 0)
-    last_attempt_at = record.get("last_attempt_at")
+    attempt_count = record.get("attempt_count", 0)  # pre-claim value; claim() advances it by 1
 
-    # Cooldown check: do not retry within 60 seconds of the last attempt.
-    if last_attempt_at is not None:
-        try:
-            last_dt = datetime.fromisoformat(last_attempt_at)
-            if datetime.now(timezone.utc) - last_dt < timedelta(seconds=_COOLDOWN_SECONDS):
-                _log.debug("cooldown not elapsed for project=%s — exiting", project_name)
-                return
-        except ValueError:
-            _log.warning("unparseable last_attempt_at=%r — proceeding", last_attempt_at)
+    claim = facebook_state.claim_pending_upload(
+        idem_key,
+        cooldown_seconds=_COOLDOWN_SECONDS,
+        max_attempts=_MAX_ATTEMPTS,
+        lease_seconds=_UPLOAD_LEASE_SECONDS,
+    )
 
-    # Video file must exist before we call the API.
-    if not Path(video_path).exists():
-        _log.error("video file missing: project=%s path=%s", project_name, video_path)
-        facebook_state.mark_failed(idem_key)
+    if claim in ("mismatch", "in_flight", "cooldown"):
+        _log.debug("declined claim (%s): project=%s key=%s", claim, project_name, idem_key)
         return
-
-    # Attempt budget check: exhausted BEFORE calling the API again, not only inside the
-    # FacebookUploadError handler below. attempt_count is persisted before every API call (see
-    # below), so this bound holds even if prior attempts never reached that handler at all —
-    # e.g. the process was killed mid-upload (OOM, host restart) rather than the API cleanly
-    # raising FacebookUploadError. Without this, a job stuck crashing every tick could retry
-    # forever at the cooldown's pace instead of ever stopping.
-    if attempt_count >= _MAX_ATTEMPTS:
-        _log.error("attempt budget exhausted: project=%s attempt_count=%d", project_name, attempt_count)
-        facebook_state.mark_failed(idem_key)
+    if claim in ("stale_published", "stale_failed"):
+        _log.warning(
+            "cleared stale pending record (%s) without reprocessing: project=%s key=%s",
+            claim, project_name, idem_key,
+        )
+        return
+    if claim == "exhausted":
+        _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
         facebook_logger.log_upload_exhausted(project_name)
         _send_alert(
             chat_id,
             f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
         )
         return
+    assert claim == "claimed", f"unexpected claim outcome: {claim!r}"
+
+    # Video file must exist before we call the API. Checked only after a successful claim — the
+    # claim is the single gate against a concurrent duplicate regardless of ordering here, and
+    # this way the filesystem is only ever touched for a job we've actually secured.
+    if not Path(video_path).exists():
+        _log.error("video file missing: project=%s path=%s", project_name, video_path)
+        facebook_state.mark_failed(idem_key)
+        return
 
     attempt_number = attempt_count + 1
-    facebook_state.mark_uploading(idem_key)
-    # Persist the attempt (attempt_count + last_attempt_at) BEFORE calling the API, not only on
-    # failure: if this process is killed mid-upload (OOM, host restart, cron timeout) after
-    # facebook_api.upload_video() has already created the real post but before mark_published()
-    # runs, the next tick must still see an advanced attempt_count and a fresh cooldown window —
-    # otherwise a crashed-but-actually-succeeded attempt would be retried immediately and forever
-    # (attempt_count frozen, cooldown never engaged), which is the same real-duplicate-post risk
-    # issue #34 was about. This bounds that residual window to _MAX_ATTEMPTS cooldown-spaced
-    # retries before mark_failed alerts the admin, instead of an unbounded retry loop.
-    facebook_state.increment_attempt(idem_key)
     facebook_logger.log_upload_started(project_name, attempt_number)
 
     try:
@@ -208,6 +206,11 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
                 chat_id,
                 f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
             )
+        else:
+            # A KNOWN, caught failure with retries remaining: release the claim immediately so
+            # the next attempt is gated by the short _COOLDOWN_SECONDS, not the much longer
+            # _UPLOAD_LEASE_SECONDS a genuinely abandoned/crashed claim would otherwise wait out.
+            facebook_state.release_claim(idem_key)
         return
 
     # Success path.
