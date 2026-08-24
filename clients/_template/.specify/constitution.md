@@ -59,7 +59,7 @@ This constitution establishes the governing principles, values, and constraints 
 - **Enforcement:** System automatically pauses AI operations when daily limit reached
 
 **Hermes Cost Model:**
-- Self-hosted Hermes Agent supervisor process (one-time hardware cost)
+- [Agent runtime hosting and associated cost model]
 - Per-token API costs to the chosen model provider (Anthropic or OpenAI)
 - External API costs for other services that can't be self-hosted (e.g. computer vision, social APIs)
 
