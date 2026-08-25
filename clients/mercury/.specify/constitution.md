@@ -179,9 +179,9 @@ privacy.
 - No feature considered complete without passing tests
 - Test suite included in client handoff
 - Mercury has no client-specific test files by design — it reuses `platform/photo-agent`'s
-  and `platform/email-agent`'s existing test suites, which are already parametrized by
-  `CLIENT_NAME`/`FIELDKIT_DATA_DIR`/`FIELDKIT_LOG_DIR` rather than hardcoded per client (same
-  pattern `_demo` follows)
+  and `platform/email-agent`'s existing test suites, which are already environment-driven and
+  client-agnostic (configured via `CLIENT_NAME`/`FIELDKIT_DATA_DIR`/`FIELDKIT_LOG_DIR` env
+  vars) rather than hardcoded per client (same pattern `_demo` follows)
 
 ### Error Handling Philosophy
 - Retry failed operations (email send, API calls)
