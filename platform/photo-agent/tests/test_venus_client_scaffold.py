@@ -98,20 +98,46 @@ def test_venus_readme_verifies_telegram_allowlist_correctly():
     assert "check `~/.hermes/profiles/venus/logs/gateway.log` for the" not in text
 
 
-def test_venus_readme_distinguishes_the_two_fail_closed_symptoms():
-    """Regression guard for a conflated failure mode caught in review:
+def _find_line(text: str, needle: str) -> str:
+    """Return the single line of `text` containing `needle` (case-insensitive).
 
-    "fail-closed" is not one symptom -- gateway/authz_mixin.py's
+    Fails loudly (not just returns "") if zero or more than one line matches,
+    so this helper can't silently pass a scoped assertion against text that
+    no longer has the expected shape.
+    """
+    matches = [line for line in text.splitlines() if needle.lower() in line.lower()]
+    assert len(matches) == 1, (
+        f"expected exactly one line containing {needle!r}, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def test_venus_readme_distinguishes_the_two_fail_closed_symptoms():
+    """Regression guard for a conflated failure mode caught in review.
+
+    "Fail-closed" is not one symptom -- gateway/authz_mixin.py's
     _get_unauthorized_dm_behavior resolves to "pair" when no allowlist is
     configured at all (TELEGRAM_ALLOWED_USERS unset -> admin gets an
     unexpected pairing-code prompt), but to "ignore" when an allowlist IS
     configured and simply doesn't match (TELEGRAM_ALLOWED_USERS set wrong
-    -> admin is silently dropped, no prompt, no response). These are
-    different troubleshooting experiences and must be documented as such,
-    not collapsed into one generic "misconfigured allowlist" outcome.
+    -> admin is silently dropped, no prompt, no response).
+
+    Scoped to each cause's own line (not "does the file contain both
+    phrases somewhere") so that swapping which symptom is attributed to
+    which cause -- the actual mistake this guards against -- fails the
+    test, rather than passing because both phrases still appear in the
+    file.
     """
     text = _VENUS_README.read_text()
-    assert "pairing" in text.lower()
-    assert "silently ignored" in text.lower() or "silently dropped" in text.lower()
-    assert "left unset entirely" in text.lower()
-    assert "wrong/mistyped" in text.lower()
+
+    # "pairing-code prompt" (not the bare word "pairing") is the
+    # discriminator: the mistyped-allowlist line legitimately says "no
+    # pairing prompt" in passing, so a bare "pairing" substring check
+    # would match both lines and not actually guard against a swap.
+    unset_line = _find_line(text, "left unset entirely")
+    assert "pairing-code prompt" in unset_line.lower()
+    assert "silently ignored" not in unset_line.lower()
+
+    mistyped_line = _find_line(text, "wrong/mistyped")
+    assert "silently ignored" in mistyped_line.lower()
+    assert "pairing-code prompt" not in mistyped_line.lower()
