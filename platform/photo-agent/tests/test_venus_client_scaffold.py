@@ -51,5 +51,28 @@ def test_venus_readme_documents_provider_configuration():
     assert "Provider Configuration" in text
 
 
+def test_venus_readme_scopes_telegram_token_and_skills_to_the_profile():
+    """Regression guard for the profile-isolation gaps caught in review:
+
+    a fresh Hermes profile inherits neither the default profile's Telegram
+    bot token nor its skills.external_dirs -- both must be set on the
+    venus profile specifically, not assumed from clients/venus's own .env
+    or from the default profile's ~/.hermes/config.yaml.
+    """
+    text = _VENUS_README.read_text()
+    assert "profiles/venus/.env" in text
+    assert "skills.external_dirs" in text
+
+
+def test_venus_readme_does_not_tell_a_human_to_edit_the_shared_root_env():
+    """CLIENT_NAME lives in one shared fieldkit/.env read by every client's
+    cron jobs (including _demo's, live on this machine) -- the e2e
+    instructions must use an inline override, never a persistent edit.
+    """
+    text = _VENUS_README.read_text()
+    assert "# fieldkit/.env\nCLIENT_NAME=venus" not in text
+    assert "CLIENT_NAME=venus FIELDKIT_ROOT=" in text
+
+
 def test_venus_constitution_exists():
     assert _VENUS_CONSTITUTION.exists()

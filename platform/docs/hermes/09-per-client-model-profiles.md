@@ -27,7 +27,7 @@ client to OpenAI:
 It also never mentioned the biggest trap: setting `model.provider: openai`
 directly in `config.yaml` does **not** call OpenAI's API. `openai` is
 registered as an alias that resolves to the OpenRouter aggregator
-(`hermes_cli/models.py`: `ALIASES = {"openai": "openrouter", ...}`) — a
+(`hermes_cli/providers.py`: `ALIASES = {"openai": "openrouter", ...}`) — a
 plain-API-key OpenAI setup that used `provider: openai` would silently bill
 through OpenRouter instead of OpenAI directly. (This also explains the
 `base_url: https://openrouter.ai/api/v1` sitting alongside
@@ -120,11 +120,36 @@ behavior across providers" acceptance scenario holds by construction.
 See `clients/venus/README.md`'s Provider Configuration section for the exact
 setup commands for venus specifically.
 
+## A fresh profile does not inherit the default profile's setup
+
+Profiles are fully isolated (`docs/design/profile-builder.md`: "a profile is
+just a HERMES_HOME directory"), which means a brand-new profile has *neither*
+of the two things `02-gateway-setup.md` set up for the default profile:
+
+- **Its Telegram bot token lives in the profile's own `.env`, not this
+  repo's client `.env`.** The gateway process reads `TELEGRAM_BOT_TOKEN` from
+  whichever `HERMES_HOME` it was started under (`agent/secret_scope.py`), so
+  `hermes -p venus gateway install` needs `TELEGRAM_BOT_TOKEN` set in
+  `~/.hermes/profiles/venus/.env` — the `TELEGRAM_BOT_TOKEN` in
+  `clients/venus/src/photo-agent/.env` is a *different* consumer (it's read
+  by the plain Python cron scripts, not by Hermes).
+- **`skills.external_dirs` must be set again, per profile.** The default
+  profile's `~/.hermes/config.yaml` pointing at
+  `platform/photo-agent/skills` (`03-process-photos-skill.md`) has no effect
+  on `venus`'s or `mercury`'s config — each profile needs its own
+  `hermes -p <client> config set skills.external_dirs '["~/src/fieldkit/platform/photo-agent/skills"]'`,
+  verified with `hermes -p <client> skills list --source local`. Verified
+  empirically on this machine against a throwaway profile: `skills list`
+  showed nothing until `external_dirs` was set on that profile specifically,
+  then showed both `process-photos` and `check-approval` as `local` /
+  `enabled`.
+
 ## Install/config locations touched (per client profile)
 
 | What | Where |
 |---|---|
 | Model provider config | `~/.hermes/profiles/<client>/config.yaml` (`model.provider`, `model.default`) |
-| Secrets | `~/.hermes/profiles/<client>/.env` (provider API key) |
+| Skill discovery | `~/.hermes/profiles/<client>/config.yaml` (`skills.external_dirs`) — must be set per profile, see above |
+| Secrets | `~/.hermes/profiles/<client>/.env` (provider API key, **and** that profile's own `TELEGRAM_BOT_TOKEN`) |
 | Gateway supervisor | a separate launchd service per profile — `hermes -p <client> gateway install` |
 | Telegram bot | a separate BotFather bot per client (gateway bot), distinct again from that client's approval bot (issue #29) |

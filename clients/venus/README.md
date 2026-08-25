@@ -55,14 +55,20 @@ skill instructions in `platform/photo-agent/skills/*/SKILL.md` are byte-identica
 regardless of which client's profile executes them.
 
 **Setup checklist for a human to complete before venus's model calls can go
-live** (deliberately not run by the orchestrator — see the PR description):
+live** (deliberately not run by the orchestrator — see the PR description).
+Note that every credential below goes in the **profile's own**
+`~/.hermes/profiles/venus/.env` — a fresh profile does not read
+`clients/venus/src/photo-agent/.env` at all; that file is for the plain
+Python cron scripts (`process_photos.py`, `check_approval.py`, ...), which
+are a completely separate consumer from the Hermes gateway process:
 
 1. `hermes profile create venus`
 2. `hermes -p venus config set model.provider openai-api`
 3. `hermes -p venus config set model.default gpt-5.5` (or whichever current model `hermes -p venus model` shows for `openai-api`)
-4. Put `OPENAI_API_KEY=...` in `~/.hermes/profiles/venus/.env`
-5. `hermes -p venus doctor` — confirm it reports the OpenAI API key as configured (no more `✗ model.provider 'openai-api' is set but no API key is configured`)
-6. `hermes -p venus gateway install --start-now --start-on-login` — a second, independently-supervised gateway process bound to venus's own `TELEGRAM_BOT_TOKEN`
+4. Put `OPENAI_API_KEY=...` **and** `TELEGRAM_BOT_TOKEN=...` (venus's gateway bot, from the checklist's Telegram step) in `~/.hermes/profiles/venus/.env`. The gateway reads its bot token from the active profile's own env, not from this repo — an install without this step would create a profile that is correctly configured for OpenAI but binds to no Telegram bot at all.
+5. `hermes -p venus config set skills.external_dirs '["~/src/fieldkit/platform/photo-agent/skills"]'` — profiles have fully isolated skill discovery (see `docs/design/profile-builder.md` in the Hermes source tree), so without this, `/process_photos` and `/check_approval` are invisible to venus's gateway even though they're already registered for the default profile (`03-process-photos-skill.md`). Confirm with `hermes -p venus skills list --source local` — expect both `process-photos` and `check-approval` listed as `local` / `enabled`.
+6. `hermes -p venus doctor` — confirm it reports the OpenAI API key as configured (no more `✗ model.provider 'openai-api' is set but no API key is configured`)
+7. `hermes -p venus gateway install --start-now --start-on-login` — a second, independently-supervised gateway process bound to venus's own `TELEGRAM_BOT_TOKEN`
 
 ---
 
@@ -111,15 +117,50 @@ Once the [Provider Configuration](#provider-configuration) checklist above is
 complete and `clients/venus/src/photo-agent/.env` is filled in from
 `.env.example`:
 
-```bash
-# fieldkit/.env
-CLIENT_NAME=venus
+**Do not set `CLIENT_NAME=venus` in the shared `fieldkit/.env`.** That file
+is read by every client's scripts on this machine — including the live
+crontab entries that already run `check_approval.py --source cron` and
+`upload_facebook.py --source cron` every minute against `_demo` right now
+(see `platform/docs/hermes/05-cron-verification.md`). Permanently editing it
+would silently redirect that live cron traffic at venus's credentials/data
+until someone edits it back. Instead, pass `CLIENT_NAME` as an inline
+override on each command — `load_dotenv()`'s default `override=False` means
+an already-set env var always wins over the root `.env` file's value
+(verified empirically against the installed `python-dotenv==1.2.2`), so this
+is safe to do without touching the shared file at all:
 
+```bash
 cd platform/photo-agent
-python3 scripts/run_e2e_test.py --duration 20
+
+# Prerequisite check (process_photos.py shells out to both):
+which ffmpeg || echo "MISSING — brew install ffmpeg"
+which gws || echo "MISSING — see platform/photo-agent/docs for gws setup"
+
+CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
+    python3 scripts/run_e2e_test.py --duration 20
+```
+
+While that's running, Stage 4 needs something to actually process the
+Telegram Approve tap. Do **not** add venus to the live crontab for this —
+run the same two scripts the crontab would, by hand, in separate terminals,
+with the same inline override, exactly matching `check_approval.py`'s own
+documented manual fallback ("if not using cron, run check_approval.py in
+another terminal"):
+
+```bash
+# Terminal 2, repeat every ~10s (or loop it) until Stage 4 reports approved:
+CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
+    python3 scripts/check_approval.py --source cron
+
+# Terminal 3, once Stage 4 passes, until Stage 5 reports the post is live:
+CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
+    python3 scripts/upload_facebook.py --source cron
 ```
 
 This is the same rig `_demo` uses (`platform/photo-agent/scripts/run_e2e_test.py`)
 — nothing venus-specific was needed there, which is itself evidence the
 pipeline is provider-agnostic. See the PR description for the exact list of
-live credentials this requires that don't exist yet.
+live credentials this requires that don't exist yet, and for a flagged
+follow-up: this inline-override dance is a one-off-test workaround, not a
+real fix for running two clients' cron/gateway processes permanently
+alongside each other on one machine.
