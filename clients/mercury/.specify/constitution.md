@@ -150,11 +150,19 @@ privacy.
 ### Hermes Integration
 - Self-hosted Hermes Agent runtime on Mac Mini
 - Model calls route to **Anthropic's API only** — this is explicit, not inherited from a
-  repo-wide default, and is enforced via a dedicated `mercury` gateway profile
-  (`hermes gateway install --profile mercury`, or equivalent — see PR description for the
-  exact live setup checklist)
-- `ANTHROPIC_API_KEY` lives in the `mercury` profile's own `~/.hermes/.env` (or equivalent
-  profile-scoped secret store), never in this repo
+  repo-wide default, and is enforced via a dedicated `mercury` Hermes profile, separate
+  from `_demo`'s default profile
+- Verified live against the installed Hermes CLI (v0.20.5): there is no `--profile` flag on
+  `config set`/`gateway install`/`doctor`. Profile targeting is `hermes profile create
+  mercury` once, then `hermes profile use mercury` (a sticky switch) before running
+  `config set`/`gateway install`/`doctor` for that profile — see PR description for the
+  exact live setup checklist
+- `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN` (Hermes gateway bot), and
+  `TELEGRAM_ALLOWED_USERS` live in `~/.hermes/profiles/mercury/.env`; `skills.external_dirs`
+  (pointing at `platform/photo-agent/skills`, same path `_demo`'s default profile already
+  uses) lives in `~/.hermes/profiles/mercury/config.yaml` — none of this in this repo
+- `gateway install` while `mercury` is active installs a separate launchd service
+  (`ai.hermes.gateway-mercury.plist`), independent of `_demo`'s default-profile gateway
 - Model selection based on task complexity
 - Token usage monitoring for cost tracking
 
