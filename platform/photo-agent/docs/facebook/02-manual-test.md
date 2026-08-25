@@ -20,22 +20,28 @@ a real token, without writing any code.
 
 2. In the top-right dropdown labelled **Meta App**, select your app (e.g. **FieldKit Demo**).
 
-3. Click **Generate Access Token**.
+3. Next to it, find the **"User or Page"** token-type dropdown and explicitly set it
+   to **User Token**. It defaults to whatever was last selected in your browser —
+   which may be **Page Token** left over from a previous session — and the Explorer
+   does not warn you if it's wrong. Generating a Page token here by mistake produces
+   a confusing failure later (see [Troubleshooting](#troubleshooting) below).
 
-4. A permissions dialog appears. Before clicking anything, expand the **permissions** panel on the right side of the Explorer and add:
+4. Click **Generate Access Token**.
+
+5. A permissions dialog appears. Before clicking anything, expand the **permissions** panel on the right side of the Explorer and add:
    - `pages_show_list`
    - `pages_read_engagement`
    - `pages_manage_posts`
 
    Then click **Generate Access Token** again (or the dialog may already be open — check it includes those scopes).
 
-5. Facebook shows a login/permissions screen. Click **Continue as [your name]**, then **Save**.
+6. Facebook shows a login/permissions screen. Click **Continue as [your name]**, then **Save**.
 
    > If you see "Invalid Scopes" or any permission is greyed out, your app's use case
    > is not configured correctly. Return to [doc 1, Step 5](01-create-app.md) and
    > verify the permissions are added.
 
-6. The Explorer shows a token in the **Access Token** field. This is a **short-lived user access token** (valid ~1 hour). Copy it.
+7. The Explorer shows a token in the **Access Token** field. This is a **short-lived user access token** (valid ~1 hour). Copy it.
 
 ---
 
@@ -65,6 +71,12 @@ The response should look like:
 }
 ```
 
+> **If your account admins more than one Page**, `data` will have multiple entries.
+> Match the entry by its **`name`** field — not by any Page ID you already have
+> from the browser or the Page's URL, which can be a completely different
+> identifier (see [doc 1, Part E](01-create-app.md)). Use *that entry's* `id`
+> field as your `FB_PAGE_ID`.
+
 - **`id`** is your `FB_PAGE_ID`. Copy it.
 - **`access_token`** in the response is a **Page access token**. Copy it.
 - The `tasks` list must contain **`CREATE_CONTENT`** — this is what allows posting.
@@ -72,6 +84,12 @@ The response should look like:
 > If the `data` array is empty, the Facebook account you authorised with is not
 > an admin of any Page. Make sure you are logged in as the Page admin and re-run
 > the Explorer flow from Part A.
+>
+> If you instead get an error like `"Tried accessing nonexisting field (accounts)"`,
+> the token in the Explorer's Access Token field is a **Page** token, not a **User**
+> token — Page nodes have no `/accounts` edge. Go back to Part A and confirm the
+> token-type dropdown was set to **User Token**. See
+> [Troubleshooting](#troubleshooting) for how to positively identify a token's type.
 
 ---
 
@@ -145,8 +163,19 @@ The `expires_in` is ~60 days. Save this long-lived user token.
 
 ```bash
 curl -s "https://graph.facebook.com/v25.0/me/accounts
-  ?access_token=LONG_LIVED_USER_TOKEN"
+  ?access_token=LONG_LIVED_USER_TOKEN" | python3 -m json.tool
 ```
+
+Piping through `python3 -m json.tool` pretty-prints the response — worth doing any
+time your account admins more than one Page, so you can visually match each
+`name` to its `id` instead of picking through one unbroken line of JSON. As in
+Part B, if more than one Page comes back, match by **`name`** — don't assume the
+first entry, and don't substitute a Page ID you already have from the browser.
+
+> Current Meta docs favor the explicit form `GET /{user-id}/accounts` over the
+> `/me/accounts` alias used above. They are functionally equivalent today, but
+> the explicit form is the more future-proof one to reach for. Get your user ID
+> first with `GET /me?access_token=LONG_LIVED_USER_TOKEN`, then substitute it in.
 
 The `access_token` values in the response's `data` array are now **long-lived Page access tokens that do not expire** (they are only invalidated if the user changes their password, deauthorises the app, or the Page admin role is removed).
 
@@ -204,5 +233,6 @@ python3 scripts/generate_auth_link.py --page-id YOUR_PAGE_ID
 | Token expires in 1 hour | Short-lived user token used to call `/accounts` | Do Part D to exchange for a permanent Page token |
 | "This app is in development mode" error | The account has no role on the app | Add the account as Tester under App Roles → Roles in the app dashboard |
 | "App not active" when opening the OAuth URL | The Meta app may need a Business Manager connection, or the app is in a state that blocks the OAuth dialog | Use the manual token flow in this doc (Parts A–D) instead of `generate_auth_link.py`. Both produce the same long-lived Page token. |
-| `FacebookUploadError: global id X is not allowed` | Wrong Page ID in `.env` | Confirm the Page ID from the `id` field in `GET /me/accounts` response — not the URL or profile ID |
+| `(#100) Tried accessing nonexisting field (accounts)` calling `/me/accounts` or `fb_exchange_token` | You passed a **Page** access token where a **User** token was expected — Page nodes have no `/accounts` edge | Confirm the token type before retrying blind: `curl -s "https://graph.facebook.com/v25.0/debug_token?input_token=TOKEN&access_token=APP_ID\|APP_SECRET"`. `"type":"PAGE"` (with a `profile_id`) means it's a Page token; `"type":"USER"` (with a `user_id`, no `profile_id`) means it's a User token. Go back to Part A and regenerate with the token-type dropdown set to **User Token**. |
+| `FacebookUploadError: global id X is not allowed` | Wrong Page ID in `.env` | Confirm the Page ID from the `id` field in `GET /me/accounts` response — not the URL or profile ID. For Pages using Meta's newer unified Page UI, the `profile.php?id=...` number in the URL is a **different ID** from the real Graph API Page ID — match by the Page's `name` in the `/me/accounts` response instead (see [doc 1, Part E](01-create-app.md)). |
 | `FacebookUploadError: Application has been deleted` (code 101) | Wrong `FB_APP_ID` or `FB_APP_SECRET` in `.env` | Copy the exact values from App Settings → Basic in the developer console |
