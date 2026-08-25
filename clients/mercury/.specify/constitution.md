@@ -152,11 +152,13 @@ privacy.
 - Model calls route to **Anthropic's API only** — this is explicit, not inherited from a
   repo-wide default, and is enforced via a dedicated `mercury` Hermes profile, separate
   from `_demo`'s default profile
-- Verified live against the installed Hermes CLI (v0.20.5): there is no `--profile` flag on
-  `config set`/`gateway install`/`doctor`. Profile targeting is `hermes profile create
-  mercury` once, then `hermes profile use mercury` (a sticky switch) before running
-  `config set`/`gateway install`/`doctor` for that profile — see PR description for the
-  exact live setup checklist
+- Verified live against the installed Hermes CLI (v0.20.5): profile targeting uses
+  `hermes -p mercury <command>` (undocumented but confirmed real — scopes a single
+  invocation to that profile, leaves the global sticky default untouched), after a one-time
+  `hermes profile create mercury`. `hermes profile use mercury` (a separate, sticky
+  global-default switch) also works but was deliberately not used for the live setup
+  checklist — safer for a human pasting commands one at a time — see PR description for the
+  exact sequence
 - `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN` (Hermes gateway bot), and
   `TELEGRAM_ALLOWED_USERS` live in `~/.hermes/profiles/mercury/.env`; `skills.external_dirs`
   (pointing at `platform/photo-agent/skills`, same path `_demo`'s default profile already
