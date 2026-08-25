@@ -88,8 +88,7 @@ def test_venus_readme_verifies_telegram_allowlist_correctly():
     absence proves nothing about TELEGRAM_ALLOWED_USERS specifically, since
     any one of the other ~19 being set would also suppress it. The README
     must verify by direct inspection instead, and must not imply a missing
-    allowlist means the bot is open to anyone (Hermes is fail-closed: an
-    unrecognized sender is routed to pairing, not auto-authorized).
+    allowlist means the bot is open to anyone (Hermes is fail-closed).
     """
     text = _VENUS_README.read_text()
     assert "grep TELEGRAM_ALLOWED_USERS" in text
@@ -97,3 +96,22 @@ def test_venus_readme_verifies_telegram_allowlist_correctly():
     # The wrong method (checking the global startup warning) may still be
     # mentioned as a documented gotcha, but never as the thing to *do*.
     assert "check `~/.hermes/profiles/venus/logs/gateway.log` for the" not in text
+
+
+def test_venus_readme_distinguishes_the_two_fail_closed_symptoms():
+    """Regression guard for a conflated failure mode caught in review:
+
+    "fail-closed" is not one symptom -- gateway/authz_mixin.py's
+    _get_unauthorized_dm_behavior resolves to "pair" when no allowlist is
+    configured at all (TELEGRAM_ALLOWED_USERS unset -> admin gets an
+    unexpected pairing-code prompt), but to "ignore" when an allowlist IS
+    configured and simply doesn't match (TELEGRAM_ALLOWED_USERS set wrong
+    -> admin is silently dropped, no prompt, no response). These are
+    different troubleshooting experiences and must be documented as such,
+    not collapsed into one generic "misconfigured allowlist" outcome.
+    """
+    text = _VENUS_README.read_text()
+    assert "pairing" in text.lower()
+    assert "silently ignored" in text.lower() or "silently dropped" in text.lower()
+    assert "left unset entirely" in text.lower()
+    assert "wrong/mistyped" in text.lower()

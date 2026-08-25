@@ -160,14 +160,29 @@ of the three things `02-gateway-setup.md` set up for the default profile:
   `TELEGRAM_ALLOWED_USERS` does **not** mean "the bot is now open to
   anyone." Hermes's Telegram adapter is fail-closed by design — its own
   comment says so directly: `"Fail-closed: no allowlist means deny by
-  default"`. Concretely, an unrecognized sender (which, if the admin's own
-  chat ID is missing or mistyped, includes the admin) is routed into
-  Hermes's pairing flow rather than being immediately authorized *or*
-  silently denied — so the realistic failure mode of getting this step
-  wrong is the admin locking themselves out, not an unauthenticated public
-  bot. Actual open access requires a separate, explicit opt-in
+  default"`. Actual open access requires a separate, explicit opt-in
   (`GATEWAY_ALLOW_ALL_USERS=true` or a platform's `*_ALLOW_ALL_USERS` /
   open `dm_policy`), which nothing in this setup sets.
+
+  **But "fail-closed" isn't one symptom — it's two different ones,
+  depending on which mistake was made**, traced through
+  `gateway/authz_mixin.py::_get_unauthorized_dm_behavior`'s resolution
+  order (rules 5–6): with no explicit per-platform/global override, it
+  defaults to `"ignore"` **when any allowlist is configured** ("the
+  allowlist signals that the owner has deliberately restricted access"),
+  and to `"pair"` ("open-gateway default") **only when no allowlist is
+  configured at all**. Concretely, for `TELEGRAM_ALLOWED_USERS`:
+  - **Left unset entirely:** no allowlist exists, so the admin's own DM —
+    unrecognized, same as anyone else's — gets routed to Hermes's
+    **pairing flow** (a pairing-code prompt), not a normal response.
+  - **Set but wrong/mistyped:** an allowlist *does* exist (just not
+    matching the admin's actual chat ID), so Hermes treats this as
+    deliberate restriction and **silently ignores** unauthorized senders —
+    no pairing prompt, no response, no error.
+
+  Either way the admin locking themselves out, not an unauthenticated
+  public bot, is the realistic failure mode — but which of the two above
+  they hit tells them which mistake they made.
 - **`skills.external_dirs` must be set again, per profile.** The default
   profile's `~/.hermes/config.yaml` pointing at
   `platform/photo-agent/skills` (`03-process-photos-skill.md`) has no effect
