@@ -178,9 +178,9 @@ The `expires_in` is ~60 days. Save this long-lived user token.
 >
 > A real example from onboarding **Fieldkit Mercury** (Page ID `1187029124503799`,
 > under app **Fieldkit Demo**): a Page token derived before extending the User token
-> passed every check in the Token Debugger — App, Type `Page`, Page ID, Scopes — and
-> still showed `Expires: in about an hour`. It would have failed in production a
-> couple hours later with no warning at write-time. Always extend first (Step 1
+> passed the App, Type `Page`, Page ID, and Scopes checks in the Token Debugger —
+> and still showed `Expires: in about an hour`. It would have failed in production
+> a couple hours later with no warning at write-time. Always extend first (Step 1
 > above, or the Access Token Tool's **Extend Access Token** button), *then* derive
 > the Page token — never the other order.
 
@@ -230,9 +230,12 @@ If any scope is missing, go back to Part A, include the missing permission expli
 > (see the warning in [Part D, Step 2](#step-2-exchange-long-lived-user-token--page-access-token))
 > shows the correct App, `Type: Page`, and Scopes — it just also expires in about an
 > hour instead of never. That's what makes it dangerous: a length-check or a
-> Type/Page-ID match alone will not catch it. **Before writing any token to `.env`,
-> confirm `Expires` says "Never"** (or, in the raw JSON via the API form of this
-> check, `"expires_at": 0`) — not just that the other fields look right.
+> Type/Page-ID match alone will not catch it. **Before relying on or retaining this
+> token, confirm `Expires` says "Never"** (or, in the raw JSON via the API form of
+> this check, `"expires_at": 0`) — not just that the other fields look right. Note
+> that "Never" means no *scheduled* expiration — Meta can still invalidate the
+> token later if the password changes, the app is deauthorized, or the Page admin
+> role is removed.
 
 ---
 
@@ -262,13 +265,12 @@ python3 scripts/generate_auth_link.py --page-id YOUR_PAGE_ID
 | `tasks` list missing `CREATE_CONTENT` | Account has a restricted Page role | Upgrade to full admin on the Page via Page Settings → Page Roles |
 | Token debugger shows wrong scopes | Permissions not added to the use case | Doc 1 Step D2, re-add permissions, re-generate token |
 | `POST /feed` returns "Permissions error" | Using user token instead of Page token | Use the `access_token` from `/me/accounts` response, not the Explorer token |
-| Token expires in 1 hour | Short-lived user token used to call `/accounts` | Do Part D to exchange for a permanent Page token |
+| Token expires in 1 hour — either immediately (calling `/accounts` in Part B), or a Page token from Part D that otherwise looks fully correct (right App, `Type: Page`, Page ID, Scopes) but stops working ~1-2 hours after being written to `.env` | A short-lived User token was used directly to call `/accounts`, or a Page token was derived from one (Part D Step 2, or the Access Token Tool's per-Page row) **before** it was extended to long-lived (Step 1, or the Access Token Tool's **Extend Access Token** button) — the Page token silently inherits the short expiry, which nothing but the `Expires` field reveals | Redo Part D in order: extend the User token first, *then* derive the Page token — never the other way round. Before relying on the result, confirm `Expires: Never` (or `expires_at: 0`) in the Token Debugger ([Part E](#part-e--verify-the-token-details)) — a Type/Page-ID/Scopes match alone is not sufficient |
 | "This app is in development mode" error | The account has no role on the app | Add the account as Tester under App Roles → Roles in the app dashboard |
 | "App not active" when opening the OAuth URL | The Meta app may need a Business Manager connection, or the app is in a state that blocks the OAuth dialog | Use the manual token flow in this doc (Parts A–D) instead of `generate_auth_link.py`. Both produce the same long-lived Page token. |
 | `(#100) Tried accessing nonexisting field (accounts)` calling `/me/accounts` or `fb_exchange_token` | You passed a **Page** access token where a **User** token was expected — Page nodes have no `/accounts` edge | Confirm the token type before retrying blind, via the [Token Debugger UI](https://developers.facebook.com/tools/debug/accesstoken/) (same tool as Part E) — paste the token, no app secret needed. `"type":"PAGE"` (with a `profile_id`) means it's a Page token; `"type":"USER"` (with a `user_id`, no `profile_id`) means it's a User token. Go back to Part A and regenerate with the token-type dropdown set to **User Token**. (A curl form of this check exists but needs your app secret — see [below](#checking-a-tokens-type-without-exposing-your-app-secret) before using it.) |
 | `FacebookUploadError: global id X is not allowed` | Wrong Page ID in `.env` | Confirm the Page ID from the `id` field in `GET /me/accounts` response — not the URL or profile ID. For Pages using Meta's newer unified Page UI, the `profile.php?id=...` number in the URL is a **different ID** from the real Graph API Page ID (a real example: URL showed `61593898195789`, actual Graph API Page ID was `1187029124503799`) — match by the Page's `name` in the `/me/accounts` response instead (see [doc 1, Part E](01-create-app.md)). |
 | `FacebookUploadError: Application has been deleted` (code 101) | Wrong `FB_APP_ID` or `FB_APP_SECRET` in `.env` | Copy the exact values from App Settings → Basic in the developer console |
-| Page token from Part D passes every check (correct App, `Type: Page`, correct Page ID and Scopes) but fails ~1-2 hours after being written to `.env` | The Page token was derived/selected (Part D Step 2, or the Access Token Tool's per-Page row) **before** the underlying User token was extended to long-lived — it silently inherited the User token's short ~1 hour expiry, which nothing but the `Expires` field reveals | Redo Part D in order: extend the User token first (Step 1, or the Access Token Tool's **Extend Access Token** button on the User Token row), *then* derive the Page token (Step 2, or the per-Page row/dropdown) — never the other way round. Before writing the new token to `.env`, confirm `Expires: Never` (or `expires_at: 0`) in the Token Debugger, not just that Type/Page ID/Scopes match — see [Part E](#part-e--verify-the-token-details). |
 
 ### Checking a token's type without exposing your app secret
 
