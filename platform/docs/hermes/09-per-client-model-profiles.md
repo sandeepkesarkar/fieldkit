@@ -133,20 +133,41 @@ of the three things `02-gateway-setup.md` set up for the default profile:
   `~/.hermes/profiles/venus/.env` — the `TELEGRAM_BOT_TOKEN` in
   `clients/venus/src/photo-agent/.env` is a *different* consumer (it's read
   by the plain Python cron scripts, not by Hermes).
-- **Its Telegram authorization allowlist is likewise per-profile and
-  security-relevant, not just config plumbing.** `02-gateway-setup.md`
-  documents `TELEGRAM_ALLOWED_USERS` alongside `TELEGRAM_BOT_TOKEN` for the
-  default profile's `~/.hermes/.env` for exactly this reason — the Telegram
-  adapter's authorization gate reads it per-profile
-  (`gateway/authz_mixin.py`, `plugins/platforms/telegram/adapter.py`:
-  `_scoped_gate_env("TELEGRAM_ALLOWED_USERS")`). Skipping it on a fresh
-  profile isn't a missing-feature gap, it's a missing-authorization gap:
-  `gateway/run.py` logs `No env user allowlists configured. ... will deny
-  unknown senders unless you configure platform allowlists` at startup when
-  none is set, but that's a log line, not a hard failure — the gateway
-  starts either way, so the check has to be to *read the log*, not just to
-  run `doctor` (which doesn't inspect this at all; verified by grepping
-  `hermes_cli/doctor.py` for `ALLOWED_USERS` — no match).
+- **Its Telegram authorization allowlist is likewise per-profile, and the
+  correct way to verify it is direct inspection, not a log line.**
+  `02-gateway-setup.md` documents `TELEGRAM_ALLOWED_USERS` alongside
+  `TELEGRAM_BOT_TOKEN` for the default profile's `~/.hermes/.env` for
+  exactly this reason — the Telegram adapter's authorization gate reads it
+  per-profile (`gateway/authz_mixin.py`,
+  `plugins/platforms/telegram/adapter.py`:
+  `_scoped_gate_env("TELEGRAM_ALLOWED_USERS")`). `hermes doctor` doesn't
+  check this at all (verified by grepping `hermes_cli/doctor.py` for
+  `ALLOWED_USERS` — no match), so verify by directly reading the value —
+  `grep TELEGRAM_ALLOWED_USERS ~/.hermes/profiles/venus/.env` (safe; it's a
+  chat ID, not a secret) — or by having the admin's Telegram account send a
+  command and confirm it goes through.
+
+  **An earlier draft of this doc suggested checking `gateway/run.py`'s
+  startup warning (`No env user allowlists configured`) for absence as
+  proof. That's wrong — verified by reading the actual check:** it's
+  `any(os.getenv(v) for v in _builtin_allowed_vars + ...)` across roughly
+  twenty platform-specific allowlist env vars (Discord, WhatsApp, Slack,
+  Signal, email, SMS, ...), so the warning is suppressed by *any one* of
+  them being set, and its absence proves nothing about
+  `TELEGRAM_ALLOWED_USERS` specifically.
+
+  **Correcting the security framing too:** a missing/wrong
+  `TELEGRAM_ALLOWED_USERS` does **not** mean "the bot is now open to
+  anyone." Hermes's Telegram adapter is fail-closed by design — its own
+  comment says so directly: `"Fail-closed: no allowlist means deny by
+  default"`. Concretely, an unrecognized sender (which, if the admin's own
+  chat ID is missing or mistyped, includes the admin) is routed into
+  Hermes's pairing flow rather than being immediately authorized *or*
+  silently denied — so the realistic failure mode of getting this step
+  wrong is the admin locking themselves out, not an unauthenticated public
+  bot. Actual open access requires a separate, explicit opt-in
+  (`GATEWAY_ALLOW_ALL_USERS=true` or a platform's `*_ALLOW_ALL_USERS` /
+  open `dm_policy`), which nothing in this setup sets.
 - **`skills.external_dirs` must be set again, per profile.** The default
   profile's `~/.hermes/config.yaml` pointing at
   `platform/photo-agent/skills` (`03-process-photos-skill.md`) has no effect

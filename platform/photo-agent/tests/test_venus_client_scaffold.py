@@ -78,3 +78,22 @@ def test_venus_readme_does_not_tell_a_human_to_edit_the_shared_root_env():
 
 def test_venus_constitution_exists():
     assert _VENUS_CONSTITUTION.exists()
+
+
+def test_venus_readme_verifies_telegram_allowlist_correctly():
+    """Regression guard for a wrong verification method caught in review:
+
+    gateway/run.py's "No env user allowlists configured" warning is a
+    disjunction over ~20 platform-specific allowlist env vars -- its
+    absence proves nothing about TELEGRAM_ALLOWED_USERS specifically, since
+    any one of the other ~19 being set would also suppress it. The README
+    must verify by direct inspection instead, and must not imply a missing
+    allowlist means the bot is open to anyone (Hermes is fail-closed: an
+    unrecognized sender is routed to pairing, not auto-authorized).
+    """
+    text = _VENUS_README.read_text()
+    assert "grep TELEGRAM_ALLOWED_USERS" in text
+    assert "fail-closed" in text.lower()
+    # The wrong method (checking the global startup warning) may still be
+    # mentioned as a documented gotcha, but never as the thing to *do*.
+    assert "check `~/.hermes/profiles/venus/logs/gateway.log` for the" not in text
