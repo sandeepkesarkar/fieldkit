@@ -123,8 +123,8 @@ setup commands for venus specifically.
 ## A fresh profile does not inherit the default profile's setup
 
 Profiles are fully isolated (`docs/design/profile-builder.md`: "a profile is
-just a HERMES_HOME directory"), which means a brand-new profile has *neither*
-of the two things `02-gateway-setup.md` set up for the default profile:
+just a HERMES_HOME directory"), which means a brand-new profile has *none*
+of the three things `02-gateway-setup.md` set up for the default profile:
 
 - **Its Telegram bot token lives in the profile's own `.env`, not this
   repo's client `.env`.** The gateway process reads `TELEGRAM_BOT_TOKEN` from
@@ -133,6 +133,20 @@ of the two things `02-gateway-setup.md` set up for the default profile:
   `~/.hermes/profiles/venus/.env` — the `TELEGRAM_BOT_TOKEN` in
   `clients/venus/src/photo-agent/.env` is a *different* consumer (it's read
   by the plain Python cron scripts, not by Hermes).
+- **Its Telegram authorization allowlist is likewise per-profile and
+  security-relevant, not just config plumbing.** `02-gateway-setup.md`
+  documents `TELEGRAM_ALLOWED_USERS` alongside `TELEGRAM_BOT_TOKEN` for the
+  default profile's `~/.hermes/.env` for exactly this reason — the Telegram
+  adapter's authorization gate reads it per-profile
+  (`gateway/authz_mixin.py`, `plugins/platforms/telegram/adapter.py`:
+  `_scoped_gate_env("TELEGRAM_ALLOWED_USERS")`). Skipping it on a fresh
+  profile isn't a missing-feature gap, it's a missing-authorization gap:
+  `gateway/run.py` logs `No env user allowlists configured. ... will deny
+  unknown senders unless you configure platform allowlists` at startup when
+  none is set, but that's a log line, not a hard failure — the gateway
+  starts either way, so the check has to be to *read the log*, not just to
+  run `doctor` (which doesn't inspect this at all; verified by grepping
+  `hermes_cli/doctor.py` for `ALLOWED_USERS` — no match).
 - **`skills.external_dirs` must be set again, per profile.** The default
   profile's `~/.hermes/config.yaml` pointing at
   `platform/photo-agent/skills` (`03-process-photos-skill.md`) has no effect
@@ -150,6 +164,6 @@ of the two things `02-gateway-setup.md` set up for the default profile:
 |---|---|
 | Model provider config | `~/.hermes/profiles/<client>/config.yaml` (`model.provider`, `model.default`) |
 | Skill discovery | `~/.hermes/profiles/<client>/config.yaml` (`skills.external_dirs`) — must be set per profile, see above |
-| Secrets | `~/.hermes/profiles/<client>/.env` (provider API key, **and** that profile's own `TELEGRAM_BOT_TOKEN`) |
+| Secrets | `~/.hermes/profiles/<client>/.env` (provider API key, **and** that profile's own `TELEGRAM_BOT_TOKEN` **and** `TELEGRAM_ALLOWED_USERS`) |
 | Gateway supervisor | a separate launchd service per profile — `hermes -p <client> gateway install` |
 | Telegram bot | a separate BotFather bot per client (gateway bot), distinct again from that client's approval bot (issue #29) |

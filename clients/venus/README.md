@@ -45,6 +45,7 @@ approach originally sketched in `02-gateway-setup.md`.
 | `model.default` | `gpt-5.5` (curated default at time of writing — confirm current availability with `hermes -p venus model` before first use; the picker's list drifts) |
 | Credential | `OPENAI_API_KEY`, in the `venus` profile's own `~/.hermes/profiles/venus/.env` (never in this repo) |
 | Telegram bot for Hermes commands | Its own `TELEGRAM_BOT_TOKEN` (see `.env.example`) — must be a separate BotFather bot from every other client's, and separate from `TELEGRAM_APPROVAL_BOT_TOKEN` below, for the same offset-race reason documented in issue #29 |
+| Telegram admin authorization | `TELEGRAM_ALLOWED_USERS` set to the admin's Telegram user ID (same value as `ADMIN_TELEGRAM_CHAT_ID` in `.env.example`) — a fresh profile has **no** allowlist until this is set, same as the bot token below |
 
 This is a per-client configuration choice, not code: `platform/photo-agent/`
 scripts never call a model API directly (see the Architecture section) — the
@@ -65,10 +66,10 @@ are a completely separate consumer from the Hermes gateway process:
 1. `hermes profile create venus`
 2. `hermes -p venus config set model.provider openai-api`
 3. `hermes -p venus config set model.default gpt-5.5` (or whichever current model `hermes -p venus model` shows for `openai-api`)
-4. Put `OPENAI_API_KEY=...` **and** `TELEGRAM_BOT_TOKEN=...` (venus's gateway bot, from the checklist's Telegram step) in `~/.hermes/profiles/venus/.env`. The gateway reads its bot token from the active profile's own env, not from this repo — an install without this step would create a profile that is correctly configured for OpenAI but binds to no Telegram bot at all.
+4. Put `OPENAI_API_KEY=...`, `TELEGRAM_BOT_TOKEN=...` (venus's gateway bot, from the checklist's Telegram step), and `TELEGRAM_ALLOWED_USERS=...` (the admin's Telegram user ID) in `~/.hermes/profiles/venus/.env`. The gateway reads its bot token and its authorization allowlist from the active profile's own env, not from this repo — an install without this step would create a profile that is correctly configured for OpenAI but either binds to no Telegram bot, or (if only the token is set and not the allowlist) starts with **no admin authorization check** for who can trigger commands.
 5. `hermes -p venus config set skills.external_dirs '["~/src/fieldkit/platform/photo-agent/skills"]'` — profiles have fully isolated skill discovery (see `docs/design/profile-builder.md` in the Hermes source tree), so without this, `/process_photos` and `/check_approval` are invisible to venus's gateway even though they're already registered for the default profile (`03-process-photos-skill.md`). Confirm with `hermes -p venus skills list --source local` — expect both `process-photos` and `check-approval` listed as `local` / `enabled`.
-6. `hermes -p venus doctor` — confirm it reports the OpenAI API key as configured (no more `✗ model.provider 'openai-api' is set but no API key is configured`)
-7. `hermes -p venus gateway install --start-now --start-on-login` — a second, independently-supervised gateway process bound to venus's own `TELEGRAM_BOT_TOKEN`
+6. `hermes -p venus doctor` — confirm it reports the OpenAI API key as configured (no more `✗ model.provider 'openai-api' is set but no API key is configured`). **`doctor` does not check the Telegram allowlist** — that's only validated at gateway startup (see step 7).
+7. `hermes -p venus gateway install --start-now --start-on-login` — a second, independently-supervised gateway process bound to venus's own `TELEGRAM_BOT_TOKEN`. Immediately after, check `~/.hermes/profiles/venus/logs/gateway.log` for the **absence** of `No env user allowlists configured` — that warning firing means `TELEGRAM_ALLOWED_USERS` from step 4 wasn't picked up and the gateway is running with no authorization gate.
 
 ---
 

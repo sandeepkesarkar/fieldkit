@@ -55,12 +55,14 @@ def test_venus_readme_scopes_telegram_token_and_skills_to_the_profile():
     """Regression guard for the profile-isolation gaps caught in review:
 
     a fresh Hermes profile inherits neither the default profile's Telegram
-    bot token nor its skills.external_dirs -- both must be set on the
-    venus profile specifically, not assumed from clients/venus's own .env
-    or from the default profile's ~/.hermes/config.yaml.
+    bot token, its authorization allowlist, nor its skills.external_dirs --
+    all three must be set on the venus profile specifically, not assumed
+    from clients/venus's own .env or from the default profile's
+    ~/.hermes/config.yaml.
     """
     text = _VENUS_README.read_text()
     assert "profiles/venus/.env" in text
+    assert "TELEGRAM_ALLOWED_USERS" in text
     assert "skills.external_dirs" in text
 
 
