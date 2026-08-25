@@ -171,9 +171,23 @@ The account that runs the OAuth flow must be an admin of the target Page.
 
 **Finding your Page ID** — you will need it for `--page-id`:
 
-- Option 1: On the Page, click **About** in the left menu. Look for **Page ID** — it is a long number (e.g. `123456789012345`).
-- Option 2: Use Graph API Explorer (covered in doc 2) — `GET /me/accounts` returns the ID alongside the token.
-- Option 3: The Page URL sometimes contains the ID directly: `facebook.com/profile.php?id=123456789012345`.
+> **Do not copy the number from the Page's own URL and use it as `FB_PAGE_ID`.**
+> For Pages created under Meta's newer unified "Page" UI, the Page's URL looks
+> like `facebook.com/profile.php?id=NNNNN` — but that number can be a
+> **completely different identifier** from the Page's actual Graph API node ID.
+> Using it as `FB_PAGE_ID` produces confusing failures later (a real example:
+> a Page's URL showed `61593898195789`, but its real Graph API Page ID —
+> confirmed via `/me/accounts` and cross-checked with the Token Debugger — was
+> `1187029124503799`). See [doc 2, Troubleshooting](02-manual-test.md) for the
+> failure this causes.
+
+- **Recommended** — Use Graph API Explorer (covered in [doc 2, Part B](02-manual-test.md)):
+  call `GET /me/accounts`, find the entry whose **`name`** matches your Page, and
+  use *that entry's* `id` field. This is the only source guaranteed to match what
+  the rest of the Graph API (and `generate_auth_link.py`) expects.
+- On the Page, click **About** in the left menu and look for **Page ID**. This
+  usually matches the Graph API ID, but if it disagrees with what `/me/accounts`
+  returns, trust `/me/accounts`.
 
 ---
 

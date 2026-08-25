@@ -95,5 +95,5 @@ Use the [Token Debugger](https://developers.facebook.com/tools/debug/accesstoken
 |---|---|
 | "Invalid Scopes" in browser | App use case is wrong — see [01-create-app.md](docs/facebook/01-create-app.md) Step 2 |
 | Port already in use | Run with `--port 8081`; add `http://localhost:8081/callback` to redirect URIs |
-| "Page not found" (exit 3) | Verify the Page ID and that the authorizing account is a Page admin |
+| "Page not found" (exit 3) | Verify the Page ID and that the authorizing account is a Page admin — don't use the ID from the Page's own URL (`profile.php?id=...`), which can be a different identifier for Pages on Meta's newer unified Page UI; get the real ID from `GET /me/accounts` instead (see [02-manual-test.md, Part B](docs/facebook/02-manual-test.md)) |
 | Token expired later | Re-run this script — it always produces a non-expiring Page token |
