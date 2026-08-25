@@ -1,0 +1,130 @@
+# Per-Client Model Provider Routing — Hermes Profiles
+
+**Supersedes:** the "Switching a client to OpenAI" section of
+[`02-gateway-setup.md`](02-gateway-setup.md) (issue #6), which documented an
+incorrect/incomplete mechanism, and resolves the open question that section
+flagged for #11/#12.
+
+**Written for:** issue #12 (venus, OpenAI-backed demo client), applies
+identically to issue #11 (mercury, Anthropic-backed demo client).
+
+## What #6's doc got wrong
+
+`02-gateway-setup.md` originally suggested two options for switching a
+client to OpenAI:
+
+1. `hermes config set model.provider openai-codex` — **wrong for this use
+   case.** `openai-codex` is Hermes's OAuth ChatGPT/Codex-subscription
+   provider (`hermes_cli/providers.py`: `auth_type="oauth_external"`,
+   `base_url_override="https://chatgpt.com/backend-api/codex"`). It has
+   nothing to do with a plain OpenAI API key.
+2. `provider: "custom"` with `base_url: "https://api.openai.com/v1"` —
+   **works, but isn't the real mechanism.** Hermes ships a first-class
+   overlay for exactly this case, so hand-rolling `custom` + `base_url` is
+   unnecessary and easy to get subtly wrong (e.g. omitting the right env var
+   name for the key).
+
+It also never mentioned the biggest trap: setting `model.provider: openai`
+directly in `config.yaml` does **not** call OpenAI's API. `openai` is
+registered as an alias that resolves to the OpenRouter aggregator
+(`hermes_cli/models.py`: `ALIASES = {"openai": "openrouter", ...}`) — a
+plain-API-key OpenAI setup that used `provider: openai` would silently bill
+through OpenRouter instead of OpenAI directly. (This also explains the
+`base_url: https://openrouter.ai/api/v1` sitting alongside
+`model.provider: anthropic` in this Mac's current `~/.hermes/config.yaml` —
+a leftover from an earlier OpenRouter experiment, unrelated to this feature,
+left as-is since editing the default profile's config is out of scope here.)
+
+Finally, it left unresolved how two demo customers on different providers
+could coexist, since this Hermes install is one gateway process with one
+global config.
+
+## The verified mechanism
+
+**Provider identity for a plain OpenAI API key: `openai-api`**, not `openai`,
+not `openai-codex`. Confirmed directly from Hermes's own source
+(`hermes_cli/providers.py`):
+
+```python
+"openai-api": HermesOverlay(
+    transport="codex_responses",
+    base_url_override="https://api.openai.com/v1",
+    base_url_env_var="OPENAI_BASE_URL",
+),
+```
+
+and from `hermes_cli/models.py`'s provider registry, which labels it
+explicitly: `ProviderEntry("openai-api", "OpenAI API", "OpenAI API
+(api.openai.com, API key)")`. `hermes auth list` on this machine already
+shows a usable credential for it:
+
+```
+openai-api (1 credentials):
+  #1  OPENAI_API_KEY       api_key env:OPENAI_API_KEY
+```
+
+**Per-client isolation: Hermes profiles**, not the global config and not
+`platforms.api_server.extra.model_routes` (that block is real, but it's
+scoped to the `api_server` platform — an OpenAI-compatible local proxy — not
+a general mechanism for routing different Telegram bots to different
+providers). A profile is a complete, isolated `~/.hermes/profiles/<name>/`
+directory with its own `config.yaml` (`model.provider`, `model.default`),
+its own `.env` (API keys), and its own skills — see `hermes profile --help`
+and `docs/design/profile-builder.md` in the Hermes source tree. Verified
+empirically on this machine (profile created, configured, and deleted purely
+for verification — the default profile, bound to `_demo`'s Telegram bot, was
+untouched throughout):
+
+```
+$ hermes profile create fk-verify-tmp --no-alias --no-skills
+Profile 'fk-verify-tmp' created at /Users/sandeep_a_k/.hermes/profiles/fk-verify-tmp
+
+$ hermes -p fk-verify-tmp config set model.provider openai-api
+✓ Set model.provider = openai-api in .../profiles/fk-verify-tmp/config.yaml
+
+$ hermes -p fk-verify-tmp config set model.default gpt-5.1
+✓ Set model.default = gpt-5.1 in .../profiles/fk-verify-tmp/config.yaml
+
+$ hermes -p fk-verify-tmp doctor
+✗ model.provider 'openai-api' is set but no API key is configured (check ~/.hermes/.env or run 'hermes setup')
+```
+
+(The `doctor` failure is expected and correct — this test profile was never
+given an `OPENAI_API_KEY`. It confirms `openai-api` is recognized as a valid
+provider and that the profile's config is genuinely isolated from the
+default profile's.)
+
+## The convention this repo uses
+
+**One Hermes profile per client, named after the client directory.** This
+resolves #6's open question directly: `_demo` keeps using the default
+profile (already bound to its Telegram bot per #6/PR #16); `venus` and
+`mercury` each get their own named profile, each with its own `model.provider`
+and its own Telegram bot pair, each independently `hermes -p <client>
+gateway install`-able as its own supervised process. Nothing about the
+photo-agent pipeline changes — `platform/photo-agent/` scripts never call a
+model API directly (video generation is deterministic FFmpeg, not
+LLM-driven), so the provider only affects which model executes the
+`process-photos` / `check-approval` Hermes skills for that client's Telegram
+commands. Because those skills are prose instructions with no room for
+provider-specific interpretation (see the SKILL.md files' own "relay
+verbatim, do not summarise" instructions), Story 2's "identical skill
+behavior across providers" acceptance scenario holds by construction.
+
+| Client | Hermes profile | `model.provider` | `model.default` |
+|---|---|---|---|
+| `_demo` | `default` | `anthropic` | `claude-sonnet-5` |
+| `mercury` (#11) | `mercury` | `anthropic` | (mercury's own choice — not this issue) |
+| `venus` (#12) | `venus` | `openai-api` | `gpt-5.5` (confirm current availability with `hermes -p venus model`) |
+
+See `clients/venus/README.md`'s Provider Configuration section for the exact
+setup commands for venus specifically.
+
+## Install/config locations touched (per client profile)
+
+| What | Where |
+|---|---|
+| Model provider config | `~/.hermes/profiles/<client>/config.yaml` (`model.provider`, `model.default`) |
+| Secrets | `~/.hermes/profiles/<client>/.env` (provider API key) |
+| Gateway supervisor | a separate launchd service per profile — `hermes -p <client> gateway install` |
+| Telegram bot | a separate BotFather bot per client (gateway bot), distinct again from that client's approval bot (issue #29) |

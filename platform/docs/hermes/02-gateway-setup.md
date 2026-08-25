@@ -102,27 +102,27 @@ running background service isn't something a unit test exercises):
 
 ## Switching a client to OpenAI
 
-For a future OpenAI-backed client (#12), the provider swap is:
+**Corrected by #12 — see
+[`09-per-client-model-profiles.md`](09-per-client-model-profiles.md) for the
+verified mechanism and full rationale.** The guidance originally written here
+was wrong on two counts: `openai-codex` is OAuth ChatGPT/Codex-subscription
+auth, not a plain API key, and bare `provider: "openai"` silently aliases to
+the OpenRouter aggregator rather than calling OpenAI directly. The correct
+provider identity for a plain API key is `openai-api`
+(`hermes_cli/providers.py`'s `HermesOverlay` for it points at
+`https://api.openai.com/v1` and reads `OPENAI_API_KEY`) — confirmed against
+`hermes auth list`, which already shows that credential available on this
+machine.
 
-```bash
-hermes config set model.provider openai-codex   # or "custom" pointed at OpenAI's endpoint
-```
-
-or, for a plain OpenAI API key rather than OAuth, set `provider: "custom"`
-with `base_url: "https://api.openai.com/v1"` under `model:` in
-`config.yaml`, and put `OPENAI_API_KEY` in `.env`. (`hermes auth list`
-already shows an `OPENAI_API_KEY` credential available in this environment —
-untouched by this issue, just noted for #12.)
-
-**Open question for #11/#12, not resolved here:** this Hermes install is a
-single gateway process with one global `config.yaml`/`.env` on this Mac
-Mini. Two demo customers each needing their *own* provider (Anthropic vs
-OpenAI) and their own bot token means either separate named gateway profiles
-(`hermes gateway list` shows profile support — `default` is the only one
-today) or Hermes's per-client model-routing block
-(`platforms.api_server.extra.model_routes` in `config.yaml`). Deciding
-between those is #11/#12's problem, not this issue's — flagging it here so
-it isn't a surprise.
+**The multi-client open question this section originally flagged is now
+resolved**: per-client provider isolation
+uses one **Hermes profile per client** (`hermes profile create <client>`,
+`hermes -p <client> config set model.provider openai-api`), not a shared
+global `config.yaml` and not `platforms.api_server.extra.model_routes` (that
+block is scoped to the `api_server` platform, not Telegram). `venus` (#12)
+and `mercury` (#11) each get their own profile and their own Telegram bot
+pair; `_demo` keeps the default profile described in this document
+unchanged.
 
 ## Install/config locations touched
 
@@ -137,5 +137,5 @@ it isn't a surprise.
 ## Next steps (separate issues)
 
 - #7 / #8 — port `process_photos` / `check_approval` dispatch as Hermes skills (done — see `03-process-photos-skill.md`, `04-check-approval-skill.md`; #8's button-callback trigger stays on its existing cron leg, not Hermes, per FR-002a)
-- #11 / #12 — Anthropic-backed / OpenAI-backed demo customers (resolves the multi-client provider question above)
+- #11 / #12 — Anthropic-backed / OpenAI-backed demo customers (resolves the multi-client provider question above — see `09-per-client-model-profiles.md`)
 - #14 — uninstall OpenClaw once nothing depends on it
