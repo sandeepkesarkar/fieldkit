@@ -76,6 +76,11 @@ The response should look like:
 > from the browser or the Page's URL, which can be a completely different
 > identifier (see [doc 1, Part E](01-create-app.md)). Use *that entry's* `id`
 > field as your `FB_PAGE_ID`.
+>
+> If two Pages share the exact same name, name-matching alone won't disambiguate
+> them — open the Page you actually want in a browser tab and cross-check via
+> **About → Page ID**, or paste each candidate's `access_token` into the Token
+> Debugger and compare its `profile_id` against the `id` you're trying to confirm.
 
 - **`id`** is your `FB_PAGE_ID`. Copy it.
 - **`access_token`** in the response is a **Page access token**. Copy it.
@@ -233,6 +238,36 @@ python3 scripts/generate_auth_link.py --page-id YOUR_PAGE_ID
 | Token expires in 1 hour | Short-lived user token used to call `/accounts` | Do Part D to exchange for a permanent Page token |
 | "This app is in development mode" error | The account has no role on the app | Add the account as Tester under App Roles → Roles in the app dashboard |
 | "App not active" when opening the OAuth URL | The Meta app may need a Business Manager connection, or the app is in a state that blocks the OAuth dialog | Use the manual token flow in this doc (Parts A–D) instead of `generate_auth_link.py`. Both produce the same long-lived Page token. |
-| `(#100) Tried accessing nonexisting field (accounts)` calling `/me/accounts` or `fb_exchange_token` | You passed a **Page** access token where a **User** token was expected — Page nodes have no `/accounts` edge | Confirm the token type before retrying blind: `curl -s "https://graph.facebook.com/v25.0/debug_token?input_token=TOKEN&access_token=APP_ID\|APP_SECRET"`. `"type":"PAGE"` (with a `profile_id`) means it's a Page token; `"type":"USER"` (with a `user_id`, no `profile_id`) means it's a User token. Go back to Part A and regenerate with the token-type dropdown set to **User Token**. |
-| `FacebookUploadError: global id X is not allowed` | Wrong Page ID in `.env` | Confirm the Page ID from the `id` field in `GET /me/accounts` response — not the URL or profile ID. For Pages using Meta's newer unified Page UI, the `profile.php?id=...` number in the URL is a **different ID** from the real Graph API Page ID — match by the Page's `name` in the `/me/accounts` response instead (see [doc 1, Part E](01-create-app.md)). |
+| `(#100) Tried accessing nonexisting field (accounts)` calling `/me/accounts` or `fb_exchange_token` | You passed a **Page** access token where a **User** token was expected — Page nodes have no `/accounts` edge | Confirm the token type before retrying blind, via the [Token Debugger UI](https://developers.facebook.com/tools/debug/accesstoken/) (same tool as Part E) — paste the token, no app secret needed. `"type":"PAGE"` (with a `profile_id`) means it's a Page token; `"type":"USER"` (with a `user_id`, no `profile_id`) means it's a User token. Go back to Part A and regenerate with the token-type dropdown set to **User Token**. (A curl form of this check exists but needs your app secret — see [below](#checking-a-tokens-type-without-exposing-your-app-secret) before using it.) |
+| `FacebookUploadError: global id X is not allowed` | Wrong Page ID in `.env` | Confirm the Page ID from the `id` field in `GET /me/accounts` response — not the URL or profile ID. For Pages using Meta's newer unified Page UI, the `profile.php?id=...` number in the URL is a **different ID** from the real Graph API Page ID (a real example: URL showed `61593898195789`, actual Graph API Page ID was `1187029124503799`) — match by the Page's `name` in the `/me/accounts` response instead (see [doc 1, Part E](01-create-app.md)). |
 | `FacebookUploadError: Application has been deleted` (code 101) | Wrong `FB_APP_ID` or `FB_APP_SECRET` in `.env` | Copy the exact values from App Settings → Basic in the developer console |
+
+### Checking a token's type without exposing your app secret
+
+The `debug_token` endpoint's curl form needs an app access token
+(`APP_ID|APP_SECRET`) to authorize the lookup. Don't type the secret directly
+into a curl URL — the same rule [doc 1](01-create-app.md) states for
+`FB_APP_SECRET` ("must never be committed to git, logged, or appear anywhere
+in the cron path") applies here too: a secret embedded in a command's
+arguments is visible to any other process on the machine via `ps` for as long
+as curl is running, and separately risks being written to your shell history.
+
+**Prefer the Token Debugger UI** linked above for this check — paste in the
+token you're unsure about and click **Debug**. It needs no app secret at all
+for this specific lookup.
+
+**If you must script it**, keep the secret out of your typed command text
+(so it isn't saved verbatim into shell history) by reading it interactively
+instead of writing it inline:
+```bash
+read -rs -p "App secret: " FB_APP_SECRET; echo
+curl -sS "https://graph.facebook.com/v25.0/debug_token?input_token=TOKEN&access_token=${FB_APP_ID}|${FB_APP_SECRET}"
+```
+This keeps the literal secret out of your shell history. It does **not** hide
+it from `ps` — once the shell expands the variables, curl's full argument
+list (secret included) is still visible to other users on the machine for
+the life of the request. For a one-off manual check, use the UI instead.
+
+Either way, don't paste the full `debug_token` response into tickets, logs,
+or chat — it includes scopes, expiry, and internal IDs beyond what's needed
+to answer the type question.
