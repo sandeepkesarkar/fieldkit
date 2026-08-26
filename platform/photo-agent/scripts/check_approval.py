@@ -73,14 +73,13 @@ load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", overri
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from tools import drive, state
+from tools import drive, paths, state
 from tools import facebook_state
 from tools import logger as activity_log
 from tools import telegram_api
 
 _log = logging.getLogger(__name__)
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
-_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _try_acquire_check_lock() -> "IO | None":
@@ -156,21 +155,11 @@ def _send_approval_email(agent_email: str, admin_email: str, project_name: str, 
     _log.info("approval email sent: project=%s", project_name)
 
 
-def _get_tmp_root() -> Path:
-    """Return the allowed root directory for local video files."""
-    tmp_raw = os.environ.get("VIDEO_TMP_DIR", "")
-    if tmp_raw:
-        p = Path(tmp_raw)
-        return (p if p.is_absolute() else (_REPO_ROOT / p)).resolve()
-    # Default to client-specific data dir so clients never share a tmp directory.
-    return (Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent" / "tmp").resolve()
-
-
 def _delete_local_file(video_local_path: str, project_name: str) -> None:
     """Delete the local temp video file, refusing to act on paths outside the tmp directory."""
     try:
         p = Path(video_local_path).resolve()
-        allowed = _get_tmp_root()
+        allowed = paths.get_video_tmp_root()
         try:
             p.relative_to(allowed)
         except ValueError:

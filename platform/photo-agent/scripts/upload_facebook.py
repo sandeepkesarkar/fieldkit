@@ -65,7 +65,7 @@ load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", overri
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from tools import facebook_api, facebook_logger, facebook_state, telegram_api
+from tools import facebook_api, facebook_logger, facebook_state, paths, telegram_api
 from tools.facebook_api import FacebookTokenError, FacebookUploadError
 
 _log = logging.getLogger(__name__)
@@ -79,7 +79,6 @@ _COOLDOWN_SECONDS = 60
 # running would let a second cron tick reclaim and re-call the Facebook API for the same job.
 # See claim_pending_upload()'s docstring for the full tradeoff.
 _UPLOAD_LEASE_SECONDS = 900
-_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _try_acquire_upload_lock() -> "IO | None":
@@ -105,21 +104,11 @@ def _try_acquire_upload_lock() -> "IO | None":
         return None
 
 
-def _get_tmp_root() -> Path:
-    """Return the allowed root directory for local video files."""
-    tmp_raw = os.environ.get("VIDEO_TMP_DIR", "")
-    if tmp_raw:
-        p = Path(tmp_raw)
-        return (p if p.is_absolute() else (_REPO_ROOT / p)).resolve()
-    # Default to client-specific data dir so clients never share a tmp directory.
-    return (Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent" / "tmp").resolve()
-
-
 def _delete_local_file(video_local_path: str, project_name: str) -> None:
     """Delete the local temp video file. Best-effort: logs on failure, never raises."""
     try:
         p = Path(video_local_path).resolve()
-        allowed = _get_tmp_root()
+        allowed = paths.get_video_tmp_root()
         try:
             p.relative_to(allowed)
         except ValueError:

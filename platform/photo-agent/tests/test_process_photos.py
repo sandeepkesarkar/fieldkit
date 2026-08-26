@@ -619,12 +619,13 @@ def test_happy_path_scrub_is_called(happy, env):
 # ---------------------------------------------------------------------------
 
 def test_relative_video_tmp_dir_resolves_against_fieldkit_data_dir(happy, monkeypatch, tmp_path):
-    """A relative VIDEO_TMP_DIR (the shipped .env.example default) resolves under
-    FIELDKIT_DATA_DIR, not the shared fieldkit repo checkout."""
+    """A relative VIDEO_TMP_DIR (the formerly shipped .env.example default, now
+    commented out — see #47) resolves under FIELDKIT_DATA_DIR, not the shared
+    fieldkit repo checkout."""
     import scripts.process_photos as proc
 
     client_data_dir = tmp_path / "clients" / "mercury" / "data"
-    monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")  # the shipped relative default
+    monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")  # the formerly shipped relative default
     monkeypatch.setenv("FIELDKIT_DATA_DIR", str(client_data_dir))
 
     main(["--project", _PROJECT])
@@ -636,9 +637,10 @@ def test_relative_video_tmp_dir_resolves_against_fieldkit_data_dir(happy, monkey
 
 
 def test_two_clients_same_relative_video_tmp_dir_do_not_collide(happy, monkeypatch, tmp_path):
-    """Two clients that ship the same relative VIDEO_TMP_DIR value (as mercury, venus,
-    and _construction_co's .env.example did) must resolve to different absolute tmp
-    directories — the cross-client collision at the heart of #47."""
+    """Two clients that set the same relative VIDEO_TMP_DIR value (as mercury, venus,
+    and _construction_co's .env.example formerly did, uncommented — see #47) must
+    resolve to different absolute tmp directories — the cross-client collision at the
+    heart of #47."""
     import scripts.process_photos as proc
 
     monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")

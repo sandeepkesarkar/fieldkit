@@ -203,6 +203,28 @@ def test_reject_deletes_local_file(base, tmp_path, monkeypatch):
     assert not local_file.exists()
 
 
+def test_reject_deletes_local_file_with_relative_video_tmp_dir(base, tmp_path, monkeypatch):
+    """reject path deletes a video the producer wrote under a RELATIVE VIDEO_TMP_DIR
+    resolved against FIELDKIT_DATA_DIR — the producer/consumer resolution mismatch
+    that #47's review follow-up caught: this script used to resolve the same
+    relative value against the shared repo root instead, so it refused to delete
+    files the fixed producer actually wrote."""
+    import scripts.check_approval as ca
+    client_data_dir = tmp_path / "clients" / "mercury" / "data"
+    monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")
+    monkeypatch.setenv("FIELDKIT_DATA_DIR", str(client_data_dir))
+
+    video_dir = client_data_dir / "data" / "photo-agent" / "tmp" / _PROJECT
+    video_dir.mkdir(parents=True)
+    local_file = video_dir / "video.mp4"
+    local_file.write_bytes(b"\x00" * 64)
+
+    pending = dict(_PENDING, video_local_path=str(local_file))
+    ca.state.get_pending_approval.return_value = pending
+    main(_REJECT_ARGS)
+    assert not local_file.exists()
+
+
 def test_reject_sends_telegram_notification(base):
     """reject path sends a Telegram rejection notification containing '❌'."""
     import scripts.check_approval as ca
