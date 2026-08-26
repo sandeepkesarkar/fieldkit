@@ -64,6 +64,18 @@ import requests
 
 from dotenv import load_dotenv
 
+# CLIENT_NAME resolution order (issue #45): a CLIENT_NAME already present in
+# the process environment when this script starts (e.g. `env CLIENT_NAME=foo
+# python3 ...` on a crontab line, or an inline override on a manual
+# invocation) wins over the root .env's CLIENT_NAME, because
+# load_dotenv(_ROOT / ".env") below defaults to override=False and never
+# clobbers an already-set env var. This is the supported mechanism for
+# running multiple clients' cron-driven flows concurrently on one machine:
+# each cron entry sets CLIENT_NAME inline and never touches the shared root
+# .env, so there's no mutable state one client's run could accidentally
+# repoint at another's. Today's single-client posture (no inline override,
+# CLIENT_NAME only in the root .env) is unaffected. See
+# platform/docs/hermes/05-cron-verification.md.
 _ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
 load_dotenv(_ROOT / ".env")
 _CLIENT = os.environ.get("CLIENT_NAME")

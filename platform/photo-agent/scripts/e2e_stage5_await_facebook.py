@@ -28,6 +28,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# CLIENT_NAME resolution order (issue #45): a pre-set CLIENT_NAME in the
+# process environment wins over the root .env's value — see
+# run_e2e_test.py's module docstring comment for the full rationale.
 _ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
 load_dotenv(_ROOT / ".env")
 _CLIENT = os.environ.get("CLIENT_NAME")

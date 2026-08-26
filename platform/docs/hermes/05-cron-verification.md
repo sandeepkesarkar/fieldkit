@@ -26,6 +26,16 @@ Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-herm
 > section, since an inaccurate "verification" doc is worse than none. The
 > corrected verdicts are in "Acceptance Criteria — Final Status" below.
 
+> **Addendum (issue #45):** the crontab lines shown throughout this doc
+> (below, and the ones actually live on the Mac Mini as of this writing) all
+> rely on the shared root `.env`'s `CLIENT_NAME` — the single-client-at-a-
+> time posture these lines were written under. See "Running more than one
+> client's cron entries concurrently" below for the per-entry override that
+> makes two clients' cron-driven flows safe to run side by side, once
+> that's actually needed. **This addendum is documentation only** — the
+> live crontab itself has not been changed by it; migrating the live
+> entries to per-client overrides is a separate, later step.
+
 ## Summary
 
 The three scripts themselves are confirmed byte-for-byte unchanged since
@@ -155,6 +165,58 @@ at each stage:
 `PATH` env var, and log redirect were left untouched in both edits to the
 other two lines — only the script path and (in the second edit) the
 interpreter path changed.
+
+## Running more than one client's cron entries concurrently (issue #45)
+
+The crontab entries above (and the ones actually live on the Mac Mini) all
+depend on the shared root `fieldkit/.env`'s `CLIENT_NAME` — every cron tick
+of `upload_facebook.py` (and, before issue #49 retired its cron leg,
+`check_approval.py`) runs against whatever client that one shared file
+currently names. That's fine for a single client at a time, but it means
+two clients' cron-driven flows cannot correctly coexist: there is no way
+for one cron entry to say "run this against `venus`" while another says
+"run this against `mercury`" — both would read the same `CLIENT_NAME`.
+
+**Mechanism (already supported by the scripts themselves, no code changes
+needed):** `process_photos.py`, `check_approval.py`, `upload_facebook.py`,
+and `run_e2e_test.py` each load env vars in two steps —
+`load_dotenv(_ROOT / ".env")` (the shared root file, `override=False`, the
+`python-dotenv` default) followed by `load_dotenv(.../clients/<client>/.../.env",
+override=True)` (that client's own secrets, which are allowed to override).
+Because the *first* call defaults to `override=False`, it never clobbers a
+`CLIENT_NAME` already present in the process's environment when the script
+starts. So a `CLIENT_NAME` set inline on the invocation itself always wins
+over the root `.env`'s value — verified empirically (see
+`platform/photo-agent/tests/test_client_name_override.py`), not assumed
+from reading the `python-dotenv` docs alone.
+
+That makes the fix a documentation-and-crontab-authoring convention, not a
+new mechanism: give each client its own crontab line, with `CLIENT_NAME=`
+set inline on that line, instead of one shared line per script that relies
+on the root `.env`:
+
+```cron
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin CLIENT_NAME=venus /usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin CLIENT_NAME=mercury /usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+```
+
+`env CLIENT_NAME=<client>` sets the variable for that one crontab-spawned
+process only — it never writes to the shared root `.env`, so there is no
+mutable state one client's cron entry (or a manual/e2e test invocation
+using the same inline-override pattern) could accidentally repoint at
+another client's credentials or data. A crontab entry with no inline
+`CLIENT_NAME=` keeps resolving from the shared root `.env` exactly as
+before, so today's single-client-at-a-time posture (the only thing live on
+this Mac Mini right now) is completely unaffected by this convention
+existing.
+
+This addendum is documentation and test coverage only. **The live crontab
+on this Mac Mini has not been changed** — it still runs the single shared-
+`.env` form shown in "Current" above, because only one client
+(`_demo`) is live today. Adopting the per-entry override form above (and
+adding entries for additional clients) is a live-migration step for
+whenever a second client's cron-driven flow actually needs to run
+alongside `_demo`'s — not part of this change.
 
 **Known gap:** there is no tracked crontab source-of-truth in this repo, and
 no automated drift check between what's documented here and what's
