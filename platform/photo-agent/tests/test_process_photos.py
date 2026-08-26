@@ -438,12 +438,146 @@ def test_happy_path_approval_message_instructs_approve_or_reject_commands(happy,
     assert "/photo_reject" in text
 
 
-def test_happy_path_approval_message_uses_markdown_parse_mode(happy, env):
-    """send_message() is called with parse_mode='Markdown'."""
+def test_happy_path_approval_message_sent_as_plain_text(happy, env):
+    """send_message() is called with no parse_mode — issue #54: Telegram's legacy
+    'Markdown' parse_mode treats unescaped '_' as an italic delimiter, which
+    silently stripped the underscores from /photo_approve and /photo_reject
+    ('Reply /photoapprove or /photoreject.'). Plain text sidesteps that class of
+    bug entirely rather than requiring escaping to be kept correct forever."""
     import scripts.process_photos as proc
     main(["--project", _PROJECT])
     kwargs = proc.telegram_api.send_message.call_args.kwargs
-    assert kwargs.get("parse_mode") == "Markdown"
+    assert "parse_mode" not in kwargs
+
+
+class _TelegramEntityParseError(Exception):
+    """Models the 400 'Can't parse entities' error Telegram's Bot API returns for
+    an unmatched Markdown-style entity delimiter. The real API rejects the whole
+    sendMessage call in this case rather than rendering something — it does not
+    silently drop or ignore an unclosed entity."""
+
+
+_LEGACY_MARKDOWN_ESCAPABLE = frozenset("_*`[")
+
+
+def _render_legacy_markdown_v1_underscores(text: str) -> str:
+    """Narrow, docs-grounded model of ONE piece of Telegram's legacy 'Markdown'
+    parse_mode (https://core.telegram.org/bots/api#markdown-style): '_' pairing/
+    stripping for italics, plus the escape-character set shared by all legacy
+    Markdown entities. It is NOT a general reimplementation of Telegram's parser
+    — it does not track '*' bold, '`' code, or '[...](...)' links as spans, and
+    entity nesting is out of scope (the docs say nesting isn't supported anyway).
+    It exists only to reason about, and regression-test, this underscore bug.
+
+    Modeled, per the docs and TDLib's actual parser (the Bot API's underlying
+    implementation:
+    https://github.com/tdlib/td/blob/d1085f9cebc5a62379991ae1652673954f229c1f/td/telegram/MessageEntity.cpp#L1929-L2045):
+    - An unescaped '_' toggles an italic span; on a matched pair, both delimiter
+      characters are stripped from the output (this is what corrupted the issue
+      #54 message: 'Reply /photo_approve or /photo_reject.' has exactly two
+      unescaped '_', so the first opens and the second closes, both vanish).
+    - Backslash-escaping is state-aware and only recognized OUTSIDE any open
+      entity: "to escape characters '_', '*', '`', '[' outside of an entity,
+      prepend the character '\\'" — and "escaping inside entities is not
+      allowed, so entity must be closed first and reopened again". So once a '_'
+      has opened an italic span, a backslash has no special meaning inside it —
+      it's just a literal character — and the very next '_' always closes the
+      entity, escaped or not. The docs' own worked example for an italicized
+      string containing a literal underscore therefore closes the entity first,
+      escapes the literal '_' in the outer scan, then reopens: '_snake_\\__case_'
+      -> 'snake_case'. That round trip, and the negative case of trying to escape
+      *inside* an already-open entity ('_snake\\_case_', which does NOT produce
+      'snake_case'), are both used below as fixtures.
+    - An unmatched (odd count of) unescaped '_' raises _TelegramEntityParseError,
+      matching Telegram's documented/widely-observed behavior of rejecting the
+      whole message with a 400 rather than rendering it some other way.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_entity = False
+    while i < n:
+        ch = text[i]
+        if in_entity:
+            # No escaping recognized inside an open entity — a backslash here is
+            # just a literal character, and the next '_' always closes the span.
+            if ch == "_":
+                in_entity = False
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n and text[i + 1] in _LEGACY_MARKDOWN_ESCAPABLE:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch == "_":
+            in_entity = True
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if in_entity:
+        raise _TelegramEntityParseError("Can't parse entities: can't find end of Italic entity")
+    return "".join(out)
+
+
+def test_legacy_markdown_v1_underscore_simulator_matches_observed_corruption():
+    """Sanity-checks the simulator against the exact corruption reported live in
+    issue #54, so the end-to-end regression test below can be trusted."""
+    assert (
+        _render_legacy_markdown_v1_underscores("Reply /photo_approve or /photo_reject.")
+        == "Reply /photoapprove or /photoreject."
+    )
+
+
+def test_legacy_markdown_v1_underscore_simulator_matches_docs_escaping_example():
+    """Sanity-checks escape-scoping against Telegram's own docs example for
+    italicizing a string with a literal underscore in it: '_snake_\\__case_'
+    (close the entity, escape the literal '_', reopen) renders as 'snake_case'."""
+    assert _render_legacy_markdown_v1_underscores("_snake_\\__case_") == "snake_case"
+
+
+def test_legacy_markdown_v1_underscore_simulator_rejects_escape_inside_open_entity():
+    """Counterexample to the docs escaping example above: a backslash does NOT
+    escape a '_' while already inside an open entity, only in the outer scan
+    before an entity is opened (per the docs' 'escaping inside entities is not
+    allowed' note and TDLib's real parser, linked above). So r'_snake\\_case_'
+    does NOT render as 'snake_case' the way the properly-closed-and-reopened
+    '_snake_\\__case_' does: the first '_' opens italics, the backslash inside it
+    is just a literal character, the '_' right after it closes the entity
+    regardless of that backslash, leaving a final, now-unmatched trailing '_' —
+    an unclosed-entity rejection, not a successful escape."""
+    with pytest.raises(_TelegramEntityParseError):
+        _render_legacy_markdown_v1_underscores(r"_snake\_case_")
+
+
+def test_legacy_markdown_v1_underscore_simulator_rejects_unmatched_underscore():
+    """An odd number of unescaped underscores is an unclosed entity — Telegram's
+    real API rejects the whole sendMessage call for this, it does not silently
+    render around it. Relevant here because project names may contain
+    underscores (_PROJECT_NAME_RE), so a project name with one underscore
+    combined with the two in '/photo_approve'/'/photo_reject' would have made
+    the old parse_mode='Markdown' call fail outright, not just corrupt text —
+    a second, independent argument for the plain-text fix."""
+    with pytest.raises(_TelegramEntityParseError):
+        _render_legacy_markdown_v1_underscores("my_project: reply /photo_approve or /photo_reject.")
+
+
+def test_happy_path_approval_message_survives_legacy_markdown_rendering(happy, env):
+    """Regression test for issue #54. Asserts the invariant directly (no
+    Markdown-family parse_mode is used for this call, so Telegram never runs
+    entity parsing on it) and, in case a future change reintroduces one, also
+    runs the actual sent text through the underscore simulator above so an
+    unescaped-underscore regression would still be caught."""
+    import scripts.process_photos as proc
+    main(["--project", _PROJECT])
+    args, kwargs = proc.telegram_api.send_message.call_args
+    _, text = args
+    assert kwargs.get("parse_mode") is None
+    rendered = _render_legacy_markdown_v1_underscores(text) if kwargs.get("parse_mode") == "Markdown" else text
+    assert "/photo_approve" in rendered
+    assert "/photo_reject" in rendered
 
 
 def test_happy_path_temp_dir_cleared_before_run(happy, env):
