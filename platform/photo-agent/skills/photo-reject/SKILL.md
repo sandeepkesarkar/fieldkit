@@ -44,9 +44,13 @@ handled both outcomes); this skill is what newly exposes that existing
 
 # photo-reject
 
-The admin types `/photo_reject` in Telegram to reject the pending video. Do
-not ask the user any clarifying questions — always run this block
-immediately:
+The admin types `/photo_reject` in Telegram to reject the pending video.
+
+The command is fully specified by the single pending record in state.json. On
+invocation, use the following script as the sole execution path, exactly once.
+The script owns state access, validation, and all rejection side effects
+(deleting the video from Drive, deleting the local temp file, activity
+logging); the agent's role is limited to invoking it and reporting the result.
 
 ```bash
 cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
@@ -56,13 +60,10 @@ python3 scripts/check_approval.py --callback-data reject 2>&1
 > **Note:** `~/src/fieldkit/` is the expected repo location. If the repo is cloned
 > elsewhere, update this path before saving.
 
-Do not improvise or read state yourself. The script handles everything:
-deleting the video from Drive, deleting the local temp file, activity
-logging, and the admin's outcome notification.
-
 ## Output handling
 
-Do not interpret the output yourself. Run the script once and do not retry.
+Run the script once and do not retry. Report the result as follows:
+
 If the exit code is non-zero, report it as an error: "Script failed (exit <code>): <output>"
 If the script exits with code 0 and no output, report: "No pending approval."
 Otherwise relay the output verbatim. Do not summarise or paraphrase.

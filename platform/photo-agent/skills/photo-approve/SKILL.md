@@ -68,8 +68,12 @@ command and platform/.specify/003-hermes-runtime/spec.md FR-002/FR-002a):
 # photo-approve
 
 The admin types `/photo_approve` in Telegram to approve the pending video.
-Do not ask the user any clarifying questions — always run this block
-immediately:
+
+The command is fully specified by the single pending record in state.json. On
+invocation, use the following script as the sole execution path, exactly once.
+The script owns state access, validation, and all approval side effects
+(sending the email, enqueueing the Facebook upload if configured, activity
+logging); the agent's role is limited to invoking it and reporting the result.
 
 ```bash
 cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
@@ -79,13 +83,10 @@ python3 scripts/check_approval.py --callback-data approve 2>&1
 > **Note:** `~/src/fieldkit/` is the expected repo location. If the repo is cloned
 > elsewhere, update this path before saving.
 
-Do not improvise or read state yourself. The script handles everything:
-sending the approval email, enqueueing the Facebook upload (if configured),
-activity logging, and the admin's outcome notification.
-
 ## Output handling
 
-Do not interpret the output yourself. Run the script once and do not retry.
+Run the script once and do not retry. Report the result as follows:
+
 If the exit code is non-zero, report it as an error: "Script failed (exit <code>): <output>"
 If the script exits with code 0 and no output, report: "No pending approval."
 Otherwise relay the output verbatim. Do not summarise or paraphrase.
