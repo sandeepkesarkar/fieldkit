@@ -100,9 +100,14 @@ def _safe_filename(raw_name: str) -> str:
 
 
 def _approval_text(project_name: str, photo_count: int, duration_sec: float, folder_link: str) -> str:
+    # Plain text, deliberately no Markdown syntax — project_name may contain
+    # underscores (see _PROJECT_NAME_RE) and Telegram's legacy "Markdown"
+    # parse_mode treats any unescaped '_' as an italic delimiter, which stripped
+    # the underscores from /photo_approve and /photo_reject (issue #54). Telegram
+    # auto-links bare URLs, so folder_link is still tappable without [text](url).
     return (
-        f"📸 *{project_name}* — {photo_count} photos, {duration_sec:g}s video\n"
-        f"[View folder]({folder_link})\n\n"
+        f"📸 {project_name} — {photo_count} photos, {duration_sec:g}s video\n"
+        f"View folder: {folder_link}\n\n"
         "Reply /photo_approve or /photo_reject."
     )
 
@@ -257,7 +262,6 @@ def main(argv=None) -> None:
             msg_id = telegram_api.send_message(
                 chat_id,
                 _approval_text(project_name, n, duration_sec, folder_link_url),
-                parse_mode="Markdown",
             )
         except RuntimeError as exc:
             _telegram_error(f"❌ {project_name}: failed to send approval message — {exc}")

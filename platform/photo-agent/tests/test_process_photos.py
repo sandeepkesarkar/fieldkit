@@ -438,12 +438,71 @@ def test_happy_path_approval_message_instructs_approve_or_reject_commands(happy,
     assert "/photo_reject" in text
 
 
-def test_happy_path_approval_message_uses_markdown_parse_mode(happy, env):
-    """send_message() is called with parse_mode='Markdown'."""
+def test_happy_path_approval_message_sent_as_plain_text(happy, env):
+    """send_message() is called with no parse_mode — issue #54: Telegram's legacy
+    'Markdown' parse_mode treats unescaped '_' as an italic delimiter, which
+    silently stripped the underscores from /photo_approve and /photo_reject
+    ('Reply /photoapprove or /photoreject.'). Plain text sidesteps that class of
+    bug entirely rather than requiring escaping to be kept correct forever."""
     import scripts.process_photos as proc
     main(["--project", _PROJECT])
     kwargs = proc.telegram_api.send_message.call_args.kwargs
-    assert kwargs.get("parse_mode") == "Markdown"
+    assert "parse_mode" not in kwargs
+
+
+def _render_legacy_markdown_italics(text: str) -> str:
+    """Reimplements Telegram's legacy 'Markdown' parse_mode italics extraction,
+    per https://core.telegram.org/bots/api#markdown-style: an unescaped '_' opens
+    an italic span and the next unescaped '_' closes it, and both delimiter
+    characters are stripped from the rendered output — regardless of what's
+    between them or whether it was an intentional italic span. '\\_' escapes a
+    literal underscore. This is what actually produced the issue #54 corruption
+    and lets tests assert against Telegram's own rendering, not just our code's
+    parse_mode flag."""
+    out: list[str] = []
+    i = 0
+    in_italic = False
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch == "_":
+            in_italic = not in_italic
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def test_legacy_markdown_italics_simulator_matches_observed_corruption():
+    """Sanity-checks the simulator itself against the exact corruption reported
+    live in issue #54, so the regression test below can be trusted."""
+    assert (
+        _render_legacy_markdown_italics("Reply /photo_approve or /photo_reject.")
+        == "Reply /photoapprove or /photoreject."
+    )
+
+
+def test_happy_path_approval_message_survives_legacy_markdown_rendering(happy, env):
+    """Regression test for issue #54: even if a future change reintroduces a
+    Markdown-family parse_mode on this call without correct escaping, the message
+    text must not rely on unescaped underscores that Telegram's legacy Markdown
+    would strip. Runs the actual sent text through a reimplementation of
+    Telegram's own legacy-Markdown rendering and asserts the command names
+    survive intact."""
+    import scripts.process_photos as proc
+    main(["--project", _PROJECT])
+    args, kwargs = proc.telegram_api.send_message.call_args
+    _, text = args
+    # Only legacy "Markdown" actually runs this entity extraction on Telegram's
+    # side; plain text (today's fix) and MarkdownV2 (which uses different escaping
+    # rules entirely) are unaffected, so only simulate rendering in that case.
+    rendered = _render_legacy_markdown_italics(text) if kwargs.get("parse_mode") == "Markdown" else text
+    assert "/photo_approve" in rendered
+    assert "/photo_reject" in rendered
 
 
 def test_happy_path_temp_dir_cleared_before_run(happy, env):
