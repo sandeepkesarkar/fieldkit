@@ -201,5 +201,59 @@ of the three things `02-gateway-setup.md` set up for the default profile:
 | Model provider config | `~/.hermes/profiles/<client>/config.yaml` (`model.provider`, `model.default`) |
 | Skill discovery | `~/.hermes/profiles/<client>/config.yaml` (`skills.external_dirs`) — must be set per profile, see above |
 | Secrets | `~/.hermes/profiles/<client>/.env` (provider API key, **and** that profile's own `TELEGRAM_BOT_TOKEN` **and** `TELEGRAM_ALLOWED_USERS`) |
+| **`CLIENT_NAME` for live skill dispatch** | `~/.hermes/profiles/<client>/.env` — **`CLIENT_NAME=<client>`, required, see below (issue #59)** |
 | Gateway supervisor | a separate launchd service per profile — `hermes -p <client> gateway install` |
 | Telegram bot | a separate BotFather bot per client (gateway bot), distinct again from that client's approval bot (issue #29) |
+
+## Live skill dispatch also needs `CLIENT_NAME`
+
+Everything above gets a client's *model calls* routed correctly. It does
+**not**, by itself, get that client's *photo-agent pipeline* pointed at its
+own Drive folder, Facebook Page, and logs when the admin types
+`/process_photos`, `/photo_approve`, or `/photo_reject` in Telegram —
+that's a separate gap issue #59 found live against `mercury`.
+
+`platform/photo-agent/scripts/process_photos.py` (and `check_approval.py`,
+`upload_facebook.py`) resolve which client they're operating on from
+`CLIENT_NAME` (issue #45/PR #57): an already-set `CLIENT_NAME` in the
+process environment wins, otherwise they fall back to the repo root
+`fieldkit/.env`'s `CLIENT_NAME` (`_demo`, today). PR #57 built and tested
+the **inline-override** side of that contract — `env CLIENT_NAME=<client>
+python3 ...` on a crontab line or manual invocation — but never the **live
+skill-dispatch** side: `platform/photo-agent/skills/*/SKILL.md` shell out
+with no `env CLIENT_NAME=...` prefix at all (verified by reading all three
+files — `process-photos`, `photo-approve`, `photo-reject` — none set it),
+so for any client running its own Hermes profile, that inline override
+never exists to begin with.
+
+What actually determines the subprocess's environment for a skill
+invocation is the **gateway process's own `os.environ`** at the moment it
+spawns the terminal-tool subprocess. Verified directly against this
+machine's installed Hermes (`~/.hermes/hermes-agent`):
+
+- `hermes_cli/env_loader.py::load_hermes_dotenv()` loads
+  `<HERMES_HOME>/.env` — i.e. `~/.hermes/profiles/<client>/.env` for a
+  named profile (`HERMES_HOME` is set per-profile in that profile's launchd
+  plist) — into the gateway process's `os.environ` with `override=True`,
+  at startup and again on every turn (`gateway/run.py`'s
+  `_reload_runtime_env_preserving_config_authority()`, for a
+  non-multiplexed single-profile-per-process gateway, which is how this
+  Mac Mini runs each named profile — a separate launchd service and
+  process per profile, not one shared multiplexed process).
+- `tools/environments/local.py` (the default `TERMINAL_ENV=local` spawn
+  path) builds the subprocess's environment as `os.environ.copy()`, then
+  strips only a specific, named blocklist of Hermes-internal routing keys
+  and provider/tool credentials (`_ALWAYS_STRIP_KEYS`,
+  `_HERMES_PROVIDER_ENV_BLOCKLIST`) — `CLIENT_NAME` is an arbitrary custom
+  key, not on either list, so it passes through untouched.
+
+So a plain custom env var set in a profile's `.env` **does** reach that
+profile's skill-invoked subprocesses — the same mechanism that already
+delivers `TELEGRAM_BOT_TOKEN` — `CLIENT_NAME` was simply never added to
+that file for `mercury` (or `venus`, whose profile doesn't exist yet as of
+this writing, but will hit the identical gap once created). **The fix:
+every non-default client's Hermes profile `.env` must set
+`CLIENT_NAME=<client>`**, exactly like `TELEGRAM_BOT_TOKEN` above — add it
+to the checklist above wherever a profile is created or audited, and see
+[`11-manual-e2e-mercury-walkthrough.md`](11-manual-e2e-mercury-walkthrough.md)'s
+pre-flight section for a verification step before every live test.

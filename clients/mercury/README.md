@@ -29,6 +29,29 @@ Real client implementations live in separate private repositories. See
 
 ---
 
+## Hermes profile — required `CLIENT_NAME` (issue #59)
+
+Mercury runs under its own Hermes profile (`hermes -p mercury ...`) — see
+[`09-per-client-model-profiles.md`](../../platform/docs/hermes/09-per-client-model-profiles.md)
+for the full per-client profile mechanism, and its "Live skill dispatch also
+needs `CLIENT_NAME`" section specifically. Beyond the provider/API-key setup
+that doc's checklist already covers, `~/.hermes/profiles/mercury/.env`
+**must also set `CLIENT_NAME=mercury`** — with no error path if it's
+missing. `platform/photo-agent/skills/*/SKILL.md` shell out to the
+photo-agent scripts with no inline `CLIENT_NAME` of their own, so
+`/process_photos`, `/photo_approve`, and `/photo_reject` typed in mercury's
+Telegram bot depend entirely on that value already being set in the
+profile's own `.env`; without it, every invocation silently falls back to
+the repo root `fieldkit/.env`'s `CLIENT_NAME` (`_demo`) and operates against
+`_demo`'s Drive folder, Telegram bot, and Facebook Page instead of
+mercury's — confirmed live on 2026-08-26. Verify with
+`grep '^CLIENT_NAME=' ~/.hermes/profiles/mercury/.env` (safe to inspect
+directly, not a secret) before any live test — see
+[`11-manual-e2e-mercury-walkthrough.md`](../../platform/docs/hermes/11-manual-e2e-mercury-walkthrough.md)'s
+pre-flight section.
+
+---
+
 ## Feature Status
 
 | Feature | Spec | Clarify | Plan | Build | Live |

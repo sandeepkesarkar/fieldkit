@@ -30,7 +30,36 @@ Do this before touching Drive or Telegram. All read-only.
    Expect `null`. If not, resolve it first (`/photo_approve` or
    `/photo_reject` in the client's Telegram chat) before continuing.
 
-2. **New-flow skills are registered under the client's Hermes profile:**
+2. **`CLIENT_NAME` resolves correctly for this profile — the actual gap
+   issue #59 found, now fixed, but worth confirming before every live run
+   rather than trusting it silently.** The live Hermes skill-dispatch path
+   never passes `CLIENT_NAME` inline: `process-photos`, `photo-approve`, and
+   `photo-reject`'s `SKILL.md` files just shell out
+   (`python3 scripts/process_photos.py ...`) with no `env CLIENT_NAME=...`
+   prefix, so correct resolution depends entirely on `CLIENT_NAME=<client>`
+   already being set in this profile's own `.env` — loaded into the gateway
+   process's environment before it spawns that subprocess (see
+   [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md)'s
+   "Live skill dispatch also needs `CLIENT_NAME`" section for the verified
+   mechanism):
+   ```bash
+   grep '^CLIENT_NAME=' ~/.hermes/profiles/mercury/.env
+   ```
+   Expect exactly `CLIENT_NAME=mercury`. **If this line is missing or wrong,
+   stop — do not proceed.** Every live skill invocation will silently fall
+   back to the repo root `fieldkit/.env`'s `CLIENT_NAME` (`_demo` as of this
+   writing) and operate against `_demo`'s Drive folder, Telegram bot, and
+   Facebook Page instead of this client's, with no error of any kind. This
+   is exactly what happened live on 2026-08-26 (issue #59): five real
+   `/process_photos` invocations from mercury's bot all wrote
+   `COMMAND | project=...` to `clients/_demo/logs/photo-agent.log` instead
+   of `mercury`'s. If the line is missing, add it and restart the gateway
+   (`launchctl kickstart -k gui/501/ai.hermes.gateway-mercury`) before
+   continuing — the gateway reloads its profile `.env` on every turn too,
+   but a restart is the deterministic way to confirm the fix landed before
+   a live test rather than racing the next turn.
+
+3. **New-flow skills are registered under the client's Hermes profile:**
    ```bash
    hermes -p mercury skills list --source local
    ```
@@ -43,21 +72,21 @@ Do this before touching Drive or Telegram. All read-only.
    [`10-text-based-approval-migration.md`](10-text-based-approval-migration.md)
    for the full cutover this depends on.
 
-3. **The client's gateway is actually running:**
+4. **The client's gateway is actually running:**
    ```bash
    launchctl list | grep hermes
    ```
    Expect a line for this client's label (`ai.hermes.gateway-mercury` for a
    named profile).
 
-4. **Cron legs this test doesn't touch are healthy** — `upload_facebook.py`
+5. **Cron legs this test doesn't touch are healthy** — `upload_facebook.py`
    still runs on cron (unaffected by the approval-flow migration) and should
    show clean recent ticks, not a repeating error:
    ```bash
    tail -20 logs/cron.log | grep upload_facebook
    ```
 
-5. **Known leftover to be aware of, not to fix here:** as of this writing,
+6. **Known leftover to be aware of, not to fix here:** as of this writing,
    `clients/mercury/src/photo-agent/.env` still has a `TELEGRAM_APPROVAL_BOT_TOKEN`
    line left over from the pre-#49 dual-bot flow. It is dead — nothing in
    the codebase reads it anymore (confirmed by grep) — so it does not affect
