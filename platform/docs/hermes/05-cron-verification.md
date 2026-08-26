@@ -177,27 +177,32 @@ two clients' cron-driven flows cannot correctly coexist: there is no way
 for one cron entry to say "run this against `venus`" while another says
 "run this against `mercury`" — both would read the same `CLIENT_NAME`.
 
-**Mechanism (already supported by the scripts themselves, no code changes
-needed):** `process_photos.py`, `check_approval.py`, `upload_facebook.py`,
-and `run_e2e_test.py` each load env vars in two steps —
-`load_dotenv(_ROOT / ".env")` (the shared root file, `override=False`, the
-`python-dotenv` default) followed by `load_dotenv(.../clients/<client>/.../.env",
-override=True)` (that client's own secrets, which are allowed to override).
-Because the *first* call defaults to `override=False`, it never clobbers a
+**Mechanism (supported by the scripts themselves — a documentation-and-
+crontab-authoring convention, not a new runtime mechanism):**
+`process_photos.py`, `check_approval.py`, `upload_facebook.py`, and
+`run_e2e_test.py` (plus the e2e stage scripts and `generate_auth_link.py`)
+each load env vars in two steps — `load_dotenv(_ROOT / ".env",
+override=False)` (the shared root file) followed by
+`load_dotenv(.../clients/<client>/.../.env", override=True)` (that client's
+own secrets, which are allowed to override), then re-assert
+`os.environ["CLIENT_NAME"]` immediately after that second load in case a
+client `.env` ever defined its own conflicting `CLIENT_NAME`. `override=False`
+is pinned explicitly on the first call — this repo owns that contract
+rather than leaning on `python-dotenv`'s current default, which
+`requirements.txt` does not pin a version for — so it never clobbers a
 `CLIENT_NAME` already present in the process's environment when the script
-starts. So a `CLIENT_NAME` set inline on the invocation itself always wins
-over the root `.env`'s value — verified empirically (see
+starts. That means a `CLIENT_NAME` set inline on the invocation itself
+always wins over the root `.env`'s value — verified empirically (see
 `platform/photo-agent/tests/test_client_name_override.py`), not assumed
 from reading the `python-dotenv` docs alone.
 
-That makes the fix a documentation-and-crontab-authoring convention, not a
-new mechanism: give each client its own crontab line, with `CLIENT_NAME=`
-set inline on that line, instead of one shared line per script that relies
-on the root `.env`:
+Adopting this convention: give each client its own crontab line, with
+`CLIENT_NAME=` set inline on that line, instead of one shared line per
+script that relies on the root `.env`:
 
 ```cron
-* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin CLIENT_NAME=venus /usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
-* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin CLIENT_NAME=mercury /usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin CLIENT_NAME=venus bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin CLIENT_NAME=mercury bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
 ```
 
 `env CLIENT_NAME=<client>` sets the variable for that one crontab-spawned

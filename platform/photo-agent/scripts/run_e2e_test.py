@@ -28,17 +28,25 @@ from dotenv import load_dotenv
 # CLIENT_NAME resolution order (issue #45): a CLIENT_NAME already present in
 # the process environment when this script starts (e.g. an inline override
 # like `env CLIENT_NAME=foo python3 ...`) wins over the root .env's
-# CLIENT_NAME, because load_dotenv(_ROOT / ".env") below defaults to
-# override=False and never clobbers an already-set env var. This is the
-# supported way to run this e2e suite against a specific client without
+# CLIENT_NAME, because load_dotenv(_ROOT / ".env") below passes
+# override=False EXPLICITLY — this repo owns that contract rather than
+# leaning on python-dotenv's current default (unpinned in
+# requirements.txt) — and so never clobbers an already-set env var. This is
+# the supported way to run this e2e suite against a specific client without
 # touching the shared root .env — see
 # platform/docs/hermes/05-cron-verification.md.
 _ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=False)
 _CLIENT = os.environ.get("CLIENT_NAME")
 if not _CLIENT:
     sys.exit("ERROR: CLIENT_NAME is not set in fieldkit/.env")
 load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", override=True)
+# The client .env above loads with override=True. If it ever defines its
+# own CLIENT_NAME (it shouldn't — see platform/photo-agent/.env.example),
+# that would silently clobber the value resolved above. Re-assert it so
+# os.environ["CLIENT_NAME"] always matches _CLIENT afterward, including
+# for anything this process later shells out to.
+os.environ["CLIENT_NAME"] = _CLIENT
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
