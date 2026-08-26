@@ -39,7 +39,7 @@ load_dotenv(_ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env", overri
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from tools import drive, state
+from tools import drive, paths, state
 from tools import logger as activity_log
 from tools import telegram_api
 from tools.drive import DriveFolderNotFoundError
@@ -47,7 +47,6 @@ from tools.video_generator import FFmpegVideoGenerator, VideoConfig, VideoGenera
 
 _log = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).parents[3]
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 
 _MIN_PHOTOS = 2
@@ -147,13 +146,7 @@ def main(argv=None) -> None:
             f"{os.environ.get('SECONDS_PER_PHOTO')!r}"
         )
 
-    tmp_base_raw = os.environ.get("VIDEO_TMP_DIR", "")
-    if tmp_base_raw:
-        p = Path(tmp_base_raw)
-        tmp_base = p if p.is_absolute() else (_REPO_ROOT / p).resolve()
-    else:
-        # Default to the client-specific data dir so clients never share a tmp directory.
-        tmp_base = Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent" / "tmp"
+    tmp_base = paths.get_video_tmp_root()
 
     try:
         lock_f = _acquire_run_lock()

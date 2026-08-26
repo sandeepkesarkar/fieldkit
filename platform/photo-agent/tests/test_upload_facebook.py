@@ -162,6 +162,30 @@ def test_happy_path_deletes_local_file_after_published(with_pending, tmp_path, m
     assert not Path(video_path).exists()
 
 
+def test_happy_path_deletes_local_file_with_relative_video_tmp_dir(base, tmp_path, monkeypatch):
+    """On success, a video the producer wrote under a RELATIVE VIDEO_TMP_DIR resolved
+    against FIELDKIT_DATA_DIR is still deleted — the producer/consumer resolution
+    mismatch that #47's review follow-up caught: this script used to resolve the same
+    relative value against the shared repo root instead, so it refused to delete files
+    the fixed producer actually wrote."""
+    import scripts.upload_facebook as uf
+    client_data_dir = tmp_path / "clients" / "mercury" / "data"
+    monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")
+    monkeypatch.setenv("FIELDKIT_DATA_DIR", str(client_data_dir))
+
+    video_dir = client_data_dir / "data" / "photo-agent" / "tmp" / _PROJECT
+    video_dir.mkdir(parents=True)
+    video_path = video_dir / "video.mp4"
+    video_path.write_bytes(b"\x00" * 64)
+
+    record = dict(_PENDING_RECORD, video_local_path=str(video_path))
+    uf.facebook_state.get_pending_upload.return_value = record
+
+    assert video_path.exists()
+    main([])
+    assert not video_path.exists()
+
+
 def test_happy_path_sends_telegram_confirmation(with_pending):
     """On success, send_message is called with a URL pointing to the Facebook post."""
     import scripts.upload_facebook as uf
