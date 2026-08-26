@@ -614,6 +614,47 @@ def test_happy_path_scrub_is_called(happy, env):
 
 
 # ---------------------------------------------------------------------------
+# VIDEO_TMP_DIR resolution — relative paths resolve per-client, not against the
+# shared repo checkout (#47)
+# ---------------------------------------------------------------------------
+
+def test_relative_video_tmp_dir_resolves_against_fieldkit_data_dir(happy, monkeypatch, tmp_path):
+    """A relative VIDEO_TMP_DIR (the shipped .env.example default) resolves under
+    FIELDKIT_DATA_DIR, not the shared fieldkit repo checkout."""
+    import scripts.process_photos as proc
+
+    client_data_dir = tmp_path / "clients" / "mercury" / "data"
+    monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")  # the shipped relative default
+    monkeypatch.setenv("FIELDKIT_DATA_DIR", str(client_data_dir))
+
+    main(["--project", _PROJECT])
+
+    video_local_path = proc.state.set_pending_approval.call_args.args[0]["video_local_path"]
+    repo_root = Path(proc.__file__).resolve().parents[3]
+    assert video_local_path.startswith(str(client_data_dir / "data" / "photo-agent" / "tmp"))
+    assert not video_local_path.startswith(str(repo_root / "data"))
+
+
+def test_two_clients_same_relative_video_tmp_dir_do_not_collide(happy, monkeypatch, tmp_path):
+    """Two clients that ship the same relative VIDEO_TMP_DIR value (as mercury, venus,
+    and _construction_co's .env.example did) must resolve to different absolute tmp
+    directories — the cross-client collision at the heart of #47."""
+    import scripts.process_photos as proc
+
+    monkeypatch.setenv("VIDEO_TMP_DIR", "data/photo-agent/tmp")
+
+    tmp_bases = {}
+    for client in ("mercury", "venus"):
+        monkeypatch.setenv("FIELDKIT_DATA_DIR", str(tmp_path / "clients" / client / "data"))
+        main(["--project", _PROJECT])
+        video_local_path = proc.state.set_pending_approval.call_args.args[0]["video_local_path"]
+        # video_local_path == tmp_base/<project_name>/<file>.mp4
+        tmp_bases[client] = Path(video_local_path).parent.parent
+
+    assert tmp_bases["mercury"] != tmp_bases["venus"]
+
+
+# ---------------------------------------------------------------------------
 # _telegram_error — direct Telegram Bot API notification (replaces openclaw CLI, #14)
 # ---------------------------------------------------------------------------
 #

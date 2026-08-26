@@ -47,7 +47,6 @@ from tools.video_generator import FFmpegVideoGenerator, VideoConfig, VideoGenera
 
 _log = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).parents[3]
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 
 _MIN_PHOTOS = 2
@@ -150,7 +149,11 @@ def main(argv=None) -> None:
     tmp_base_raw = os.environ.get("VIDEO_TMP_DIR", "")
     if tmp_base_raw:
         p = Path(tmp_base_raw)
-        tmp_base = p if p.is_absolute() else (_REPO_ROOT / p).resolve()
+        # A relative VIDEO_TMP_DIR resolves against FIELDKIT_DATA_DIR (the
+        # per-client dir), not _REPO_ROOT (the shared fieldkit checkout) —
+        # otherwise every client whose .env ships the same relative default
+        # collides on one shared tmp directory (issue #47).
+        tmp_base = p if p.is_absolute() else (Path(os.environ["FIELDKIT_DATA_DIR"]) / p).resolve()
     else:
         # Default to the client-specific data dir so clients never share a tmp directory.
         tmp_base = Path(os.environ["FIELDKIT_DATA_DIR"]) / "photo-agent" / "tmp"
