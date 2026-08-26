@@ -1,11 +1,29 @@
 """
-Tests for issue #45 — per-client CLIENT_NAME resolution under concurrent
-multi-client cron/gateway operation.
+Tests for issue #45/PR #57's CLIENT_NAME resolution mechanism, and its
+status as of issue #61's architecture decision.
 
-Root problem: process_photos.py, check_approval.py, upload_facebook.py, and
-run_e2e_test.py all resolve CLIENT_NAME via a single shared root .env, with
-no per-invocation override — so two clients' cron-driven flows could not
-correctly coexist on one machine.
+Original problem (#45): process_photos.py, check_approval.py,
+upload_facebook.py, and run_e2e_test.py all resolve CLIENT_NAME via a
+single shared root .env, with no per-invocation override — so a manual
+test run against a client other than the one currently installed had no
+way to avoid touching that shared file.
+
+**Status after issue #61 (read before assuming this mechanism does more
+than it does):** this project's architecture now runs exactly ONE client
+at a time, installed via platform/photo-agent/scripts/install_client.sh —
+see platform/docs/hermes/09-per-client-model-profiles.md. The inline
+CLIENT_NAME= override this file tests is KEPT, deliberately, as a harmless
+ad-hoc/single-invocation escape hatch for manual testing against a
+non-installed client (e.g. `CLIENT_NAME=venus python3
+run_e2e_test.py ...` without disturbing whatever's actually installed) —
+it is explicitly NOT a supported mechanism for running two clients'
+cron/gateway flows concurrently, which is the framing this file's tests
+originally described and issue #61 retired. That concurrent-profile design
+(each client getting its own Hermes profile so multiple clients' flows
+could coexist) was the actual root cause of issue #59, not a gap in the
+resolution order tested here — see test_install_client.py for the
+regression coverage proving the single-install model closes that gap by
+construction.
 
 Mechanism (application-owned, not an implicit library default): each script
 loads env vars in two steps —
@@ -33,7 +51,6 @@ clean subprocess with a controlled environment (same approach as
 test_env_loading.py).
 """
 
-import concurrent.futures
 import inspect
 import os
 import subprocess
@@ -204,66 +221,18 @@ def test_no_shipped_client_env_example_sets_client_name():
 
 
 # ---------------------------------------------------------------------------
-# Real concurrency: two clients' processes, launched at the same time against
-# the *same* shared root .env, are proven to genuinely overlap in time (via
-# a file-based barrier, not just launched from two threads) and each
-# resolve to their own CLIENT_NAME with no cross-contamination.
-# ---------------------------------------------------------------------------
-
-def test_two_clients_resolve_correctly_when_run_concurrently(tmp_path):
-    """Two subprocess invocations, each with its own inline CLIENT_NAME
-    override, against one shared root .env whose own CLIENT_NAME matches
-    neither — reproduces two cron entries firing in the same minute for
-    different clients. A file-based barrier makes both processes wait for
-    each other before resolving/printing, so this proves genuine temporal
-    overlap (both alive and past CLIENT_NAME resolution at the same time),
-    not merely that they were launched from two threads."""
-    root_env = tmp_path / ".env"
-    root_env.write_text("CLIENT_NAME=_demo\n")
-    root_env_before = root_env.read_text()
-
-    marker_a = tmp_path / "ready_a"
-    marker_b = tmp_path / "ready_b"
-
-    def _snippet(module: str, my_marker: Path, other_marker: Path) -> str:
-        return (
-            "import sys, os, time\n"
-            "sys.path.insert(0, '.')\n"
-            f"from scripts import {module} as m\n"
-            f"open({str(my_marker)!r}, 'w').close()\n"
-            "deadline = time.time() + 10\n"
-            f"while not os.path.exists({str(other_marker)!r}):\n"
-            "    if time.time() > deadline:\n"
-            "        print('TIMEOUT_WAITING_FOR_PEER')\n"
-            "        sys.exit(1)\n"
-            "    time.sleep(0.02)\n"
-            "print('RESOLVED_CLIENT=' + m._CLIENT)\n"
-        )
-
-    env_a = _base_env(tmp_path)
-    env_a["CLIENT_NAME"] = "venus"
-    env_b = _base_env(tmp_path)
-    env_b["CLIENT_NAME"] = "mercury"
-
-    snippet_a = _snippet("upload_facebook", marker_a, marker_b)
-    snippet_b = _snippet("upload_facebook", marker_b, marker_a)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        future_a = pool.submit(_run, snippet_a, env_a)
-        future_b = pool.submit(_run, snippet_b, env_b)
-        result_a = future_a.result()
-        result_b = future_b.result()
-
-    assert result_a.returncode == 0, result_a.stderr
-    assert result_b.returncode == 0, result_b.stderr
-    assert "TIMEOUT_WAITING_FOR_PEER" not in result_a.stdout
-    assert "TIMEOUT_WAITING_FOR_PEER" not in result_b.stdout
-    assert "RESOLVED_CLIENT=venus" in result_a.stdout
-    assert "RESOLVED_CLIENT=mercury" in result_b.stdout
-    # Neither concurrent invocation repointed the shared root .env.
-    assert root_env.read_text() == root_env_before
-
-
+# NOTE (issue #61): a "two clients' processes running concurrently, each
+# resolving their own CLIENT_NAME via inline override" test used to live
+# here. It's removed, not just left passing — that scenario (two clients'
+# flows genuinely coexisting on one machine) is exactly the configuration
+# this project's architecture now prohibits (see the module docstring and
+# platform/docs/hermes/09-per-client-model-profiles.md). Keeping a passing
+# test for an explicitly unsupported configuration would read as tacit
+# endorsement to a future contributor skimming this file. The inline
+# override mechanism itself is still fully covered above (single-invocation
+# use, not concurrent use) and in test_install_client.py's
+# test_switching_clients_replaces_not_merges_prior_config, which is the
+# actual #59 regression guard under the current architecture.
 # ---------------------------------------------------------------------------
 # Guard against silently regressing the mechanism itself: the root .env
 # load must keep an EXPLICIT override=False, or an inline CLIENT_NAME

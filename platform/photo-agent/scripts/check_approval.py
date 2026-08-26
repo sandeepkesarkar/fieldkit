@@ -72,12 +72,17 @@ from dotenv import load_dotenv
 # this repo owns that contract rather than leaning on python-dotenv's
 # current default (unpinned in requirements.txt), so it never clobbers an
 # already-set env var regardless of what a future dependency upgrade does.
-# This is the supported mechanism for running multiple clients' cron-driven
-# flows concurrently on one machine: each cron entry sets CLIENT_NAME
-# inline and never touches the shared root .env, so there's no mutable
-# state one client's run could accidentally repoint at another's. Today's
-# single-client posture (no inline override, CLIENT_NAME only in the root
-# .env) is unaffected. See platform/docs/hermes/05-cron-verification.md.
+# This override remains available as an ad-hoc, single-invocation escape
+# hatch (a manual test run against a client other than the one currently
+# installed, without disturbing it) — it does NOT support running multiple
+# clients' cron/gateway flows concurrently as a matter of policy. That
+# concurrent-multi-client design (per-client Hermes profiles, per-cron-entry
+# overrides) was retired by issue #61: this fieldkit install runs exactly
+# ONE client at a time, switched via
+# platform/photo-agent/scripts/install_client.sh, which is what keeps this
+# CLIENT_NAME resolution's fallback-to-root-.env branch always correct — it
+# was the concurrent-profile design itself that caused issue #59, not a gap
+# in this resolution order. See platform/docs/hermes/09-per-client-model-profiles.md.
 _ROOT = Path(os.environ.get("FIELDKIT_ROOT", str(Path(__file__).parents[3])))
 load_dotenv(_ROOT / ".env", override=False)
 _CLIENT = os.environ.get("CLIENT_NAME")

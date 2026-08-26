@@ -12,6 +12,16 @@ Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-herm
 [`07-callback-race-fix.md`](07-callback-race-fix.md) (#29), both marked
 superseded by this doc — see "What this supersedes" below.
 
+> **Context (issue #61):** this doc's cutover checklist below occasionally
+> references "a non-default Hermes profile, e.g. mercury" as a possibility
+> to account for. As of issue #61, this project runs exactly one client at
+> a time via Hermes's default profile only — see
+> [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md). A
+> non-default profile directory may still exist on a machine as pre-#61
+> leftover state (not yet retired), which is why the checklist below still
+> handles that case, but standing up a *new* non-default profile is no
+> longer this project's supported way to run a client.
+
 ## Background — why the poller is gone, not just faster
 
 - Issue #31 (cron-cadence vs. Telegram callback-query freshness race) was

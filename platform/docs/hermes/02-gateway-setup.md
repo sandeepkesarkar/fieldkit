@@ -114,14 +114,23 @@ provider identity for a plain API key is `openai-api`
 `hermes auth list`, which already shows that credential available on this
 machine.
 
-**The multi-client open question this section originally flagged is now
-resolved**: per-client provider isolation
-uses one **Hermes profile per client** (`hermes profile create <client>`,
-`hermes -p <client> config set model.provider openai-api`), not a shared
-global `config.yaml` and not `platforms.api_server.extra.model_routes` (that
-block is scoped to the `api_server` platform, not Telegram). `venus` (#12)
-and `mercury` (#11) each get their own profile and their own Telegram bot
-pair; `_demo` keeps the default profile described in this document
+**Further superseded by issue #61:** the per-client-Hermes-profile
+mechanism described just below (`hermes profile create <client>`) was this
+project's answer to the multi-client open question for a while, but was
+retired — it was the direct root cause of issue #59. See
+[`09-per-client-model-profiles.md`](09-per-client-model-profiles.md) for
+the current model: exactly one client installed at a time, via
+`platform/photo-agent/scripts/install_client.sh`, using Hermes's single
+default profile only. The paragraph below is left as historical record of
+what was tried and why it didn't hold up.
+
+Per-client provider isolation used one **Hermes profile per client**
+(`hermes profile create <client>`, `hermes -p <client> config set
+model.provider openai-api`), not a shared global `config.yaml` and not
+`platforms.api_server.extra.model_routes` (that block is scoped to the
+`api_server` platform, not Telegram). `venus` (#12) and `mercury` (#11)
+each got their own profile and their own Telegram bot pair; `_demo` kept
+the default profile described in this document
 unchanged.
 
 ## Install/config locations touched

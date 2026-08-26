@@ -1,12 +1,15 @@
 """
-Tests for the venus client scaffold (issue #12).
+Tests for the venus client scaffold (issue #12) under the single-install
+architecture (issue #61).
 
 Venus's whole premise is that swapping the model provider (Anthropic -> OpenAI)
-requires no change to the photo-agent pipeline itself -- only to which Hermes
-profile executes it. These tests guard that claim structurally: venus's
-.env.example must declare exactly the same pipeline configuration keys as
-_demo's, so a diff between the two clients' env files shows nothing but
-comments.
+requires no change to the photo-agent pipeline itself -- only to which client
+is installed as the active one via
+platform/photo-agent/scripts/install_client.sh. These tests guard that claim
+structurally: venus's .env.example must declare exactly the same
+configuration keys as _demo's (pipeline config plus the shared "Hermes
+gateway install" fields), so a diff between the two clients' env files shows
+nothing but comments.
 """
 
 from pathlib import Path
@@ -16,6 +19,7 @@ _DEMO_ENV_EXAMPLE = _ROOT / "clients" / "_demo" / "src" / "photo-agent" / ".env.
 _VENUS_ENV_EXAMPLE = _ROOT / "clients" / "venus" / "src" / "photo-agent" / ".env.example"
 _VENUS_README = _ROOT / "clients" / "venus" / "README.md"
 _VENUS_CONSTITUTION = _ROOT / "clients" / "venus" / ".specify" / "constitution.md"
+_PROFILES_DOC = _ROOT / "platform" / "docs" / "hermes" / "09-per-client-model-profiles.md"
 
 
 def _env_keys(path: Path) -> set[str]:
@@ -34,15 +38,26 @@ def test_venus_env_example_exists():
 
 
 def test_venus_env_example_matches_demo_key_set():
-    """Venus and _demo must configure the identical set of pipeline variables.
-
-    Provider choice (Anthropic vs OpenAI) lives entirely in the client's
-    Hermes profile, not in this file -- so the two clients' .env.example
-    key sets must be identical.
-    """
+    """Venus and _demo must configure the identical set of variables --
+    both the pipeline config and the shared "Hermes gateway install" fields
+    (TELEGRAM_ALLOWED_USERS, HERMES_MODEL_PROVIDER, HERMES_MODEL_DEFAULT,
+    HERMES_PROVIDER_API_KEY) that install_client.sh reads. Provider choice
+    (Anthropic vs OpenAI) is a VALUE difference in those shared keys, never
+    a difference in which keys exist."""
     demo_keys = _env_keys(_DEMO_ENV_EXAMPLE)
     venus_keys = _env_keys(_VENUS_ENV_EXAMPLE)
     assert venus_keys == demo_keys
+
+
+def test_venus_env_example_declares_hermes_install_fields():
+    keys = _env_keys(_VENUS_ENV_EXAMPLE)
+    for required in (
+        "TELEGRAM_ALLOWED_USERS",
+        "HERMES_MODEL_PROVIDER",
+        "HERMES_MODEL_DEFAULT",
+        "HERMES_PROVIDER_API_KEY",
+    ):
+        assert required in keys, f"venus .env.example is missing {required}"
 
 
 def test_venus_readme_documents_provider_configuration():
@@ -51,28 +66,30 @@ def test_venus_readme_documents_provider_configuration():
     assert "Provider Configuration" in text
 
 
-def test_venus_readme_scopes_telegram_token_and_skills_to_the_profile():
-    """Regression guard for the profile-isolation gaps caught in review:
-
-    a fresh Hermes profile inherits neither the default profile's Telegram
-    bot token, its authorization allowlist, nor its skills.external_dirs --
-    all three must be set on the venus profile specifically, not assumed
-    from clients/venus's own .env or from the default profile's
-    ~/.hermes/config.yaml.
-    """
+def test_venus_readme_documents_install_client_script():
+    """Regression guard for issue #61: venus's setup checklist must point
+    at install_client.sh, not at the retired per-client Hermes profile
+    mechanism (hermes profile create / hermes -p venus ...)."""
     text = _VENUS_README.read_text()
-    assert "profiles/venus/.env" in text
+    assert "install_client.sh venus" in text
+    assert "hermes profile create venus" not in text
+    assert "hermes -p venus" not in text
+
+
+def test_venus_readme_documents_required_install_fields():
+    text = _VENUS_README.read_text()
     assert "TELEGRAM_ALLOWED_USERS" in text
+    assert "HERMES_PROVIDER_API_KEY" in text
     assert "skills.external_dirs" in text
 
 
-def test_venus_readme_does_not_tell_a_human_to_edit_the_shared_root_env():
-    """CLIENT_NAME lives in one shared fieldkit/.env read by every client's
-    cron jobs (including _demo's, live on this machine) -- the e2e
-    instructions must use an inline override, never a persistent edit.
-    """
+def test_venus_readme_ad_hoc_test_uses_inline_override_not_the_installer():
+    """The "run the e2e rig against venus without installing it" path must
+    keep using the ad-hoc CLIENT_NAME= inline override (issue #45/PR #57,
+    kept as an escape hatch by #61) -- not install_client.sh, which would
+    make venus the live installed client and disrupt whatever's actually
+    running."""
     text = _VENUS_README.read_text()
-    assert "# fieldkit/.env\nCLIENT_NAME=venus" not in text
     assert "CLIENT_NAME=venus FIELDKIT_ROOT=" in text
 
 
@@ -80,39 +97,57 @@ def test_venus_constitution_exists():
     assert _VENUS_CONSTITUTION.exists()
 
 
-def test_venus_readme_verifies_telegram_allowlist_correctly():
-    """Regression guard for a wrong verification method caught in review:
-
-    gateway/run.py's "No env user allowlists configured" warning is a
-    disjunction over ~20 platform-specific allowlist env vars -- its
-    absence proves nothing about TELEGRAM_ALLOWED_USERS specifically, since
-    any one of the other ~19 being set would also suppress it. The README
-    must verify by direct inspection instead, and must not imply a missing
-    allowlist means the bot is open to anyone (Hermes is fail-closed).
-    """
+def test_venus_readme_points_to_shared_allowlist_troubleshooting_doc():
+    """Regression guard for a wrong verification method caught in review
+    (pre-#61): gateway/run.py's "No env user allowlists configured"
+    warning is a disjunction over ~20 platform-specific allowlist env
+    vars -- its absence proves nothing about TELEGRAM_ALLOWED_USERS
+    specifically. That troubleshooting content now lives in the shared
+    09-per-client-model-profiles.md doc (issue #61 -- it applies identically
+    regardless of which client is installed), not duplicated per-client;
+    venus's README must at least point there."""
     text = _VENUS_README.read_text()
-    assert "grep TELEGRAM_ALLOWED_USERS" in text
+    assert "09-per-client-model-profiles.md" in text
+    assert "troubleshooting" in text.lower()
+
+
+def _find_bullet(text: str, needle: str) -> str:
+    """Return the single markdown bullet (a "- ..." line plus any wrapped
+    continuation lines up to the next bullet or blank line) whose first line
+    contains `needle` (case-insensitive), joined into one string.
+
+    Fails loudly (not just returns "") if zero or more than one bullet's
+    first line matches, so this helper can't silently pass a scoped
+    assertion against text that no longer has the expected shape. Scans
+    multi-line bullets (not just a single line) so it stays correct across
+    markdown re-wrapping that moves a key phrase onto a continuation line.
+    """
+    lines = text.splitlines()
+    starts = [
+        i for i, line in enumerate(lines)
+        if line.lstrip().startswith("- ") and needle.lower() in line.lower()
+    ]
+    assert len(starts) == 1, (
+        f"expected exactly one bullet starting with a line containing {needle!r}, "
+        f"found {len(starts)}"
+    )
+    start = starts[0]
+    end = start + 1
+    while end < len(lines) and lines[end].strip() and not lines[end].lstrip().startswith("- "):
+        end += 1
+    return " ".join(lines[start:end])
+
+
+def test_shared_doc_verifies_telegram_allowlist_correctly():
+    text = _PROFILES_DOC.read_text()
+    assert "grep '^TELEGRAM_ALLOWED_USERS=' ~/.hermes/.env" in text
     assert "fail-closed" in text.lower()
     # The wrong method (checking the global startup warning) may still be
     # mentioned as a documented gotcha, but never as the thing to *do*.
     assert "check `~/.hermes/profiles/venus/logs/gateway.log` for the" not in text
 
 
-def _find_line(text: str, needle: str) -> str:
-    """Return the single line of `text` containing `needle` (case-insensitive).
-
-    Fails loudly (not just returns "") if zero or more than one line matches,
-    so this helper can't silently pass a scoped assertion against text that
-    no longer has the expected shape.
-    """
-    matches = [line for line in text.splitlines() if needle.lower() in line.lower()]
-    assert len(matches) == 1, (
-        f"expected exactly one line containing {needle!r}, found {len(matches)}"
-    )
-    return matches[0]
-
-
-def test_venus_readme_distinguishes_the_two_fail_closed_symptoms():
+def test_shared_doc_distinguishes_the_two_fail_closed_symptoms():
     """Regression guard for a conflated failure mode caught in review.
 
     "Fail-closed" is not one symptom -- gateway/authz_mixin.py's
@@ -126,18 +161,20 @@ def test_venus_readme_distinguishes_the_two_fail_closed_symptoms():
     phrases somewhere") so that swapping which symptom is attributed to
     which cause -- the actual mistake this guards against -- fails the
     test, rather than passing because both phrases still appear in the
-    file.
+    file. This content now lives in the shared 09-per-client-model-profiles.md
+    doc (issue #61), since it's the same regardless of which client is
+    installed -- not duplicated in every client README.
     """
-    text = _VENUS_README.read_text()
+    text = _PROFILES_DOC.read_text()
 
     # "pairing-code prompt" (not the bare word "pairing") is the
-    # discriminator: the mistyped-allowlist line legitimately says "no
+    # discriminator: the mistyped-allowlist bullet legitimately says "no
     # pairing prompt" in passing, so a bare "pairing" substring check
-    # would match both lines and not actually guard against a swap.
-    unset_line = _find_line(text, "left unset entirely")
-    assert "pairing-code prompt" in unset_line.lower()
-    assert "silently ignored" not in unset_line.lower()
+    # would match both bullets and not actually guard against a swap.
+    unset_bullet = _find_bullet(text, "left unset entirely")
+    assert "pairing-code prompt" in unset_bullet.lower()
+    assert "silently ignored" not in unset_bullet.lower()
 
-    mistyped_line = _find_line(text, "wrong/mistyped")
-    assert "silently ignored" in mistyped_line.lower()
-    assert "pairing-code prompt" not in mistyped_line.lower()
+    mistyped_bullet = _find_bullet(text, "wrong/mistyped")
+    assert "silently ignored" in mistyped_bullet.lower()
+    assert "pairing-code prompt" not in mistyped_bullet.lower()
