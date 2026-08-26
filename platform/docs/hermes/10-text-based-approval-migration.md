@@ -248,28 +248,44 @@ the new command flow has a working consumer is seconds long, not hours.
       `clients/{_demo,mercury}/src/photo-agent/.env` is already the *same*
       token as that client's Hermes gateway profile uses (they're supposed
       to already match — this step exists to confirm that assumption
-      before acting on it, not to assume it silently). Compare by length
-      and/or a hash, **never by printing either token's actual value** —
-      same debugging-hygiene convention this project adopted after issue
-      #27's incident (see `CONTRIBUTING.md`'s Security & Secrets section):
+      before acting on it, not to assume it silently). **Compare hashes;
+      never print either token.** A length mismatch proves the tokens
+      differ — cheap, worth checking first — but equal length does **NOT**
+      prove they match (two different Telegram tokens routinely have the
+      same length); only equal hashes do. Treat length as a fast
+      initial-mismatch check only, never as proof of a match:
       ```bash
-      # Length-only comparison (no value ever printed):
-      awk '/^TELEGRAM_BOT_TOKEN=/{sub(/^[^=]*=/,""); print length}' \
-          clients/_demo/src/photo-agent/.env
-      awk '/^TELEGRAM_BOT_TOKEN=/{sub(/^[^=]*=/,""); print length}' \
-          ~/.hermes/.env   # or ~/.hermes/profiles/<profile>/.env for a non-default profile
+      # Fast initial-mismatch check (equal length proves NOTHING — only
+      # a length DIFFERENCE is meaningful here):
+      grep '^TELEGRAM_BOT_TOKEN=' clients/_demo/src/photo-agent/.env | cut -d= -f2- | tr -d '\n' | wc -c
+      grep '^TELEGRAM_BOT_TOKEN=' ~/.hermes/.env | cut -d= -f2- | tr -d '\n' | wc -c
+      #   (~/.hermes/profiles/<profile>/.env for a non-default profile, e.g. mercury)
 
-      # Or a hash comparison, still without printing the value itself:
-      awk -F= '/^TELEGRAM_BOT_TOKEN=/{print $2}' clients/_demo/src/photo-agent/.env | sha256sum
-      awk -F= '/^TELEGRAM_BOT_TOKEN=/{print $2}' ~/.hermes/.env | sha256sum
+      # The actual proof of a match — hash equality, nothing less. Uses
+      # `shasum -a 256` (ships with every macOS install) rather than
+      # `sha256sum` (GNU coreutils, not guaranteed present on a stock Mac).
+      # `cut -d= -f2-` (not `awk -F=`) takes everything after the FIRST
+      # `=` so an `=` inside the token value itself wouldn't silently
+      # truncate it. `tr -d '\n'` strips the trailing newline `cut`'s
+      # output carries so the hash is computed on the exact token bytes
+      # only — a stray trailing newline in one file but not the other
+      # would otherwise produce a false mismatch between two tokens that
+      # actually are equal.
+      grep '^TELEGRAM_BOT_TOKEN=' clients/_demo/src/photo-agent/.env | cut -d= -f2- | tr -d '\n' | shasum -a 256
+      grep '^TELEGRAM_BOT_TOKEN=' ~/.hermes/.env | cut -d= -f2- | tr -d '\n' | shasum -a 256
       ```
-      If the lengths/hashes don't match, **stop here** — do not proceed to
-      step 3.2. That means the client's `.env` and its Hermes profile are
-      already on two different bots today, which is a pre-existing
-      misconfiguration this migration would otherwise silently paper over
-      (both bots happen to work independently right now; consolidating
-      onto the wrong one would break the gateway, the approval flow, or
-      both). Reconcile which token is correct before continuing.
+      If the lengths differ, the tokens are **definitely** different —
+      stop here. If the lengths match, that alone proves nothing either
+      way — the hash comparison is the only step that can actually confirm
+      a match, and is required before proceeding regardless of what the
+      length check showed. If the hashes don't match, **stop here** — do
+      not proceed to step 3.2. That means the client's `.env` and its
+      Hermes profile are already on two different bots today, which is a
+      pre-existing misconfiguration this migration would otherwise
+      silently paper over (both bots happen to work independently right
+      now; consolidating onto the wrong one would break the gateway, the
+      approval flow, or both). Reconcile which token is correct before
+      continuing.
    2. **Only once 3.1 confirms a match**, delete the
       `TELEGRAM_APPROVAL_BOT_TOKEN` line from that same `.env` file.
       `TELEGRAM_BOT_TOKEN` now also serves the approval flow — no new
@@ -277,19 +293,48 @@ the new command flow has a working consumer is seconds long, not hours.
    3. **Do not delete or revoke the old approval bot's BotFather
       registration yet.** Keep it registered for a defined rollback
       window (a few days of live use through the new flow is a reasonable
-      bar) before retiring it via step 6 below — there's no cost to an
+      bar) before retiring it via step 7 below — there's no cost to an
       unused bot token existing, only to a client `.env` still declaring a
       variable the code no longer reads (which step 3.2 already handled).
 
-4. **Restart Hermes's gateway** so it picks up the `.env` change from step
-   3.2 — Hermes's own env loading happens at gateway start, not per-message:
+4. **Restart Hermes's gateway** so it picks up the renamed/new skill files
+   from step 2. `agent.skill_commands.get_skill_commands()` caches its
+   skill-command map in memory and only rescans automatically when the
+   active platform or profile home changes (`agent/skill_commands.py`)
+   — a plain on-disk rename doesn't invalidate that cache by itself. A
+   fresh gateway process has an empty cache and rescans on first access, so
+   a restart is a reliable way to pick this up; `hermes`'s own
+   `/reload-skills` command is a lighter-weight alternative that rescans
+   without restarting the process, if preferred.
+
+   **Not** about the `.env` edit from step 3 — Hermes reads its *own*
+   profile's env (`~/.hermes/.env` for the default profile, or
+   `~/.hermes/profiles/<profile>/.env`), never the client's
+   `photo-agent/.env`, which is a completely separate consumer read only by
+   the plain Python scripts (`check_approval.py`, `process_photos.py`, ...).
+   Step 3 only *compares against* the Hermes profile's env — it never
+   writes to it — so there is nothing from step 3 for a restart to pick up.
+
+   The launchd service label is **profile-specific, not universal** —
+   confirmed directly in Hermes's own source
+   (`hermes_cli/gateway.py::get_launchd_plist_path()`: "Default `~/.hermes`
+   → `ai.hermes.gateway.plist` (backward compatible). Profile
+   `~/.hermes/profiles/coder` → `ai.hermes.gateway-coder.plist`."): the
+   default profile uses bare `ai.hermes.gateway`, and every other profile
+   gets `ai.hermes.gateway-<profile>` (e.g. `ai.hermes.gateway-mercury`) —
+   also confirmed live on this machine via `launchctl list | grep hermes`,
+   which currently shows both `ai.hermes.gateway` (default, `_demo`) and
+   `ai.hermes.gateway-mercury` running as separate services. Use the label
+   matching the client being migrated:
    ```bash
+   # _demo (default profile):
    launchctl kickstart -k gui/501/ai.hermes.gateway
+   # mercury (its own profile):
+   launchctl kickstart -k gui/501/ai.hermes.gateway-mercury
    ```
    (The crontab and code-deploy steps above don't need a restart on their
    own — cron re-reads its table every tick, and `check_approval.py`
-   re-reads `.env` on every invocation — but do this restart regardless,
-   since it's required for step 3's `.env` edit to take effect.)
+   re-reads `.env` on every invocation.)
 
 5. **Verify the skill rename landed**, before doing a live approval test:
    ```bash
@@ -304,8 +349,10 @@ the new command flow has a working consumer is seconds long, not hours.
    `skills.external_dirs` itself needs no config change — it already
    points at `platform/photo-agent/skills`
    ([`03-process-photos-skill.md`](03-process-photos-skill.md) /
-   [`04-check-approval-skill.md`](04-check-approval-skill.md)), and the
-   rename is picked up automatically by the existing directory scan.
+   [`04-check-approval-skill.md`](04-check-approval-skill.md)) — but the
+   rename is only picked up by a fresh scan of that directory, which is
+   exactly what step 4's restart (or `/reload-skills`) forces; this step
+   is where that actually gets confirmed.
 
 6. **Live verification:**
    1. Trigger a real approval message (`/process_photos project=<name>` via
