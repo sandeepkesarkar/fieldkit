@@ -469,38 +469,55 @@ def _render_legacy_markdown_v1_underscores(text: str) -> str:
     entity nesting is out of scope (the docs say nesting isn't supported anyway).
     It exists only to reason about, and regression-test, this underscore bug.
 
-    Modeled, per the docs:
+    Modeled, per the docs and TDLib's actual parser (the Bot API's underlying
+    implementation:
+    https://github.com/tdlib/td/blob/d1085f9cebc5a62379991ae1652673954f229c1f/td/telegram/MessageEntity.cpp#L1929-L2045):
     - An unescaped '_' toggles an italic span; on a matched pair, both delimiter
       characters are stripped from the output (this is what corrupted the issue
       #54 message: 'Reply /photo_approve or /photo_reject.' has exactly two
       unescaped '_', so the first opens and the second closes, both vanish).
-    - Backslash escapes ONLY '_', '*', '`', '[' ("to escape characters '_', '*',
-      '`', '[' outside of an entity, prepend the character '\\'") — a backslash
-      before any other character is not a recognized escape and is left as a
-      literal backslash. The docs' own worked example for an italicized string
-      containing a literal underscore, '_snake_\\__case_' -> 'snake_case', is
-      used below as a fixture to check this function against real documented
-      behavior rather than just the one corruption string from the issue.
+    - Backslash-escaping is state-aware and only recognized OUTSIDE any open
+      entity: "to escape characters '_', '*', '`', '[' outside of an entity,
+      prepend the character '\\'" — and "escaping inside entities is not
+      allowed, so entity must be closed first and reopened again". So once a '_'
+      has opened an italic span, a backslash has no special meaning inside it —
+      it's just a literal character — and the very next '_' always closes the
+      entity, escaped or not. The docs' own worked example for an italicized
+      string containing a literal underscore therefore closes the entity first,
+      escapes the literal '_' in the outer scan, then reopens: '_snake_\\__case_'
+      -> 'snake_case'. That round trip, and the negative case of trying to escape
+      *inside* an already-open entity ('_snake\\_case_', which does NOT produce
+      'snake_case'), are both used below as fixtures.
     - An unmatched (odd count of) unescaped '_' raises _TelegramEntityParseError,
       matching Telegram's documented/widely-observed behavior of rejecting the
       whole message with a 400 rather than rendering it some other way.
     """
     out: list[str] = []
     i, n = 0, len(text)
-    pending_italic_open = False
+    in_entity = False
     while i < n:
         ch = text[i]
+        if in_entity:
+            # No escaping recognized inside an open entity — a backslash here is
+            # just a literal character, and the next '_' always closes the span.
+            if ch == "_":
+                in_entity = False
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
         if ch == "\\" and i + 1 < n and text[i + 1] in _LEGACY_MARKDOWN_ESCAPABLE:
             out.append(text[i + 1])
             i += 2
             continue
         if ch == "_":
-            pending_italic_open = not pending_italic_open
+            in_entity = True
             i += 1
             continue
         out.append(ch)
         i += 1
-    if pending_italic_open:
+    if in_entity:
         raise _TelegramEntityParseError("Can't parse entities: can't find end of Italic entity")
     return "".join(out)
 
@@ -519,6 +536,20 @@ def test_legacy_markdown_v1_underscore_simulator_matches_docs_escaping_example()
     italicizing a string with a literal underscore in it: '_snake_\\__case_'
     (close the entity, escape the literal '_', reopen) renders as 'snake_case'."""
     assert _render_legacy_markdown_v1_underscores("_snake_\\__case_") == "snake_case"
+
+
+def test_legacy_markdown_v1_underscore_simulator_rejects_escape_inside_open_entity():
+    """Counterexample to the docs escaping example above: a backslash does NOT
+    escape a '_' while already inside an open entity, only in the outer scan
+    before an entity is opened (per the docs' 'escaping inside entities is not
+    allowed' note and TDLib's real parser, linked above). So r'_snake\\_case_'
+    does NOT render as 'snake_case' the way the properly-closed-and-reopened
+    '_snake_\\__case_' does: the first '_' opens italics, the backslash inside it
+    is just a literal character, the '_' right after it closes the entity
+    regardless of that backslash, leaving a final, now-unmatched trailing '_' —
+    an unclosed-entity rejection, not a successful escape."""
+    with pytest.raises(_TelegramEntityParseError):
+        _render_legacy_markdown_v1_underscores(r"_snake\_case_")
 
 
 def test_legacy_markdown_v1_underscore_simulator_rejects_unmatched_underscore():
