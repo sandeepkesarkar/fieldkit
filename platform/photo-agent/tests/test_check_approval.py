@@ -7,8 +7,11 @@ Tests call main() directly and verify behaviour through mock assertions.
 Before issue #49, this script had a cron-based getUpdates polling path and a
 --callback-data direct path (invoked by the manual /check_approval Hermes
 command). #49 retired the poller entirely — the direct path's logic is now
-the script's only code path, invoked by the /approve and /reject Hermes
-skills. Tests for the poller (getUpdates, offset tracking, callback
+the script's only code path, invoked by the /photo_approve and /photo_reject
+Hermes skills (named with a `photo-` prefix, not the bare `approve`/`reject`
+this issue originally specified, because `approve` collides with a built-in
+Hermes core command — see platform/photo-agent/skills/photo-approve/SKILL.md's
+naming note). Tests for the poller (getUpdates, offset tracking, callback
 matching, button-tap acknowledgement/removal, the dedicated approval-bot
 token) are gone along with that code; see git history for the pre-#49
 versions of this file if that coverage is ever needed for reference.
@@ -550,8 +553,9 @@ def test_activity_log_error_on_reject_does_not_block_state_clear(base, mocker):
 
 # ---------------------------------------------------------------------------
 # Cron re-entrancy lock — retained even though the cron poller is gone: two
-# /approve (or /approve + /reject) commands could still be dispatched by
-# Hermes in close succession, and this guards the same state.json race.
+# /photo_approve (or /photo_approve + /photo_reject) commands could still be
+# dispatched by Hermes in close succession, and this guards the same
+# state.json race.
 # ---------------------------------------------------------------------------
 
 def test_lock_contention_exits_silently(mocker, env):

@@ -248,10 +248,10 @@ def main(argv=None) -> None:
         activity_log.log_uploaded(project_name, drive_video_file_id)
 
         # Send the approval-request message as plain text — no inline buttons.
-        # The admin replies /approve or /reject as a Hermes command, dispatched
-        # through Hermes's own always-running gateway poller on the single
-        # TELEGRAM_BOT_TOKEN (issue #49 retired the dedicated second bot and
-        # the button-callback flow that required it).
+        # The admin replies /photo_approve or /photo_reject as a Hermes command,
+        # dispatched through Hermes's own always-running gateway poller on the
+        # single TELEGRAM_BOT_TOKEN (issue #49 retired the dedicated second bot
+        # and the button-callback flow that required it).
         folder_link_url = drive.folder_link(folder_id)
         try:
             msg_id = telegram_api.send_message(

@@ -184,7 +184,7 @@ for the specific mapping from old to new:
   leg — the race it shrank no longer exists because the thing that raced
   (the button-tap `callback_query`) no longer exists.
 - **[`05-cron-verification.md`](05-cron-verification.md) (issue #13).**
-  Partially superseded — its `check_approval.py`'s cron leg" coverage
+  Partially superseded — its `check_approval.py`'s cron leg coverage
   describes a poller and crontab entry that no longer apply.
   `check_email.py`'s and `upload_facebook.py`'s cron entries, also covered
   by that doc, are unaffected.
@@ -200,79 +200,130 @@ their scaffolding (`.env.example`, `README.md`, `.specify/constitution.md`)
 is already updated by this PR to the new single-bot model for their
 eventual first setup.
 
-### 1. Crontab — remove the `check_approval.py` entry
+**Why the order below matters — read before starting.** Deploying this
+PR's code while the old `check_approval.py --source cron` crontab entry is
+still in place produces a *repeated, ongoing* failure: `check_approval.py`
+no longer accepts `--source cron` at all (`--callback-data` is now
+`required=True`, `choices=["approve", "reject"]`), so every cron tick exits
+via argparse's usage error, forever, until the entry is removed. Removing
+the cron entry *substantially* before deploying the new code leaves the old
+button-tap flow with no consumer at all for however long that gap lasts (no
+cron leg to catch a tap; Hermes never dispatches on `callback_query`
+either — confirmed in `04-check-approval-skill.md`). The fix is not a
+different order so much as a **short, uninterrupted window**: do steps 1–2
+back-to-back in one sitting, with no approval expected to land mid-cutover
+(step 0 checks for that), so the gap where neither the old button flow nor
+the new command flow has a working consumer is seconds long, not hours.
 
-The live crontab currently runs (confirmed via `crontab -l` on 2026-08-26):
+### Cutover checklist (follow in order — do not skip or reorder)
 
-```
-* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/check_approval.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
-* * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
-```
+0. **Confirm no approval is currently pending**, on the Mac Mini, for the
+   client being migrated — `state.json` holds no secrets, so reading it
+   directly is fine (unlike a `.env` file, see step 3.1):
+   ```bash
+   jq .pending_approval clients/_demo/data/photo-agent/state.json
+   ```
+   Expect `null`. If a real approval is pending, resolve it first (approve
+   or reject via the *current*, pre-migration flow — tap the button or run
+   `check_approval.py --callback-data approve`) before continuing. Starting
+   the cutover with a pending approval in flight is exactly the scenario
+   the "why the order matters" note above is warning about.
 
-**This is not optional cleanup — it will start failing loudly the moment
-this PR's code is deployed to the Mac Mini.** `check_approval.py` no longer
-accepts `--source cron` at all (`--callback-data` is now `required=True`,
-`choices=["approve", "reject"]`); every cron tick will exit via argparse's
-usage error until the entry is removed. Remove the first line
-(`check_approval.py --source cron`) with `crontab -e`. **Leave the second
-line (`upload_facebook.py --source cron`) untouched** — that pipeline is
-unaffected by this issue.
+1. **Stop/remove the `check_approval.py` cron entry.** The live crontab
+   currently runs (confirmed via `crontab -l` on 2026-08-26):
+   ```
+   * * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/check_approval.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+   * * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c '/usr/local/bin/python3 /Users/sandeep_a_k/src/fieldkit/platform/photo-agent/scripts/upload_facebook.py --source cron' >> /Users/sandeep_a_k/src/fieldkit/logs/cron.log 2>&1
+   ```
+   Remove **only** the first line (`check_approval.py --source cron`) via
+   `crontab -e`. **Leave the second line (`upload_facebook.py --source
+   cron`) untouched** — that pipeline is unaffected by this issue.
 
-### 2. `.env` — remove `TELEGRAM_APPROVAL_BOT_TOKEN`
+2. **Deploy the new code** (`git pull` / whatever sync mechanism the Mac
+   Mini uses to pick up this PR's merge commit on `main`), immediately
+   after step 1, same sitting.
 
-In each live client's `clients/{_demo,mercury}/src/photo-agent/.env`,
-delete the `TELEGRAM_APPROVAL_BOT_TOKEN` line. `TELEGRAM_BOT_TOKEN` (the
-existing Hermes gateway bot) now also serves the approval flow — no new
-value is needed there. Do **not** delete the old approval bot's BotFather
-registration yet if it's easy to keep around for a rollback window; there's
-no harm in an unused bot token existing, only in a client `.env` still
-declaring a variable the code no longer reads.
+3. **Verify and consolidate Telegram tokens — in this exact sub-order:**
+   1. **First**, verify `TELEGRAM_BOT_TOKEN` in the client's
+      `clients/{_demo,mercury}/src/photo-agent/.env` is already the *same*
+      token as that client's Hermes gateway profile uses (they're supposed
+      to already match — this step exists to confirm that assumption
+      before acting on it, not to assume it silently). Compare by length
+      and/or a hash, **never by printing either token's actual value** —
+      same debugging-hygiene convention this project adopted after issue
+      #27's incident (see `CONTRIBUTING.md`'s Security & Secrets section):
+      ```bash
+      # Length-only comparison (no value ever printed):
+      awk '/^TELEGRAM_BOT_TOKEN=/{sub(/^[^=]*=/,""); print length}' \
+          clients/_demo/src/photo-agent/.env
+      awk '/^TELEGRAM_BOT_TOKEN=/{sub(/^[^=]*=/,""); print length}' \
+          ~/.hermes/.env   # or ~/.hermes/profiles/<profile>/.env for a non-default profile
 
-### 3. Hermes skill config — no change expected, but verify
+      # Or a hash comparison, still without printing the value itself:
+      awk -F= '/^TELEGRAM_BOT_TOKEN=/{print $2}' clients/_demo/src/photo-agent/.env | sha256sum
+      awk -F= '/^TELEGRAM_BOT_TOKEN=/{print $2}' ~/.hermes/.env | sha256sum
+      ```
+      If the lengths/hashes don't match, **stop here** — do not proceed to
+      step 3.2. That means the client's `.env` and its Hermes profile are
+      already on two different bots today, which is a pre-existing
+      misconfiguration this migration would otherwise silently paper over
+      (both bots happen to work independently right now; consolidating
+      onto the wrong one would break the gateway, the approval flow, or
+      both). Reconcile which token is correct before continuing.
+   2. **Only once 3.1 confirms a match**, delete the
+      `TELEGRAM_APPROVAL_BOT_TOKEN` line from that same `.env` file.
+      `TELEGRAM_BOT_TOKEN` now also serves the approval flow — no new
+      value is needed.
+   3. **Do not delete or revoke the old approval bot's BotFather
+      registration yet.** Keep it registered for a defined rollback
+      window (a few days of live use through the new flow is a reasonable
+      bar) before retiring it via step 6 below — there's no cost to an
+      unused bot token existing, only to a client `.env` still declaring a
+      variable the code no longer reads (which step 3.2 already handled).
 
-`skills.external_dirs` already points at
-`platform/photo-agent/skills` (unchanged directory, per
-[`03-process-photos-skill.md`](03-process-photos-skill.md) /
-[`04-check-approval-skill.md`](04-check-approval-skill.md)) — the rename
-from `check-approval/` to `photo-approve/` plus the new `photo-reject/`
-subdirectory are picked up automatically by the existing directory scan, no
-config edit needed. Confirm post-deploy with:
+4. **Restart Hermes's gateway** so it picks up the `.env` change from step
+   3.2 — Hermes's own env loading happens at gateway start, not per-message:
+   ```bash
+   launchctl kickstart -k gui/501/ai.hermes.gateway
+   ```
+   (The crontab and code-deploy steps above don't need a restart on their
+   own — cron re-reads its table every tick, and `check_approval.py`
+   re-reads `.env` on every invocation — but do this restart regardless,
+   since it's required for step 3's `.env` edit to take effect.)
 
-```bash
-hermes skills list --source local
-```
+5. **Verify the skill rename landed**, before doing a live approval test:
+   ```bash
+   hermes skills list --source local
+   ```
+   Expect `photo-approve` and `photo-reject` listed as `local` / `enabled`,
+   and `check-approval` **absent** (confirms the rename replaced the old
+   command rather than adding a new one alongside it — same check
+   `test_photo_approve_dispatch.py::test_check_approval_command_key_no_longer_resolves`
+   makes automatically). If `check-approval` still appears, the deployed
+   repo checkout is stale — re-pull (repeat step 2) before continuing.
+   `skills.external_dirs` itself needs no config change — it already
+   points at `platform/photo-agent/skills`
+   ([`03-process-photos-skill.md`](03-process-photos-skill.md) /
+   [`04-check-approval-skill.md`](04-check-approval-skill.md)), and the
+   rename is picked up automatically by the existing directory scan.
 
-Expect `photo-approve` and `photo-reject` listed as `local` / `enabled`,
-and `check-approval` **absent** (confirms the rename replaced the old
-command rather than adding a new one alongside it — same check
-`test_photo_approve_dispatch.py::test_check_approval_command_key_no_longer_resolves`
-makes automatically). If `check-approval` still appears, the deployed repo
-checkout is stale — re-pull before continuing.
+6. **Live verification:**
+   1. Trigger a real approval message (`/process_photos project=<name>` via
+      Hermes, or wait for a natural one) and confirm the message text reads
+      "Reply /photo_approve or /photo_reject." with **no inline buttons**.
+   2. Reply `/photo_approve` (or `/photo_reject`) in the same Telegram chat.
+      Confirm the expected downstream effect (approval email sent / Drive
+      file deleted, per `logs/photo-agent.log`) and that `logs/cron.log`
+      shows no further `check_approval.py` entries at all after step 1's
+      crontab edit.
+   3. Confirm `pending_approval` clears in `state.json` and (for approve) a
+      Facebook upload is enqueued if `FB_PAGE_ID` is configured.
+   4. Repeat once more to rule out a one-off — same "repeat once" bar
+      `07-callback-race-fix.md`'s own verification steps set.
 
-### 4. Live verification
-
-1. Restart is **not** required for the crontab or `.env` edits above (cron
-   re-reads its table on every tick; `check_approval.py` re-reads `.env` on
-   every invocation) — but restart Hermes's gateway
-   (`launchctl kickstart -k gui/501/ai.hermes.gateway`) after the `.env`
-   edit anyway, since Hermes's own env loading happens at gateway start,
-   not per-message.
-2. Trigger a real approval message (`/process_photos project=<name>` via
-   Hermes, or wait for a natural one) and confirm the message text reads
-   "Reply /photo_approve or /photo_reject." with **no inline buttons**.
-3. Reply `/photo_approve` (or `/photo_reject`) in the same Telegram chat.
-   Confirm the expected downstream effect (approval email sent / Drive file
-   deleted, per `logs/photo-agent.log`) and that `logs/cron.log` shows
-   no further `check_approval.py` entries at all after the crontab edit.
-4. Confirm `pending_approval` clears in `state.json` and (for approve) a
-   Facebook upload is enqueued if `FB_PAGE_ID` is configured.
-5. Repeat once more to rule out a one-off — same "repeat once" bar
-   `07-callback-race-fix.md`'s own verification steps set.
-
-### 5. Retiring the old approval bot (optional, once confident)
-
-Once the above is confirmed stable, the old dedicated approval bot
-registration can be deleted via [@BotFather](https://t.me/BotFather)
-(`/deletebot`) if desired — purely cosmetic cleanup, not required for
-correctness, since nothing in the codebase references
-`TELEGRAM_APPROVAL_BOT_TOKEN` anymore once step 2 is done.
+7. **Retire the old approval bot, once the rollback window from step 3.3
+   has passed with the new flow confirmed stable.** Delete it via
+   [@BotFather](https://t.me/BotFather) (`/deletebot`) if desired — purely
+   cosmetic cleanup at this point, not required for correctness, since
+   nothing in the codebase references `TELEGRAM_APPROVAL_BOT_TOKEN` anymore
+   once step 3.2 is done.

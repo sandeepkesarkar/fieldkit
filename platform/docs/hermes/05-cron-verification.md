@@ -10,7 +10,7 @@ and [`04-check-approval-skill.md`](04-check-approval-skill.md) (#8).
 Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-hermes-runtime/spec.md) (FR-003, SC-001).
 
 > **Partially superseded by issue #49 (2026-08-26):** this doc's
-> `check_approval.py`'s cron leg" coverage describes a poller that issue
+> `check_approval.py`'s cron leg coverage describes a poller that issue
 > #49 retires entirely — `check_approval.py` no longer accepts
 > `--source cron` at all, and no crontab entry should run it on an interval
 > going forward. See
