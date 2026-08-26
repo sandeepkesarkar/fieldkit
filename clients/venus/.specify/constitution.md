@@ -39,10 +39,13 @@ exercised manually, not on a schedule — consistent with `_demo`'s posture.
 ### 3. Human Oversight & Quality Control
 
 Unchanged from the framework constitution's Gate 2: every generated video
-requires an explicit Telegram Approve/Reject from the admin before any
-publish step runs. This is the exact behavior Story 2's acceptance scenario
-requires to be identical across providers — verified by using the same
-`check-approval` / `process-photos` skills, unmodified, under the `venus`
+requires an explicit `/photo_approve` or `/photo_reject` Telegram command
+from the admin before any publish step runs (issue #49 replaced the earlier
+inline Approve/Reject buttons with these plain-text Hermes commands — see
+`platform/docs/hermes/10-text-based-approval-migration.md`). This is the
+exact behavior Story 2's acceptance scenario requires to be identical
+across providers — verified by using the same `photo-approve` /
+`photo-reject` / `process-photos` skills, unmodified, under the `venus`
 Hermes profile.
 
 ### 4. Operational Priorities
@@ -69,15 +72,20 @@ only for client-initiated photo uploads per the framework constitution's
 ### Infrastructure Requirements
 - Same Mac Mini / Hermes supervisor as every other client on this machine
 - A dedicated Hermes profile (`venus`) — see `README.md`
-- A dedicated Telegram bot pair (gateway + approval), separate from every
-  other client's, per issue #29's offset-race finding
+- A single dedicated Telegram bot (`TELEGRAM_BOT_TOKEN`), separate from
+  every other client's. Before issue #49 this was a bot *pair* (gateway +
+  a second, dedicated approval bot, per issue #29's offset-race finding) —
+  the second bot is retired now that approval is a plain Hermes command
+  dispatched through the same gateway poller; see
+  `platform/docs/hermes/10-text-based-approval-migration.md`.
 
 ### Hermes Integration
 - Runtime: Hermes Agent, profile `venus`
 - Model routing: OpenAI (`model.provider: openai-api`) — explicit per-client
   choice per framework constitution Architecture Constraints
 - Skills: `platform/photo-agent/skills/process-photos`,
-  `platform/photo-agent/skills/check-approval` — unmodified, shared with
+  `platform/photo-agent/skills/photo-approve`,
+  `platform/photo-agent/skills/photo-reject` — unmodified, shared with
   every other client
 
 ### Testing Requirements

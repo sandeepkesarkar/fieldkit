@@ -1,5 +1,16 @@
 # check-approval as a Hermes Skill (issue #8)
 
+> **Superseded by issue #49 (2026-08-26).** The `check-approval` skill this
+> doc describes was renamed to `photo-approve` and a new sibling
+> `photo-reject` skill was added — see
+> [`10-text-based-approval-migration.md`](10-text-based-approval-migration.md).
+> This doc's empirical finding that Hermes cannot dispatch off the raw
+> Approve/Reject button `callback_query` still holds and is exactly why
+> issue #49 removed the buttons entirely rather than continuing to work
+> around that limitation — that part of this doc is not obsolete, just
+> superseded by a different resolution. Left in place as a historical
+> record of the original manual-command port, not silently deleted.
+
 Replaces OpenClaw's `SKILL_check_approval.md` with a Hermes-native skill at
 `platform/photo-agent/skills/check-approval/SKILL.md`, covering the manual
 `/check_approval` command trigger only. `check_approval.py` itself is

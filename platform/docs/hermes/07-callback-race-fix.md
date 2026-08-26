@@ -1,5 +1,16 @@
 # Hermes-vs-Cron `getUpdates` Offset Race — Fix (issue #29)
 
+> **Superseded by issue #49 (2026-08-26).** The dual-bot-token architecture
+> this doc implements (`TELEGRAM_APPROVAL_BOT_TOKEN`, separate from
+> Hermes's `TELEGRAM_BOT_TOKEN`) is retired — see
+> [`10-text-based-approval-migration.md`](10-text-based-approval-migration.md).
+> Issue #49 removed the button-callback flow (and its cron poller) that
+> this fix's second bot token existed to protect from a `getUpdates` offset
+> race; with no second poller left to race against Hermes's own, the whole
+> reason for a second bot is gone. This doc's diagnosis of the race and why
+> the alternatives (options 1–3 below) were rejected remain accurate
+> history — left in place, not silently deleted.
+
 Closes issue #29: `check_approval.py`'s cron leg and Hermes's gateway were
 both polling Telegram `getUpdates` against the same bot token, so Hermes —
 polling continuously — would consume and offset-past a real Approve/Reject

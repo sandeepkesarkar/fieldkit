@@ -10,8 +10,10 @@ the job — clearing pending_facebook_upload (issue #34) — before this poll ev
 samples the brief window it was pending in. facebook_state.find_published() is
 checked as a second, equally-valid success signal for exactly that race.
 
-Tap Approve in Telegram while this script is polling. If not using cron,
-run check_approval.py in another terminal to process the approval.
+Reply /approve (or run `check_approval.py --callback-data approve` directly)
+in Telegram while this script is polling — issue #49 removed the inline
+Approve button and the cron poller in favor of the /approve and /reject
+Hermes commands.
 
 Usage:
     python3 scripts/e2e_stage4_await_approval.py
@@ -77,7 +79,8 @@ def main(argv=None) -> None:
     test_name = run_state["test_name"]
 
     print(f"Waiting for approval of {test_name} (timeout: {args.timeout}s)...")
-    print("  Approve in Telegram. Run check_approval.py if not using cron.")
+    print("  Reply /approve in Telegram, or run "
+          "'check_approval.py --callback-data approve' directly.")
 
     try:
         _wait_for_approval(test_name, args.timeout)

@@ -2,13 +2,19 @@
 State manager for the photo-video agent.
 
 Manages:
-  $FIELDKIT_DATA_DIR/photo-agent/state.json  — pending approval record + Telegram update offset
+  $FIELDKIT_DATA_DIR/photo-agent/state.json  — the pending approval record
 
 All read-modify-write operations acquire an exclusive file lock (fcntl.LOCK_EX) before
 reading and release it after writing. This prevents corruption when process_photos.py
 and check_approval.py overlap.
 
 Sensitive fields (chat IDs, bot tokens) are never written to log output.
+
+Before issue #49, this file also tracked a `telegram_update_offset` for
+check_approval.py's cron-based getUpdates poll. That poller is retired —
+approve/reject are now direct Hermes commands with no offset to track — so
+the offset field and its accessors are gone. See
+platform/docs/hermes/10-text-based-approval-migration.md.
 """
 
 import fcntl
@@ -29,8 +35,6 @@ __all__ = [
     "get_pending_approval",
     "set_pending_approval",
     "clear_pending_approval",
-    "get_telegram_offset",
-    "set_telegram_offset",
 ]
 
 _REQUIRED_APPROVAL_KEYS = frozenset({
@@ -43,7 +47,7 @@ _REQUIRED_APPROVAL_KEYS = frozenset({
     "triggered_at",
 })
 
-_DEFAULTS = {"telegram_update_offset": 0, "pending_approval": None}
+_DEFAULTS = {"pending_approval": None}
 
 
 def _read(file_obj) -> dict:
@@ -134,45 +138,6 @@ def clear_pending_approval() -> None:
             data["pending_approval"] = None
             _write(f, data)
             logger.info("clear_pending_approval: pending_approval cleared")
-        finally:
-            logger.debug("Releasing lock on state.json")
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
-def get_telegram_offset() -> int:
-    """Return the stored Telegram update offset. Returns 0 if state.json is missing."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(STATE_FILE, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                data = _read(f)
-                offset = data.get("telegram_update_offset", 0)
-                logger.debug("get_telegram_offset=%d", offset)
-                return offset
-            finally:
-                logger.debug("Releasing lock on state.json")
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except FileNotFoundError:
-        logger.debug("state.json missing — telegram_update_offset=0")
-        return 0
-
-
-def set_telegram_offset(offset: int) -> None:
-    """Write the Telegram update offset without touching pending_approval."""
-    if not isinstance(offset, int):
-        raise TypeError(f"set_telegram_offset: offset must be int, got {type(offset).__name__}")
-    if offset < 0:
-        raise ValueError(f"set_telegram_offset: offset must be >= 0, got {offset}")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        logger.debug("Acquiring exclusive lock on state.json for set_telegram_offset")
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            data["telegram_update_offset"] = offset
-            _write(f, data)
-            logger.info("set_telegram_offset=%d", offset)
         finally:
             logger.debug("Releasing lock on state.json")
             fcntl.flock(f, fcntl.LOCK_UN)

@@ -1,10 +1,16 @@
 """
 Tests for tools/state.py — the photo-video agent's persistent state manager.
 
-Covers pending approval read/write/clear, Telegram offset tracking, file
-auto-creation, corrupt-file handling, and concurrent-access safety.
-All file I/O is redirected to a tmp directory via the autouse fixture so tests
-never touch the real Mac Mini data directory.
+Covers pending approval read/write/clear, file auto-creation, corrupt-file
+handling, and concurrent-access safety. All file I/O is redirected to a tmp
+directory via the autouse fixture so tests never touch the real Mac Mini
+data directory.
+
+Before issue #49, this module also tracked a Telegram update offset for
+check_approval.py's cron-based getUpdates poll. That poller is retired, so
+get_telegram_offset/set_telegram_offset and their tests are gone along with
+it — see git history for the pre-#49 version of this file if that coverage
+is ever needed for reference.
 """
 
 import json
@@ -53,7 +59,7 @@ def test_get_pending_approval_returns_none_when_file_missing():
 
 def test_get_pending_approval_returns_none_when_null_in_file():
     """get_pending_approval() returns None when pending_approval is null in the file."""
-    state.STATE_FILE.write_text(json.dumps({"telegram_update_offset": 0, "pending_approval": None}))
+    state.STATE_FILE.write_text(json.dumps({"pending_approval": None}))
     assert state.get_pending_approval() is None
 
 
@@ -96,49 +102,6 @@ def test_clear_pending_approval_writes_null_in_file(valid_record):
     assert data["pending_approval"] is None
 
 
-# --- get_telegram_offset ---
-
-def test_get_telegram_offset_returns_0_when_file_missing():
-    """get_telegram_offset() returns 0 when state.json does not exist."""
-    assert not state.STATE_FILE.exists()
-    assert state.get_telegram_offset() == 0
-
-
-def test_get_telegram_offset_returns_stored_value():
-    """get_telegram_offset() returns the value written by set_telegram_offset()."""
-    state.set_telegram_offset(999)
-    assert state.get_telegram_offset() == 999
-
-
-def test_get_telegram_offset_raises_on_corrupt_file():
-    """get_telegram_offset() raises RuntimeError when state.json is corrupt."""
-    state.STATE_FILE.write_text("{corrupt: not valid json")
-    with pytest.raises(RuntimeError, match="corrupt"):
-        state.get_telegram_offset()
-
-
-# --- set_telegram_offset ---
-
-def test_set_telegram_offset_does_not_overwrite_pending_approval(valid_record):
-    """set_telegram_offset() updates only the offset field; pending_approval survives."""
-    state.set_pending_approval(valid_record)
-    state.set_telegram_offset(77)
-    assert state.get_pending_approval() == valid_record
-    assert state.get_telegram_offset() == 77
-
-
-def test_set_telegram_offset_rejects_non_integer():
-    """set_telegram_offset() raises TypeError when passed a non-integer."""
-    with pytest.raises(TypeError, match="offset must be int"):
-        state.set_telegram_offset(99.9)  # type: ignore[arg-type]
-
-
-def test_set_telegram_offset_rejects_negative():
-    """set_telegram_offset() raises ValueError when passed a negative offset."""
-    with pytest.raises(ValueError, match="offset must be >= 0"):
-        state.set_telegram_offset(-1)
-
-
 # --- file creation ---
 
 def test_state_file_created_if_missing_on_set_pending_approval(valid_record):
@@ -148,27 +111,21 @@ def test_state_file_created_if_missing_on_set_pending_approval(valid_record):
     assert state.STATE_FILE.exists()
 
 
-def test_state_file_created_if_missing_on_set_telegram_offset():
-    """set_telegram_offset() creates state.json when the file does not exist."""
-    assert not state.STATE_FILE.exists()
-    state.set_telegram_offset(5)
-    assert state.STATE_FILE.exists()
-
-
 # --- concurrency ---
 
 def test_concurrent_mixed_calls_do_not_corrupt_file(valid_record):
-    """Mixed set_pending_approval and set_telegram_offset threads produce a valid state file.
+    """Mixed set_pending_approval and clear_pending_approval threads produce a valid state file.
 
     This exercises the real dangerous race: thread A reads stale data and overwrites
-    thread B's write. With correct LOCK_EX serialisation both fields must survive intact.
+    thread B's write. With correct LOCK_EX serialisation the file must stay parseable
+    and end in one of the two valid end states, never a corrupt partial write.
     """
     state.set_pending_approval(valid_record)
     errors = []
 
-    def writer_offset(i):
+    def writer_clear():
         try:
-            state.set_telegram_offset(i)
+            state.clear_pending_approval()
         except Exception as e:
             errors.append(e)
 
@@ -179,7 +136,7 @@ def test_concurrent_mixed_calls_do_not_corrupt_file(valid_record):
             errors.append(e)
 
     threads = (
-        [threading.Thread(target=writer_offset, args=(i,)) for i in range(5)]
+        [threading.Thread(target=writer_clear) for _ in range(5)]
         + [threading.Thread(target=writer_approval) for _ in range(5)]
     )
     for t in threads:
@@ -189,6 +146,4 @@ def test_concurrent_mixed_calls_do_not_corrupt_file(valid_record):
 
     assert not errors, f"Errors in threads: {errors}"
     data = json.loads(state.STATE_FILE.read_text())
-    assert data["pending_approval"] == valid_record
-    assert isinstance(data["telegram_update_offset"], int)
-    assert data["telegram_update_offset"] in range(5)
+    assert data["pending_approval"] in (valid_record, None)

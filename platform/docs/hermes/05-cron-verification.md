@@ -9,6 +9,16 @@ and [`04-check-approval-skill.md`](04-check-approval-skill.md) (#8).
 
 Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-hermes-runtime/spec.md) (FR-003, SC-001).
 
+> **Partially superseded by issue #49 (2026-08-26):** this doc's
+> `check_approval.py`'s cron leg" coverage describes a poller that issue
+> #49 retires entirely — `check_approval.py` no longer accepts
+> `--source cron` at all, and no crontab entry should run it on an interval
+> going forward. See
+> [`10-text-based-approval-migration.md`](10-text-based-approval-migration.md)
+> for the retirement and the live-migration steps. `check_email.py`'s and
+> `upload_facebook.py`'s cron entries are unaffected — only the
+> photo-approval polling leg is retired.
+
 > **Revision note (2026-08-22):** the version of this document written
 > during PR #22 overstated several of its own conclusions — see issue #13
 > (reopened) for the retroactive cross-vendor review that found this. This

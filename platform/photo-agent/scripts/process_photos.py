@@ -103,7 +103,7 @@ def _approval_text(project_name: str, photo_count: int, duration_sec: float, fol
     return (
         f"📸 *{project_name}* — {photo_count} photos, {duration_sec:g}s video\n"
         f"[View folder]({folder_link})\n\n"
-        "Approve or reject:"
+        "Reply /photo_approve or /photo_reject."
     )
 
 
@@ -247,19 +247,17 @@ def main(argv=None) -> None:
 
         activity_log.log_uploaded(project_name, drive_video_file_id)
 
-        # Send approval message with inline keyboard. Sent via the dedicated
-        # approval bot token (issue #29) — check_approval.py's cron leg polls
-        # getUpdates for the tap on this same token, kept separate from
-        # Hermes's own TELEGRAM_BOT_TOKEN long-poll so the two never race for
-        # the same offset.
+        # Send the approval-request message as plain text — no inline buttons.
+        # The admin replies /approve or /reject as a Hermes command, dispatched
+        # through Hermes's own always-running gateway poller on the single
+        # TELEGRAM_BOT_TOKEN (issue #49 retired the dedicated second bot and
+        # the button-callback flow that required it).
         folder_link_url = drive.folder_link(folder_id)
         try:
-            msg_id = telegram_api.send_message_with_buttons(
+            msg_id = telegram_api.send_message(
                 chat_id,
                 _approval_text(project_name, n, duration_sec, folder_link_url),
-                [("✅ Approve", "approve"), ("❌ Reject", "reject")],
                 parse_mode="Markdown",
-                token_env_var="TELEGRAM_APPROVAL_BOT_TOKEN",
             )
         except RuntimeError as exc:
             _telegram_error(f"❌ {project_name}: failed to send approval message — {exc}")
