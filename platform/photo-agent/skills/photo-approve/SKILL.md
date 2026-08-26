@@ -69,12 +69,11 @@ command and platform/.specify/003-hermes-runtime/spec.md FR-002/FR-002a):
 
 The admin types `/photo_approve` in Telegram to approve the pending video.
 
-FieldKit's state.json maintains at most one pending-approval record at a time,
-so this command carries unambiguous semantics: approve whichever video is
-currently pending. The check_approval.py script is idempotent and performs all
-necessary safety checks before taking action.
-
-Run this command immediately:
+The command is fully specified by the single pending record in state.json. On
+invocation, use the following script as the sole execution path, exactly once.
+The script owns state access, validation, and all approval side effects
+(sending the email, enqueueing the Facebook upload if configured, activity
+logging); the agent's role is limited to invoking it and reporting the result.
 
 ```bash
 cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
@@ -83,10 +82,6 @@ python3 scripts/check_approval.py --callback-data approve 2>&1
 
 > **Note:** `~/src/fieldkit/` is the expected repo location. If the repo is cloned
 > elsewhere, update this path before saving.
-
-The script handles everything: sending the approval email, enqueueing the
-Facebook upload (if configured), activity logging, and the admin's outcome
-notification.
 
 ## Output handling
 
