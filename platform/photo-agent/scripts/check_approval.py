@@ -1,45 +1,53 @@
 """
-check_approval.py — Poll Telegram for admin approval/rejection and process it.
+check_approval.py — Process an admin approve/reject decision for the pending video.
 
 Usage:
-    python3 scripts/check_approval.py                        # cron path
-    python3 scripts/check_approval.py --source cron          # cron with source label
-    python3 scripts/check_approval.py --callback-query-id <id> --callback-data approve --message-id <msg_id>
+    python3 scripts/check_approval.py --callback-data approve
+    python3 scripts/check_approval.py --callback-data reject
 
-Cron path: reads state.json for a pending approval, polls Telegram getUpdates for
-a callback_query matching the pending message_id, dispatches approve or reject.
+Invoked directly by Hermes's /photo_approve and /photo_reject skills (see
+platform/photo-agent/skills/photo-approve/SKILL.md and
+platform/photo-agent/skills/photo-reject/SKILL.md — named with a `photo-`
+prefix, not the bare `approve`/`reject` this issue originally specified,
+because `approve` collides with a built-in Hermes core command; see those
+SKILL.md files' naming notes) — Hermes shells out to this script
+synchronously in response to the admin's command and relays its output;
+there is no poller or background process on either side.
 
-Direct path: invoked by Hermes's /check_approval skill with --callback-data
-approve, getUpdates is bypassed entirely (see platform/photo-agent/skills/
-check-approval/SKILL.md — Hermes cannot dispatch off the raw button tap itself,
-so this path only ever fires from the manual /check_approval command).
+The system operates on a single-pending-approval-at-a-time model
+(state.json's pending_approval field is singular), so a bare /photo_approve
+or /photo_reject carries unambiguous semantics: whichever approval is
+currently pending. If nothing is pending, the script exits 0 with no output.
 
-Bot-token split (issue #29): the entire button-callback surface — sending the
-approval message with its inline keyboard (process_photos.py), polling
-getUpdates for the tap, answering the callback query, and editing the message
-to remove the buttons — runs on TELEGRAM_APPROVAL_BOT_TOKEN, a bot token
-dedicated to this cron leg and never shared with Hermes's gateway. Hermes's
-own continuous getUpdates long-poll runs on TELEGRAM_BOT_TOKEN. Both tokens
-poll independently against Telegram's own servers, so there is no shared
-per-token offset for Hermes to advance past a real button tap before this
-cron leg's once-a-minute run sees it — the two bots simply never compete for
-the same update stream. Plain-text admin notifications (_notify_admin) also
-use the approval bot token so the whole approve/reject interaction — button,
-tap acknowledgement, and outcome message — stays in one Telegram
-conversation, separate from Hermes's own bot conversation.
+---
 
-Fast-ack / long-poll fix (issue #31): a callback_query's freshness window
-(~15s, Telegram-side) is far shorter than cron's once-a-minute cadence. The
-cron leg's getUpdates call already answered a matched callback before any
-approve/reject processing (see _LONG_POLL_TIMEOUT_SECONDS below and the
-answer_callback_query call in _run) — but with a plain instant poll
-(timeout=0), a tap landing between two cron ticks could sit queued for up to
-~60s before this leg ever saw it, already stale by the time it was observed.
-getUpdates now long-polls for up to _LONG_POLL_TIMEOUT_SECONDS: Telegram
-holds the connection open and delivers the tap the moment it happens, so
-answer_callback_query fires within a fraction of a second of the tap for any
-tap landing while the poll is open, instead of waiting for the next minute
-boundary.
+Historical note (issue #49, 2026-08-26): this script used to be a
+cron-driven poller. Before this change, `process_photos.py` sent the
+approval-request message with inline Approve/Reject buttons on a second,
+dedicated `TELEGRAM_APPROVAL_BOT_TOKEN` (issue #29), and this script's
+`--source cron` entry polled that bot's `getUpdates` once a minute, looking
+for the button-tap `callback_query`, long-polling for up to 45s to close a
+callback-freshness race against Telegram's own ~15s answer window (issue
+#31). A `--callback-data` direct path already existed alongside the cron
+path — added by issue #8 for a manual "/check_approval" Hermes command that
+could force an immediate re-check — because Hermes's Telegram adapter has
+no hook for a raw button-tap `callback_query` at all (verified against
+Hermes's own source; see platform/docs/hermes/04-check-approval-skill.md).
+
+Issue #49 eliminates the poller entirely rather than continuing to shrink
+its race window: plain text/slash-command messages have no callback-
+freshness deadline in Telegram's API (only `callback_query` does), so
+routing approve/reject through Hermes's own always-running gateway poller
+— which the direct path already exercised — removes the race
+architecturally. The buttons are gone from the approval-request message
+(see process_photos.py), the cron leg and its long-poll/offset/callback-
+matching machinery are gone from this script, and the second bot token
+(TELEGRAM_APPROVAL_BOT_TOKEN) is retired along with them — one bot per
+client now handles both Hermes's gateway traffic and the approval flow. See
+platform/docs/hermes/10-text-based-approval-migration.md for the full
+writeup, the empirical dispatch verification, and the live-migration steps
+for already-deployed clients (deferred to a human follow-up, not part of
+this change).
 """
 
 import argparse
@@ -73,17 +81,6 @@ from tools import telegram_api
 _log = logging.getLogger(__name__)
 _PHOTO_AGENT_DIR = Path(__file__).parents[1]
 _REPO_ROOT = Path(__file__).parents[3]
-
-# Dedicated bot token for the entire button-callback surface (issue #29) —
-# never the same token as Hermes's TELEGRAM_BOT_TOKEN gateway poll.
-_APPROVAL_TOKEN_ENV = "TELEGRAM_APPROVAL_BOT_TOKEN"
-
-# Telegram long-poll duration (seconds) for the cron leg's getUpdates call
-# (issue #31). Telegram's own recommended ceiling for a single getUpdates
-# long-poll is ~50s; kept a little under both that and cron's 60s cadence so
-# this invocation's poll has normally finished (or been serviced) before the
-# next cron tick fires and finds the check_approval.lock still held.
-_LONG_POLL_TIMEOUT_SECONDS = 45
 
 
 def _try_acquire_check_lock() -> "IO | None":
@@ -121,7 +118,7 @@ def _notify_admin(message: str) -> None:
         _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot send admin notification")
         return
     try:
-        telegram_api.send_message(chat_id, message, token_env_var=_APPROVAL_TOKEN_ENV)
+        telegram_api.send_message(chat_id, message)
     except Exception as exc:
         _log.warning("failed to send admin notification: %s", exc)
 
@@ -223,94 +220,19 @@ def _enqueue_facebook_upload(
         _log.error("Failed to enqueue FB upload for project=%s: %s", project_name, exc)
 
 
-_TAP_TOASTS = {"approve": "✅ Approving...", "reject": "❌ Rejecting..."}
-
-
-def _tap_toast(callback_data: str) -> str:
-    """Return the brief toast text shown to the admin after tapping Approve or Reject."""
-    return _TAP_TOASTS.get(callback_data, "⚠️ Unknown action")
-
-
-def _acknowledge_tap(
-    callback_query_id: str | None,
-    callback_data: str,
-    chat_id: str,
-    message_id: int,
-) -> None:
-    """Answer the callback query (best-effort) and remove the inline buttons.
-
-    Used on the direct path where the /check_approval skill may or may not supply the callback_query_id.
-    Both operations are best-effort: failures are logged as warnings and do not abort
-    the approval — the spinner auto-clears after ~10s and button removal is cosmetic.
-    """
-    if callback_query_id:
-        try:
-            telegram_api.answer_callback_query(
-                callback_query_id, text=_tap_toast(callback_data), token_env_var=_APPROVAL_TOKEN_ENV
-            )
-        except RuntimeError as exc:
-            _log.warning("answer_callback_query failed (non-fatal): %s", exc)
-    _remove_buttons(chat_id, message_id)
-
-
-def _remove_buttons(chat_id: str, message_id: int) -> None:
-    """Edit the approval message to remove its inline keyboard. Best-effort."""
-    if not chat_id:
-        _log.warning("ADMIN_TELEGRAM_CHAT_ID not set — cannot remove approval buttons")
-        return
-    try:
-        telegram_api.edit_message_reply_markup(chat_id, message_id, token_env_var=_APPROVAL_TOKEN_ENV)
-    except RuntimeError as exc:
-        _log.warning("edit_message_reply_markup failed (non-fatal): %s", exc)
-
-
-def _find_matching_callback(updates: list[dict], message_id: int, chat_id: str) -> dict | None:
-    """Return the first update whose callback_query matches message_id and chat_id, or None."""
-    for update in updates:
-        cq = update.get("callback_query")
-        if not cq:
-            continue
-        msg = cq.get("message", {})
-        if msg.get("message_id") != message_id:
-            continue
-        if chat_id and str(msg.get("chat", {}).get("id", "")) != chat_id:
-            continue
-        return update
-    return None
-
-
 def main(argv=None) -> None:
-    """Poll Telegram for the pending approval callback and dispatch approve or reject."""
-    parser = argparse.ArgumentParser(description="Check for pending approval and process it.")
-    parser.add_argument(
-        "--source",
-        choices=["cron"],
-        default=None,
-        help="Invocation source; 'cron' is informational (logged but does not change behaviour).",
-    )
-    parser.add_argument(
-        "--callback-query-id",
-        default=None,
-        dest="callback_query_id",
-        help="Telegram callback_query.id (direct path — bypasses getUpdates).",
+    """Parse --callback-data and dispatch the approve/reject decision."""
+    parser = argparse.ArgumentParser(
+        description="Process an admin approve/reject decision for the pending video."
     )
     parser.add_argument(
         "--callback-data",
         choices=["approve", "reject"],
-        default=None,
+        required=True,
         dest="callback_data",
-        help="Telegram callback_query.data, 'approve' or 'reject' (direct path).",
-    )
-    parser.add_argument(
-        "--message-id",
-        type=int,
-        default=None,
-        dest="message_id",
-        help="Telegram message_id of the approval message (direct path).",
+        help="Decision to process: 'approve' or 'reject'.",
     )
     args = parser.parse_args(argv)
-    if args.source:
-        _log.debug("invoked from source=%s", args.source)
 
     _load_env()
 
@@ -320,13 +242,13 @@ def main(argv=None) -> None:
         return
 
     try:
-        return _run(args)
+        return _run(args.callback_data)
     finally:
         fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
 
 
-def _run(args) -> None:
+def _run(callback_data: str) -> None:
     """Core logic, called after the check_approval.lock is held."""
     record = state.get_pending_approval()
     if record is None:
@@ -341,71 +263,6 @@ def _run(args) -> None:
 
     agent_email = os.environ.get("AGENT_EMAIL", "")
     admin_email = os.environ.get("ADMIN_EMAIL", "")
-    chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
-
-    # Direct path: the /check_approval skill (see skills/check-approval/SKILL.md)
-    # passes --callback-data approve|reject, bypassing getUpdates. Hermes's Telegram
-    # adapter cannot dispatch off the raw button-tap callback_query itself (only the
-    # cron leg below sees it), so this path only ever fires from the manual command.
-    # --callback-query-id and --message-id are optional extras; --callback-data alone suffices.
-    direct = args.callback_data is not None
-
-    if direct:
-        callback_data = args.callback_data
-        new_offset = None  # direct path has no getUpdates offset to advance
-
-        # Verify message_id if provided — guards against stale direct invocations.
-        if args.message_id is not None and args.message_id != telegram_message_id:
-            _log.warning(
-                "direct callback message_id=%d does not match pending approval message_id=%d — ignoring",
-                args.message_id,
-                telegram_message_id,
-            )
-            return
-
-        _acknowledge_tap(args.callback_query_id, callback_data, chat_id, telegram_message_id)
-
-    else:
-        # Cron path: poll getUpdates for the callback.
-        offset = state.get_telegram_offset()
-
-        try:
-            updates = telegram_api.get_updates(
-                offset, token_env_var=_APPROVAL_TOKEN_ENV, timeout=_LONG_POLL_TIMEOUT_SECONDS
-            )
-        except RuntimeError as exc:
-            _log.error("get_updates failed — retrying on next run: %s", exc)
-            return
-
-        new_offset = max(u["update_id"] for u in updates) + 1 if updates else offset
-
-        match = _find_matching_callback(updates, telegram_message_id, chat_id)
-        if match is None:
-            _log.debug(
-                "no matching callback for message_id=%d — advancing offset to %d",
-                telegram_message_id,
-                new_offset,
-            )
-            state.set_telegram_offset(new_offset)
-            return
-
-        cq = match["callback_query"]
-        callback_query_id = cq["id"]
-        callback_data = cq.get("data", "")
-
-        # Dismiss the spinner and remove buttons before any email or Telegram message.
-        # answer_callback_query failure on the cron path → advance offset and bail
-        # (leave state intact so the admin can re-tap the next approval message).
-        try:
-            _toast = _tap_toast(callback_data)
-            telegram_api.answer_callback_query(
-                callback_query_id, text=_toast, token_env_var=_APPROVAL_TOKEN_ENV
-            )
-        except RuntimeError as exc:
-            _log.error("answer_callback_query failed: %s", exc)
-            state.set_telegram_offset(new_offset)
-            return
-        _remove_buttons(chat_id, telegram_message_id)
 
     if callback_data == "approve":
         email_sent = False
@@ -442,7 +299,7 @@ def _run(args) -> None:
 
         _enqueue_facebook_upload(project_name, video_local_path, telegram_message_id)
 
-    elif callback_data == "reject":
+    else:  # reject
         # Drive delete is best-effort — failure is logged but does not block the rejection.
         try:
             drive.delete(drive_video_file_id)
@@ -463,25 +320,7 @@ def _run(args) -> None:
         except (ValueError, OSError) as exc:
             _log.error("activity log failed after rejection: %s", exc)
 
-    else:
-        # Unknown callback_data: advance offset (cron path) so this update is not
-        # reprocessed, but leave the pending approval intact — the admin must re-tap.
-        _log.warning(
-            "unexpected callback_data=%r for project=%s — ignoring",
-            callback_data,
-            project_name,
-        )
-        if new_offset is not None:
-            state.set_telegram_offset(new_offset)
-        return
-
-    # Runs only on the approve/reject paths.
-    # try/finally ensures offset advances (cron path) even if clear_pending_approval raises.
-    try:
-        state.clear_pending_approval()
-    finally:
-        if new_offset is not None:
-            state.set_telegram_offset(new_offset)
+    state.clear_pending_approval()
 
 
 if __name__ == "__main__":

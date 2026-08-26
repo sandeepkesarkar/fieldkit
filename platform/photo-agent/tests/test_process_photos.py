@@ -29,7 +29,6 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("ADMIN_TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root_folder_id")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
-    monkeypatch.setenv("TELEGRAM_APPROVAL_BOT_TOKEN", "test_approval_token")
     monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path))
     return tmp_path
 
@@ -57,7 +56,7 @@ def happy(base, env):
         return_value="https://drive.google.com/drive/folders/x",
     )
     base.patch(
-        "scripts.process_photos.telegram_api.send_message_with_buttons", return_value=42
+        "scripts.process_photos.telegram_api.send_message", return_value=42
     )
     base.patch("scripts.process_photos.state.set_pending_approval")
     base.patch("scripts.process_photos.activity_log.log_downloaded")
@@ -350,7 +349,7 @@ def test_telegram_send_failure_exits_and_does_not_set_state(happy, env):
     """Telegram send failure sends a Telegram error; state.set_pending_approval is not called."""
     import scripts.process_photos as proc
     happy.patch(
-        "scripts.process_photos.telegram_api.send_message_with_buttons",
+        "scripts.process_photos.telegram_api.send_message",
         side_effect=RuntimeError("chat not found"),
     )
     mock_set_state = happy.patch("scripts.process_photos.state.set_pending_approval")
@@ -397,7 +396,7 @@ def test_happy_path_calls_tools_in_sequence(happy, env):
     assert proc.drive.download.call_count == 2
     proc.FFmpegVideoGenerator.return_value.generate.assert_called_once()
     proc.drive.upload.assert_called_once()
-    proc.telegram_api.send_message_with_buttons.assert_called_once()
+    proc.telegram_api.send_message.assert_called_once()
     proc.state.set_pending_approval.assert_called_once()
 
 
@@ -415,32 +414,36 @@ def test_happy_path_state_set_with_required_fields(happy, env):
     assert record["telegram_message_id"] == 42
 
 
-def test_happy_path_approval_message_has_approve_reject_buttons(happy, env):
-    """send_message_with_buttons() is called with ✅ Approve and ❌ Reject button labels."""
+def test_happy_path_approval_message_has_no_inline_buttons(happy, env):
+    """send_message() (plain text, chat_id + text + parse_mode only) is called — issue #49
+    removed the inline Approve/Reject keyboard entirely, so there is no buttons/reply_markup
+    argument left for it to appear in."""
     import scripts.process_photos as proc
     main(["--project", _PROJECT])
-    _, _, buttons = proc.telegram_api.send_message_with_buttons.call_args.args
-    labels = [label for label, _ in buttons]
-    assert "✅ Approve" in labels
-    assert "❌ Reject" in labels
+    proc.telegram_api.send_message.assert_called_once()
+    args, kwargs = proc.telegram_api.send_message.call_args
+    assert len(args) == 2  # chat_id, text — no positional buttons argument
+    assert set(kwargs) <= {"parse_mode"}
+
+
+def test_happy_path_approval_message_instructs_approve_or_reject_commands(happy, env):
+    """Approval message text tells the admin to reply /photo_approve or
+    /photo_reject (issue #49) — not to tap a button. Not the shorter
+    /approve — that collides with a Hermes core command; see
+    test_photo_approve_dispatch.py."""
+    import scripts.process_photos as proc
+    main(["--project", _PROJECT])
+    _, text = proc.telegram_api.send_message.call_args.args
+    assert "/photo_approve" in text
+    assert "/photo_reject" in text
 
 
 def test_happy_path_approval_message_uses_markdown_parse_mode(happy, env):
-    """send_message_with_buttons() is called with parse_mode='Markdown'."""
+    """send_message() is called with parse_mode='Markdown'."""
     import scripts.process_photos as proc
     main(["--project", _PROJECT])
-    kwargs = proc.telegram_api.send_message_with_buttons.call_args.kwargs
+    kwargs = proc.telegram_api.send_message.call_args.kwargs
     assert kwargs.get("parse_mode") == "Markdown"
-
-
-def test_happy_path_approval_message_uses_approval_bot_token(happy, env):
-    """send_message_with_buttons() uses TELEGRAM_APPROVAL_BOT_TOKEN (issue #29), not
-    Hermes's TELEGRAM_BOT_TOKEN — the button-bearing message must be sent by the same
-    bot that check_approval.py's cron leg will later poll for the tap."""
-    import scripts.process_photos as proc
-    main(["--project", _PROJECT])
-    kwargs = proc.telegram_api.send_message_with_buttons.call_args.kwargs
-    assert kwargs.get("token_env_var") == "TELEGRAM_APPROVAL_BOT_TOKEN"
 
 
 def test_happy_path_temp_dir_cleared_before_run(happy, env):
@@ -458,7 +461,7 @@ def test_happy_path_message_includes_project_name_count_and_duration(happy, env)
     """Approval message text includes project name, photo count, and video duration."""
     import scripts.process_photos as proc
     main(["--project", _PROJECT])
-    _, text, _ = proc.telegram_api.send_message_with_buttons.call_args.args
+    _, text = proc.telegram_api.send_message.call_args.args
     assert _PROJECT in text
     assert "2" in text          # photo count
     assert "7.5" in text        # duration: 2 × 4s − 1 × 0.5s = 7.5s

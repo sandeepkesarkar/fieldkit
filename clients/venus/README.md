@@ -44,13 +44,13 @@ approach originally sketched in `02-gateway-setup.md`.
 | `model.provider` | `openai-api` (direct OpenAI API key — **not** bare `openai`, which silently aliases to the OpenRouter aggregator, and **not** `openai-codex`, which is OAuth ChatGPT/Codex-subscription auth) |
 | `model.default` | `gpt-5.5` (curated default at time of writing — confirm current availability with `hermes -p venus model` before first use; the picker's list drifts) |
 | Credential | `OPENAI_API_KEY`, in the `venus` profile's own `~/.hermes/profiles/venus/.env` (never in this repo) |
-| Telegram bot for Hermes commands | Its own `TELEGRAM_BOT_TOKEN` (see `.env.example`) — must be a separate BotFather bot from every other client's, and separate from `TELEGRAM_APPROVAL_BOT_TOKEN` below, for the same offset-race reason documented in issue #29 |
+| Telegram bot for Hermes commands | Its own `TELEGRAM_BOT_TOKEN` (see `.env.example`) — must be a separate BotFather bot from every other client's. A single bot now handles both Hermes's gateway traffic and the photo-approval flow — issue #49 retired the second, dedicated approval bot (`TELEGRAM_APPROVAL_BOT_TOKEN`) that issue #29 originally required; see `platform/docs/hermes/10-text-based-approval-migration.md` |
 | Telegram admin authorization | `TELEGRAM_ALLOWED_USERS` set to the admin's Telegram user ID (same value as `ADMIN_TELEGRAM_CHAT_ID` in `.env.example`) — a fresh profile has **no** allowlist until this is set, same as the bot token below |
 
 This is a per-client configuration choice, not code: `platform/photo-agent/`
 scripts never call a model API directly (see the Architecture section) — the
 provider only matters for the Hermes-mediated slash commands
-(`/process_photos`, `/check_approval`), which is exactly why Story 2's
+(`/process_photos`, `/photo_approve`, `/photo_reject`), which is exactly why Story 2's
 acceptance scenario ("identical skill behavior across providers") holds: the
 skill instructions in `platform/photo-agent/skills/*/SKILL.md` are byte-identical
 regardless of which client's profile executes them.
@@ -68,7 +68,7 @@ are a completely separate consumer from the Hermes gateway process:
 3. `hermes -p venus config set model.default gpt-5.5` (or whichever current model `hermes -p venus model` shows for `openai-api`)
 4. Put `OPENAI_API_KEY=...`, `TELEGRAM_BOT_TOKEN=...` (venus's gateway bot, from the checklist's Telegram step), and `TELEGRAM_ALLOWED_USERS=...` (the admin's Telegram user ID) in `~/.hermes/profiles/venus/.env`. The gateway reads its bot token and its authorization allowlist from the active profile's own env, not from this repo — an install without this step would create a profile that is correctly configured for OpenAI but binds to no Telegram bot at all, or (if only the token is set and not the allowlist) leaves the admin themselves unrecognized (see step 7's note — this is a fail-closed system, not fail-open).
    Verify the value actually landed with `grep TELEGRAM_ALLOWED_USERS ~/.hermes/profiles/venus/.env` — this is safe to inspect directly (it's a chat ID, not a secret). **Do not** rely on the absence of Hermes's "No env user allowlists configured" startup warning as proof this specific variable is set: that check is `any(os.getenv(v) for v in <~20 platform allowlist vars>)` across every supported platform (`gateway/run.py`) — it's suppressed by *any one* of them being set, so its absence tells you nothing about `TELEGRAM_ALLOWED_USERS` specifically.
-5. `hermes -p venus config set skills.external_dirs '["~/src/fieldkit/platform/photo-agent/skills"]'` — profiles have fully isolated skill discovery (see `docs/design/profile-builder.md` in the Hermes source tree), so without this, `/process_photos` and `/check_approval` are invisible to venus's gateway even though they're already registered for the default profile (`03-process-photos-skill.md`). Confirm with `hermes -p venus skills list --source local` — expect both `process-photos` and `check-approval` listed as `local` / `enabled`.
+5. `hermes -p venus config set skills.external_dirs '["~/src/fieldkit/platform/photo-agent/skills"]'` — profiles have fully isolated skill discovery (see `docs/design/profile-builder.md` in the Hermes source tree), so without this, `/process_photos`, `/photo_approve`, and `/photo_reject` are invisible to venus's gateway even though they're already registered for the default profile (`03-process-photos-skill.md`, `10-text-based-approval-migration.md`). Confirm with `hermes -p venus skills list --source local` — expect `process-photos`, `photo-approve`, and `photo-reject` all listed as `local` / `enabled`.
 6. `hermes -p venus doctor` — confirm it reports the OpenAI API key as configured (no more `✗ model.provider 'openai-api' is set but no API key is configured`). **`doctor` does not check the Telegram allowlist at all** — use the `grep` from step 4 for that.
 7. `hermes -p venus gateway install --start-now --start-on-login` — a second, independently-supervised gateway process bound to venus's own `TELEGRAM_BOT_TOKEN`. Then have the admin's own Telegram account send `/process_photos` (or any command) to venus's bot and confirm it's accepted — that's the real proof `TELEGRAM_ALLOWED_USERS` loaded correctly for *this* platform.
    **What actually happens if step 4 is skipped or wrong isn't "anyone can now command the bot"** — Hermes's Telegram adapter is fail-closed by design (`plugins/platforms/telegram/adapter.py`: "Fail-closed: no allowlist means deny by default"). But which fail-closed symptom the admin sees depends on *which* mistake was made — these are two different troubleshooting experiences, not one generic "misconfigured" outcome (traced in `gateway/authz_mixin.py::_get_unauthorized_dm_behavior`, rules 5–6):
@@ -126,8 +126,10 @@ complete and `clients/venus/src/photo-agent/.env` is filled in from
 
 **Do not set `CLIENT_NAME=venus` in the shared `fieldkit/.env`.** That file
 is read by every client's scripts on this machine — including the live
-crontab entries that already run `check_approval.py --source cron` and
-`upload_facebook.py --source cron` every minute against `_demo` right now
+crontab entries that (as of this writing, pre-migration — see
+`platform/docs/hermes/10-text-based-approval-migration.md`) still run
+`check_approval.py --source cron` and `upload_facebook.py --source cron`
+every minute against `_demo` right now
 (see `platform/docs/hermes/05-cron-verification.md`). Permanently editing it
 would silently redirect that live cron traffic at venus's credentials/data
 until someone edits it back. Instead, pass `CLIENT_NAME` as an inline
@@ -148,21 +150,25 @@ CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
 ```
 
 While that's running, Stage 4 needs something to actually process the
-Telegram Approve tap. Do **not** add venus to the live crontab for this —
-run the same two scripts the crontab would, by hand, in separate terminals,
-with the same inline override, exactly matching `check_approval.py`'s own
-documented manual fallback ("if not using cron, run check_approval.py in
-another terminal"):
+approval. Issue #49 removed the inline Approve/Reject buttons and the
+cron-based polling loop that used to watch for a button tap — reply
+`/photo_approve` (or `/photo_reject`) to venus's bot in Telegram, or, to
+approve without a live Hermes gateway running, invoke the decision directly
+in another terminal, with the same inline override:
 
 ```bash
-# Terminal 2, repeat every ~10s (or loop it) until Stage 4 reports approved:
+# Terminal 2, once Stage 3 has sent the approval-request message:
 CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
-    python3 scripts/check_approval.py --source cron
+    python3 scripts/check_approval.py --callback-data approve
 
 # Terminal 3, once Stage 4 passes, until Stage 5 reports the post is live:
 CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
     python3 scripts/upload_facebook.py --source cron
 ```
+
+(`upload_facebook.py`'s own cron leg is unaffected by issue #49 — only the
+photo-approval flow's polling was retired, not the separate Facebook-upload
+pipeline.)
 
 This is the same rig `_demo` uses (`platform/photo-agent/scripts/run_e2e_test.py`)
 — nothing venus-specific was needed there, which is itself evidence the
