@@ -118,6 +118,16 @@ def test_no_pending_approval_reject_exits_silently(mocker, env, lock_mock):
     main(_REJECT_ARGS)  # must not raise
 
 
+def test_no_pending_approval_prints_nothing_to_stdout(mocker, env, lock_mock, capsys):
+    """Issue #63: the genuine no-pending-approval case must be the ONLY one that
+    produces empty stdout — this is the signal Hermes's output-handling rule
+    relies on to distinguish it from a successful approve/reject."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
+    main(_APPROVE_ARGS)
+    assert capsys.readouterr().out == ""
+
+
 # ---------------------------------------------------------------------------
 # Approve path — actions
 # ---------------------------------------------------------------------------
@@ -177,6 +187,14 @@ def test_approve_logs_approved(base):
     import scripts.check_approval as ca
     main(_APPROVE_ARGS)
     ca.activity_log.log_approved.assert_called_once_with(_PROJECT)
+
+
+def test_approve_prints_unambiguous_confirmation_to_stdout(base, capsys):
+    """Issue #63: a successful approval must print a one-line stdout confirmation
+    so Hermes never mistakes it for the no-pending-approval no-op case."""
+    main(_APPROVE_ARGS)
+    out = capsys.readouterr().out
+    assert out == f"Approved: {_PROJECT}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +272,40 @@ def test_reject_logs_rejected(base):
     import scripts.check_approval as ca
     main(_REJECT_ARGS)
     ca.activity_log.log_rejected.assert_called_once_with(_PROJECT)
+
+
+def test_reject_prints_unambiguous_confirmation_to_stdout(base, capsys):
+    """Issue #63: a successful rejection must print a one-line stdout confirmation
+    so Hermes never mistakes it for the no-pending-approval no-op case."""
+    main(_REJECT_ARGS)
+    out = capsys.readouterr().out
+    assert out == f"Rejected: {_PROJECT}\n"
+
+
+def test_approve_and_no_pending_stdout_are_distinguishable(mocker, env, lock_mock, capsys):
+    """Issue #63 end-to-end: capture stdout for a successful approve and for the
+    genuine no-pending-approval case in the same test and assert they differ —
+    this is exactly the ambiguity Hermes's output-handling rule was fooled by
+    before check_approval.py printed anything on success."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=_PENDING)
+    mocker.patch("scripts.check_approval.state.clear_pending_approval")
+    mocker.patch("scripts.check_approval.drive.delete")
+    mocker.patch("scripts.check_approval._send_approval_email")
+    mocker.patch("scripts.check_approval._notify_admin")
+    mocker.patch("scripts.check_approval.activity_log.log_approved")
+    mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    mocker.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    main(_APPROVE_ARGS)
+    success_out = capsys.readouterr().out
+    assert success_out != ""
+
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
+    main(_APPROVE_ARGS)
+    no_pending_out = capsys.readouterr().out
+
+    assert no_pending_out == ""
+    assert success_out != no_pending_out
 
 
 # ---------------------------------------------------------------------------

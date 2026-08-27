@@ -18,6 +18,11 @@ The system operates on a single-pending-approval-at-a-time model
 (state.json's pending_approval field is singular), so a bare /photo_approve
 or /photo_reject carries unambiguous semantics: whichever approval is
 currently pending. If nothing is pending, the script exits 0 with no output.
+A successful approve or reject also exits 0, but prints a one-line
+"Approved: <project>" / "Rejected: <project>" confirmation to stdout (issue
+#63) — exit 0 with EMPTY stdout is reserved exclusively for the
+nothing-pending case, so Hermes's output-handling rule (see the
+photo-approve/photo-reject SKILL.md files) can tell the two apart.
 
 ---
 
@@ -313,6 +318,15 @@ def _run(callback_data: str) -> None:
 
         _enqueue_facebook_upload(project_name, video_local_path, telegram_message_id)
 
+        # Issue #63: exit 0 with empty stdout is Hermes's signal (see the
+        # photo-approve/photo-reject SKILL.md "Output handling" sections)
+        # for "nothing was pending" — the `record is None` branch above.
+        # Without a stdout line here, a genuinely successful approval was
+        # indistinguishable from that no-op case, so Hermes reported "No
+        # pending approval" to the admin even though the approval (and any
+        # Facebook publish it enqueued) had already gone through.
+        print(f"Approved: {project_name}")
+
     else:  # reject
         # Drive delete is best-effort — failure is logged but does not block the rejection.
         try:
@@ -333,6 +347,10 @@ def _run(callback_data: str) -> None:
             activity_log.log_rejected(project_name)
         except (ValueError, OSError) as exc:
             _log.error("activity log failed after rejection: %s", exc)
+
+        # Issue #63: see the matching comment on the approve branch above —
+        # same stdout contract applies to a successful rejection.
+        print(f"Rejected: {project_name}")
 
     state.clear_pending_approval()
 
