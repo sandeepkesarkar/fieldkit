@@ -12,6 +12,16 @@ Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-herm
 [`07-callback-race-fix.md`](07-callback-race-fix.md) (#29), both marked
 superseded by this doc — see "What this supersedes" below.
 
+> **Context (issue #61):** this doc's cutover checklist below occasionally
+> references "a non-default Hermes profile, e.g. mercury" as a possibility
+> to account for. As of issue #61, this project runs exactly one client at
+> a time via Hermes's default profile only — see
+> [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md). A
+> non-default profile directory may still exist on a machine as pre-#61
+> leftover state (not yet retired), which is why the checklist below still
+> handles that case, but standing up a *new* non-default profile is no
+> longer this project's supported way to run a client.
+
 ## Background — why the poller is gone, not just faster
 
 - Issue #31 (cron-cadence vs. Telegram callback-query freshness race) was
@@ -315,22 +325,36 @@ the new command flow has a working consumer is seconds long, not hours.
    Step 3 only *compares against* the Hermes profile's env — it never
    writes to it — so there is nothing from step 3 for a restart to pick up.
 
-   The launchd service label is **profile-specific, not universal** —
-   confirmed directly in Hermes's own source
-   (`hermes_cli/gateway.py::get_launchd_plist_path()`: "Default `~/.hermes`
-   → `ai.hermes.gateway.plist` (backward compatible). Profile
+   > **Under issue #61's single-install architecture (see
+   > [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md)),
+   > do NOT restart `ai.hermes.gateway-mercury` (or any other non-default
+   > profile's gateway) as a way to pick up this migration for that
+   > client.** This project runs exactly one client at a time via the
+   > default profile only — a client that needs this migration should
+   > already be, or should first be made, the one client installed via
+   > `platform/photo-agent/scripts/install_client.sh <client>`, and it's
+   > `ai.hermes.gateway` (the default profile's label) that needs
+   > restarting for it, not a named per-client label. Restarting a
+   > leftover named profile's gateway instead is exactly the kind of
+   > action that keeps two gateways with two different clients' live
+   > credentials running simultaneously — the same exposure issue #59 and
+   > #61 exist to close — confirmed live on this machine via `launchctl
+   > list | grep hermes`, which showed both `ai.hermes.gateway` (default)
+   > and `ai.hermes.gateway-mercury` running as separate services
+   > simultaneously. The paragraph and command below are left as
+   > historical record of how per-profile restarts worked under the
+   > retired concurrent-profile model — not a live instruction.
+
+   The launchd service label used to be **profile-specific, not
+   universal**, under that retired model — confirmed directly in Hermes's
+   own source (`hermes_cli/gateway.py::get_launchd_plist_path()`: "Default
+   `~/.hermes` → `ai.hermes.gateway.plist` (backward compatible). Profile
    `~/.hermes/profiles/coder` → `ai.hermes.gateway-coder.plist`."): the
    default profile uses bare `ai.hermes.gateway`, and every other profile
-   gets `ai.hermes.gateway-<profile>` (e.g. `ai.hermes.gateway-mercury`) —
-   also confirmed live on this machine via `launchctl list | grep hermes`,
-   which currently shows both `ai.hermes.gateway` (default, `_demo`) and
-   `ai.hermes.gateway-mercury` running as separate services. Use the label
-   matching the client being migrated:
+   got `ai.hermes.gateway-<profile>` (e.g. `ai.hermes.gateway-mercury`).
+   Under the current architecture there is only ever the default profile:
    ```bash
-   # _demo (default profile):
-   launchctl kickstart -k gui/501/ai.hermes.gateway
-   # mercury (its own profile):
-   launchctl kickstart -k gui/501/ai.hermes.gateway-mercury
+   launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
    ```
    (The crontab and code-deploy steps above don't need a restart on their
    own — cron re-reads its table every tick, and `check_approval.py`

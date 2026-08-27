@@ -1,205 +1,303 @@
-# Per-Client Model Provider Routing — Hermes Profiles
+# Per-Client Model Provider Routing — Single-Install Model (issue #61)
 
-**Supersedes:** the "Switching a client to OpenAI" section of
-[`02-gateway-setup.md`](02-gateway-setup.md) (issue #6), which documented an
-incorrect/incomplete mechanism, and resolves the open question that section
-flagged for #11/#12.
+**Supersedes:** the original version of this document (per-client Hermes
+profiles, `hermes profile create <name>`, one running gateway per client),
+which itself superseded the "Switching a client to OpenAI" section of
+[`02-gateway-setup.md`](02-gateway-setup.md) (issue #6). That per-profile
+design was scope creep beyond this project's real deployment model and was
+the direct root cause of [issue #59](https://github.com/sandeepkesarkar/fieldkit/issues/59):
+a live `/process_photos` invocation in mercury's Telegram bot silently
+resolved `CLIENT_NAME` against `_demo`'s credentials, because the concurrent
+per-client-profile setup gave the skill-dispatch subprocess no reliable way
+to know which profile it was running under. See
+[issue #61](https://github.com/sandeepkesarkar/fieldkit/issues/61) for the
+full architecture decision this document now reflects.
 
-**Written for:** issue #12 (venus, OpenAI-backed demo client), applies
-identically to issue #11 (mercury, Anthropic-backed demo client).
+**Written for:** issue #11/#12 (mercury, venus) originally; this revision
+generalizes it to every client this repo scaffolds.
 
-## What #6's doc got wrong
+## The architecture decision (permanent)
 
-`02-gateway-setup.md` originally suggested two options for switching a
-client to OpenAI:
+**This fieldkit install runs exactly ONE client at a time.** The code stays
+multi-client forever — `clients/_demo/`, `clients/mercury/`, `clients/venus/`,
+`clients/_construction_co/`, `clients/_template/` all continue to coexist in
+the repo as source-of-truth config per client. What's single is the
+*deployment*: on any one machine, at any one time, only one client's config
+is "installed" — copied into the two places the running system actually
+reads:
 
-1. `hermes config set model.provider openai-codex` — **wrong for this use
-   case.** `openai-codex` is Hermes's OAuth ChatGPT/Codex-subscription
-   provider (`hermes_cli/providers.py`: `auth_type="oauth_external"`,
-   `base_url_override="https://chatgpt.com/backend-api/codex"`). It has
-   nothing to do with a plain OpenAI API key.
-2. `provider: "custom"` with `base_url: "https://api.openai.com/v1"` —
-   **works, but isn't the real mechanism.** Hermes ships a first-class
-   overlay for exactly this case, so hand-rolling `custom` + `base_url` is
-   unnecessary and easy to get subtly wrong (e.g. omitting the right env var
-   name for the key).
+1. **The repo-root `fieldkit/.env`** — `CLIENT_NAME`, read by every
+   `platform/photo-agent/` script to pick which `clients/<name>/.../.env`
+   to load for everything else (Drive folder, Facebook page, Gmail, ...).
+2. **Hermes's single DEFAULT profile** (`~/.hermes/.env`,
+   `~/.hermes/config.yaml`) — that client's Telegram bot token/allowlist,
+   model provider/key, and skill discovery dirs.
 
-It also never mentioned the biggest trap: setting `model.provider: openai`
-directly in `config.yaml` does **not** call OpenAI's API. `openai` is
-registered as an alias that resolves to the OpenRouter aggregator
-(`hermes_cli/providers.py`: `ALIASES = {"openai": "openrouter", ...}`) — a
-plain-API-key OpenAI setup that used `provider: openai` would silently bill
-through OpenRouter instead of OpenAI directly. (This also explains the
-`base_url: https://openrouter.ai/api/v1` sitting alongside
-`model.provider: anthropic` in this Mac's current `~/.hermes/config.yaml` —
-a leftover from an earlier OpenRouter experiment, unrelated to this feature,
-left as-is since editing the default profile's config is out of scope here.)
+There is no more "which Hermes profile is a live skill invocation running
+under" question to answer, because there is only ever one profile — the
+default — and only ever one client's config installed anywhere on the
+machine. This is what makes `CLIENT_NAME`'s fallback-to-root-`.env` behavior
+(issue #45/PR #57) **always correct**: the root `.env` can never disagree
+with "the currently active client," because there is only one active client,
+full stop. Issue #59's entire failure precondition — two clients' config
+being simultaneously live and a subprocess guessing wrong between them —
+cannot occur under this model.
 
-Finally, it left unresolved how two demo customers on different providers
-could coexist, since this Hermes install is one gateway process with one
-global config.
+## Switching the active client: `install_client.sh`
 
-## The verified mechanism
+```bash
+platform/photo-agent/scripts/install_client.sh <client-name>
+```
 
-**Provider identity for a plain OpenAI API key: `openai-api`**, not `openai`,
-not `openai-codex`. Confirmed directly from Hermes's own source
+Reads `clients/<client-name>/src/photo-agent/.env` (must already exist and
+be filled in — copy from `.env.example` first) and, in this exact order
+(kept in sync with the script itself — if this list and the code ever
+disagree, the code is authoritative and this doc has drifted):
+
+1. **Validates and canonicalizes paths first, with zero side effects.**
+   The client name is checked against `^[A-Za-z0-9_-]+$` before it ever
+   touches a path; both the resolved client directory AND the resolved
+   `.env` file itself (not just its parent directory) are symlink-resolved
+   and verified to still live under `clients/` — a symlink at either level
+   pointing outside the repo is rejected outright, never followed. Prints
+   the plan and, if `--dry-run` was passed, exits here — before the first
+   side-effecting line of any kind (no `mkdir`, no `chmod`, no lock, no
+   temp file).
+2. **Checks whether any leftover, non-default Hermes gateway has a gateway
+   that's currently running — before ANY mutation of any kind, not merely
+   before the live `.env` files.** Candidates come from TWO independent
+   sources, unioned: directories under `~/.hermes/profiles/<name>/`
+   (pre-#61 state, e.g. `mercury`, `venus`), AND every loaded
+   `ai.hermes.gateway-<name>` launchd service enumerated directly via
+   `launchctl list`, regardless of whether that profile's directory still
+   exists. The second source exists specifically to catch an **orphaned**
+   service — a profile directory that was deleted or renamed while its
+   launchd service definition stayed loaded, potentially alive with
+   credentials in memory, which the directory scan alone would miss
+   entirely. If any candidate is confirmed running, or its status can't be
+   confirmed at all, the install **aborts here**, before even the
+   preflight command/writability checks or the lock, with the exact
+   retirement commands to run first — never merely warns about this after
+   the fact once a new gateway is already up (that would recreate the
+   exact two-gateways-live exposure issue #59 was about). **It never
+   touches those profiles or services itself** either way — they're live
+   state from before this architecture decision, and mutating
+   already-running, non-default profile state is not this script's job
+   (same posture as every other live-infrastructure change in this
+   project's history: the automation proposes, a human disposes).
+3. **Preflight, lock, and staging.** Confirms `hermes` is on `PATH`;
+   creates and locks down `HERMES_HOME` (`chmod 700`); confirms both target
+   directories are writable; takes a `mkdir`-based lock so a concurrent
+   invocation refuses immediately rather than racing; stages a full
+   rebuild of both the repo-root `fieldkit/.env` (`CLIENT_NAME`,
+   `FIELDKIT_ROOT`) and Hermes's default profile `.env`
+   (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `CLIENT_NAME`, and only
+   the selected provider's API key) as temp files — **not written to their
+   live locations yet.** Every managed key is stripped from whatever
+   existed before and re-added fresh: a stale `OPENAI_API_KEY` left over
+   from a prior OpenAI-backed client cannot survive a switch to an
+   Anthropic-backed one, and no key can end up duplicated.
+4. **Checks the DEFAULT profile's own gateway status** and stops it first
+   if running — an unrecognized/ambiguous status also aborts here rather
+   than guessing "not running."
+5. **Runs `hermes config set`** (`model.provider`, `model.default`,
+   `skills.external_dirs`, always against the forced-sticky `default`
+   profile) against a backed-up `config.yaml` (content AND original file
+   mode both captured, so a restore can't leave the file more permissive
+   than it started — `hermes config set` itself can rewrite `config.yaml`
+   via its own atomic write partway through this sequence, which changes
+   its mode as a side effect). **Only if every one of these calls
+   succeeds** does the script proceed to the next step — a failure here
+   rolls `config.yaml` back to exactly what it was (content and mode)
+   before this attempt (deleted outright if this run would have created it
+   fresh) and leaves **both staged `.env` files completely uncommitted** —
+   the live files are untouched, not merely self-consistent with each
+   other.
+6. **Commits.** Only now, after every fallible step above has succeeded:
+   fixes the client's own source `.env` permissions (deferred to here, not
+   done at validation time, so a failure before this point never mutates
+   it); a snapshot (content AND original file mode) of Hermes's `.env` is
+   captured, exactly like `config.yaml`'s in step 5; then commits Hermes's
+   `.env` first (it's the file that actually governs live skill dispatch —
+   the #59 exposure this script exists to close); then commits the root
+   `.env` last. POSIX offers no true multi-file transaction, so this
+   script does not pretend the two renames are one atomic operation — but
+   it keeps both snapshots available until BOTH renames succeed, and rolls
+   back whichever of them already changed on either failure: if the FIRST
+   rename fails, `config.yaml` (already applied by step 5) is restored,
+   and neither `.env` file was touched; if the SECOND rename fails after
+   the first succeeded, BOTH Hermes's `.env` and `config.yaml` are
+   restored to their pre-install state — the root `.env` was never touched
+   (a failed rename leaves its target untouched by definition), so every
+   live file ends up back on the OLD client, consistently, never a mix of
+   old and new.
+7. **Re-checks every stale profile's and orphaned service's status one
+   more time, immediately before actually starting the new default-profile
+   gateway** — closing the gap where one could start running in the window
+   between step 2's check and this final moment. Both `.env` files are
+   already committed by this point regardless of this recheck's outcome
+   (they're correct for the client being installed); what's refused, if a
+   stale profile is now found running, is only the new gateway's start —
+   this script never itself creates a moment where two gateways with two
+   different clients' credentials are both live.
+
+There is no window where one live file reflects the new client's config and
+another still reflects the old one, and no window where the gateway
+observes a half-written file — barring the restore step of a rollback
+itself failing, an essentially unreachable double-failure the script
+detects and reports loudly ("MANUAL INTERVENTION REQUIRED") rather than
+silently accepting.
+
+Flags: `--dry-run` (print the plan; makes **zero** filesystem changes of
+any kind — no `mkdir`, no `chmod`, no lock, no temp file — and runs no
+`hermes` commands), `--no-restart` (apply config, leave the gateway
+stopped).
+
+**Required fields in `clients/<name>/src/photo-agent/.env`** (added to
+`platform/photo-agent/.env.example` and every client's own `.env.example`):
+
+| Variable | Used for |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Already required for the pipeline scripts themselves — reused as-is for Hermes's gateway bot (one bot serves both, issue #49) |
+| `TELEGRAM_ALLOWED_USERS` | Comma-separated Telegram user IDs allowed to command the Hermes gateway bot |
+| `HERMES_MODEL_PROVIDER` | e.g. `anthropic`, `openai-api` — see provider identity notes below |
+| `HERMES_MODEL_DEFAULT` | Model id for that provider (`hermes model` shows the current picker list) |
+| `HERMES_PROVIDER_API_KEY` | That client's own API key for `HERMES_MODEL_PROVIDER` — `install_client.sh` maps it to the correct real env var name (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) before writing it into `~/.hermes/.env` |
+
+Missing any required field, or an unrecognized `HERMES_MODEL_PROVIDER`
+(the script only knows the API-key variable name for `anthropic`,
+`openai-api`, and `openrouter` — add a case to the script before using
+another provider), fails the whole install loudly before touching any
+file — never a partial install with some fields switched and others stale.
+
+## Diagnosing a Telegram allowlist problem after installing a client
+
+`hermes doctor` does **not** check the Telegram allowlist at all — verify
+it landed with `grep '^TELEGRAM_ALLOWED_USERS=' ~/.hermes/.env` (safe to
+inspect directly, it's a chat ID, not a secret). **Do not** rely on the
+absence of Hermes's "No env user allowlists configured" startup warning as
+proof this specific variable is set: that check is
+`any(os.getenv(v) for v in <~20 platform allowlist vars>)` across every
+supported platform (`gateway/run.py`) — it's suppressed by *any one* of
+them being set, so its absence tells you nothing about
+`TELEGRAM_ALLOWED_USERS` specifically.
+
+If the installed client's bot doesn't respond correctly, what you see
+depends on *which* mistake was made — these are two different
+troubleshooting experiences, not one generic "misconfigured" outcome
+(traced in `gateway/authz_mixin.py::_get_unauthorized_dm_behavior`, rules
+5–6):
+
+- **`TELEGRAM_ALLOWED_USERS` left unset entirely:** no allowlist exists at
+  all, so Hermes falls back to its open-gateway default — the admin's DM
+  gets a **pairing-code prompt** instead of a normal response. Expect a
+  pairing flow you didn't ask for, not silence.
+- **`TELEGRAM_ALLOWED_USERS` set but wrong/mistyped** (e.g. the wrong chat
+  ID): an allowlist *does* exist, which Hermes takes as a deliberate access
+  restriction — unauthorized senders are **silently ignored**, no pairing
+  prompt, no response, nothing. Expect total silence, not an error.
+
+Either way, no unauthenticated third party ever gains access — Hermes's
+Telegram adapter is fail-closed by design (`plugins/platforms/telegram/adapter.py`:
+"Fail-closed: no allowlist means deny by default"). The one way this
+becomes an actual open-access exposure is `GATEWAY_ALLOW_ALL_USERS=true` or
+a platform-specific `*_ALLOW_ALL_USERS`/open `dm_policy`, neither of which
+`install_client.sh` ever sets.
+
+## Provider identity — still correct, still worth reading
+
+This part of the original investigation is unaffected by the architecture
+change and remains the reference for what a given `HERMES_MODEL_PROVIDER`
+value actually does. Confirmed directly from Hermes's own source
 (`hermes_cli/providers.py`):
 
-```python
-"openai-api": HermesOverlay(
-    transport="codex_responses",
-    base_url_override="https://api.openai.com/v1",
-    base_url_env_var="OPENAI_BASE_URL",
-),
+- **`openai-api`** — a plain OpenAI API key:
+  ```python
+  "openai-api": HermesOverlay(
+      transport="codex_responses",
+      base_url_override="https://api.openai.com/v1",
+      base_url_env_var="OPENAI_BASE_URL",
+  ),
+  ```
+  and `hermes_cli/models.py`'s registry labels it explicitly:
+  `ProviderEntry("openai-api", "OpenAI API", "OpenAI API (api.openai.com, API key)")`.
+- **Bare `openai`** is registered as an alias that resolves to the
+  OpenRouter aggregator (`ALIASES = {"openai": "openrouter", ...}`) — a
+  plain-API-key OpenAI setup that used `provider: openai` would silently
+  bill through OpenRouter instead of OpenAI directly.
+- **`openai-codex`** is Hermes's OAuth ChatGPT/Codex-subscription provider
+  (`auth_type="oauth_external"`) — unrelated to a plain API key, and not
+  something `install_client.sh` supports (it only writes API-key-shaped
+  credentials).
+
+## What happened to per-client Hermes profiles?
+
+**Retired for this project's actual usage**, though Hermes itself still
+supports `hermes profile create <name>` generally — nothing about this
+decision changes Hermes's own capabilities, only how this repo uses them.
+The original empirical verification that profiles are real, isolated,
+independently-configurable `HERMES_HOME` directories (a throwaway
+`fk-verify-tmp` profile created, configured, and deleted on this machine)
+is still accurate and was genuinely useful for understanding Hermes's
+mechanics — it's just not the mechanism this project uses in production
+anymore. If `~/.hermes/profiles/<name>/` directories exist on a machine
+from before this decision (mercury, venus), `install_client.sh` will detect
+and report them.
+
+**Retirement order matters, and `install_client.sh` now enforces it rather
+than merely documenting it** — an earlier version let the install proceed
+regardless and only warned about a leftover profile after the fact, which
+review correctly identified as recreating exactly the kind of exposure
+issue #59 was about, and which was confirmed live on this machine: the
+default gateway and `ai.hermes.gateway-mercury` were both found running
+simultaneously, well after this architecture had already shifted away from
+the per-profile model — a leftover profile doesn't retire itself just
+because it's no longer the intended design. A leftover per-client-profile
+gateway is a **separate, independent launchd service with its own Telegram
+bot** — `install_client.sh` never touches it, in either direction, at any
+point in its run. That means if it's still running, it stays fully live and
+reachable on its own bot regardless of what `install_client.sh` does to the
+default profile — installing a new client does not "take over" from it or
+shut it down.
+
+**So: `install_client.sh` checks every leftover per-client profile's
+gateway status BEFORE touching anything live, and refuses to proceed at
+all if any is confirmed running or its status can't be confirmed** — it
+prints the exact retirement commands and exits non-zero rather than
+installing anyway. Retire it, then re-run the install:
+
+```bash
+hermes -p <name> gateway stop
+hermes -p <name> gateway uninstall
+hermes profile delete <name>
 ```
 
-and from `hermes_cli/models.py`'s provider registry, which labels it
-explicitly: `ProviderEntry("openai-api", "OpenAI API", "OpenAI API
-(api.openai.com, API key)")`. `hermes auth list` on this machine already
-shows a usable credential for it:
+Run these yourself, for every stale profile `install_client.sh` reports,
+**before** relying on the newly-installed client's identity as the only
+live one — `install_client.sh` prints these commands but never runs them
+itself, since they act on live, already-running state outside this
+script's scope (see its own module docstring for the full reasoning).
 
-```
-openai-api (1 credentials):
-  #1  OPENAI_API_KEY       api_key env:OPENAI_API_KEY
-```
+## What if I need to test a non-active client without switching?
 
-**Per-client isolation: Hermes profiles**, not the global config and not
-`platforms.api_server.extra.model_routes` (that block is real, but it's
-scoped to the `api_server` platform — an OpenAI-compatible local proxy — not
-a general mechanism for routing different Telegram bots to different
-providers). A profile is a complete, isolated `~/.hermes/profiles/<name>/`
-directory with its own `config.yaml` (`model.provider`, `model.default`),
-its own `.env` (API keys), and its own skills — see `hermes profile --help`
-and `docs/design/profile-builder.md` in the Hermes source tree. Verified
-empirically on this machine (profile created, configured, and deleted purely
-for verification — the default profile, bound to `_demo`'s Telegram bot, was
-untouched throughout):
+`install_client.sh` changes what's *installed* — the live Telegram bot and
+gateway a real admin talks to. For a one-off manual test or e2e run against
+a client other than the currently-installed one, without disturbing it, use
+the inline `CLIENT_NAME=` override (issue #45/PR #57 — still supported,
+still tested, see
+[`platform/photo-agent/tests/test_client_name_override.py`](../../photo-agent/tests/test_client_name_override.py)):
 
-```
-$ hermes profile create fk-verify-tmp --no-alias --no-skills
-Profile 'fk-verify-tmp' created at /Users/sandeep_a_k/.hermes/profiles/fk-verify-tmp
-
-$ hermes -p fk-verify-tmp config set model.provider openai-api
-✓ Set model.provider = openai-api in .../profiles/fk-verify-tmp/config.yaml
-
-$ hermes -p fk-verify-tmp config set model.default gpt-5.1
-✓ Set model.default = gpt-5.1 in .../profiles/fk-verify-tmp/config.yaml
-
-$ hermes -p fk-verify-tmp doctor
-✗ model.provider 'openai-api' is set but no API key is configured (check ~/.hermes/.env or run 'hermes setup')
+```bash
+CLIENT_NAME=venus FIELDKIT_ROOT=/absolute/path/to/fieldkit \
+    python3 platform/photo-agent/scripts/run_e2e_test.py --duration 20
 ```
 
-(The `doctor` failure is expected and correct — this test profile was never
-given an `OPENAI_API_KEY`. It confirms `openai-api` is recognized as a valid
-provider and that the profile's config is genuinely isolated from the
-default profile's.)
-
-## The convention this repo uses
-
-**One Hermes profile per client, named after the client directory.** This
-resolves #6's open question directly: `_demo` keeps using the default
-profile (already bound to its Telegram bot per #6/PR #16); `venus` and
-`mercury` each get their own named profile, each with its own `model.provider`
-and its own Telegram bot pair, each independently `hermes -p <client>
-gateway install`-able as its own supervised process. Nothing about the
-photo-agent pipeline changes — `platform/photo-agent/` scripts never call a
-model API directly (video generation is deterministic FFmpeg, not
-LLM-driven), so the provider only affects which model executes the
-`process-photos` / `check-approval` Hermes skills for that client's Telegram
-commands. Because those skills are prose instructions with no room for
-provider-specific interpretation (see the SKILL.md files' own "relay
-verbatim, do not summarise" instructions), Story 2's "identical skill
-behavior across providers" acceptance scenario holds by construction.
-
-| Client | Hermes profile | `model.provider` | `model.default` |
-|---|---|---|---|
-| `_demo` | `default` | `anthropic` | `claude-sonnet-5` |
-| `mercury` (#11) | `mercury` | `anthropic` | (mercury's own choice — not this issue) |
-| `venus` (#12) | `venus` | `openai-api` | `gpt-5.5` (confirm current availability with `hermes -p venus model`) |
-
-See `clients/venus/README.md`'s Provider Configuration section for the exact
-setup commands for venus specifically.
-
-## A fresh profile does not inherit the default profile's setup
-
-Profiles are fully isolated (`docs/design/profile-builder.md`: "a profile is
-just a HERMES_HOME directory"), which means a brand-new profile has *none*
-of the three things `02-gateway-setup.md` set up for the default profile:
-
-- **Its Telegram bot token lives in the profile's own `.env`, not this
-  repo's client `.env`.** The gateway process reads `TELEGRAM_BOT_TOKEN` from
-  whichever `HERMES_HOME` it was started under (`agent/secret_scope.py`), so
-  `hermes -p venus gateway install` needs `TELEGRAM_BOT_TOKEN` set in
-  `~/.hermes/profiles/venus/.env` — the `TELEGRAM_BOT_TOKEN` in
-  `clients/venus/src/photo-agent/.env` is a *different* consumer (it's read
-  by the plain Python cron scripts, not by Hermes).
-- **Its Telegram authorization allowlist is likewise per-profile, and the
-  correct way to verify it is direct inspection, not a log line.**
-  `02-gateway-setup.md` documents `TELEGRAM_ALLOWED_USERS` alongside
-  `TELEGRAM_BOT_TOKEN` for the default profile's `~/.hermes/.env` for
-  exactly this reason — the Telegram adapter's authorization gate reads it
-  per-profile (`gateway/authz_mixin.py`,
-  `plugins/platforms/telegram/adapter.py`:
-  `_scoped_gate_env("TELEGRAM_ALLOWED_USERS")`). `hermes doctor` doesn't
-  check this at all (verified by grepping `hermes_cli/doctor.py` for
-  `ALLOWED_USERS` — no match), so verify by directly reading the value —
-  `grep TELEGRAM_ALLOWED_USERS ~/.hermes/profiles/venus/.env` (safe; it's a
-  chat ID, not a secret) — or by having the admin's Telegram account send a
-  command and confirm it goes through.
-
-  **An earlier draft of this doc suggested checking `gateway/run.py`'s
-  startup warning (`No env user allowlists configured`) for absence as
-  proof. That's wrong — verified by reading the actual check:** it's
-  `any(os.getenv(v) for v in _builtin_allowed_vars + ...)` across roughly
-  twenty platform-specific allowlist env vars (Discord, WhatsApp, Slack,
-  Signal, email, SMS, ...), so the warning is suppressed by *any one* of
-  them being set, and its absence proves nothing about
-  `TELEGRAM_ALLOWED_USERS` specifically.
-
-  **Correcting the security framing too:** a missing/wrong
-  `TELEGRAM_ALLOWED_USERS` does **not** mean "the bot is now open to
-  anyone." Hermes's Telegram adapter is fail-closed by design — its own
-  comment says so directly: `"Fail-closed: no allowlist means deny by
-  default"`. Actual open access requires a separate, explicit opt-in
-  (`GATEWAY_ALLOW_ALL_USERS=true` or a platform's `*_ALLOW_ALL_USERS` /
-  open `dm_policy`), which nothing in this setup sets.
-
-  **But "fail-closed" isn't one symptom — it's two different ones,
-  depending on which mistake was made**, traced through
-  `gateway/authz_mixin.py::_get_unauthorized_dm_behavior`'s resolution
-  order (rules 5–6): with no explicit per-platform/global override, it
-  defaults to `"ignore"` **when any allowlist is configured** ("the
-  allowlist signals that the owner has deliberately restricted access"),
-  and to `"pair"` ("open-gateway default") **only when no allowlist is
-  configured at all**. Concretely, for `TELEGRAM_ALLOWED_USERS`:
-  - **Left unset entirely:** no allowlist exists, so the admin's own DM —
-    unrecognized, same as anyone else's — gets routed to Hermes's
-    **pairing flow** (a pairing-code prompt), not a normal response.
-  - **Set but wrong/mistyped:** an allowlist *does* exist (just not
-    matching the admin's actual chat ID), so Hermes treats this as
-    deliberate restriction and **silently ignores** unauthorized senders —
-    no pairing prompt, no response, no error.
-
-  Either way the admin locking themselves out, not an unauthenticated
-  public bot, is the realistic failure mode — but which of the two above
-  they hit tells them which mistake they made.
-- **`skills.external_dirs` must be set again, per profile.** The default
-  profile's `~/.hermes/config.yaml` pointing at
-  `platform/photo-agent/skills` (`03-process-photos-skill.md`) has no effect
-  on `venus`'s or `mercury`'s config — each profile needs its own
-  `hermes -p <client> config set skills.external_dirs '["~/src/fieldkit/platform/photo-agent/skills"]'`,
-  verified with `hermes -p <client> skills list --source local`. Verified
-  empirically on this machine against a throwaway profile: `skills list`
-  showed nothing until `external_dirs` was set on that profile specifically,
-  then showed both `process-photos` and `check-approval` as `local` /
-  `enabled`.
-
-## Install/config locations touched (per client profile)
-
-| What | Where |
-|---|---|
-| Model provider config | `~/.hermes/profiles/<client>/config.yaml` (`model.provider`, `model.default`) |
-| Skill discovery | `~/.hermes/profiles/<client>/config.yaml` (`skills.external_dirs`) — must be set per profile, see above |
-| Secrets | `~/.hermes/profiles/<client>/.env` (provider API key, **and** that profile's own `TELEGRAM_BOT_TOKEN` **and** `TELEGRAM_ALLOWED_USERS`) |
-| Gateway supervisor | a separate launchd service per profile — `hermes -p <client> gateway install` |
-| Telegram bot | a separate BotFather bot per client (gateway bot), distinct again from that client's approval bot (issue #29) |
+This never touches the repo-root `.env` or Hermes's default profile — it's
+scoped to that one process only. It does **not** reach live Hermes skill
+dispatch (`/process_photos` typed in Telegram) at all, because Hermes's
+skill-invoked subprocess never carries an inline override — only
+`install_client.sh`'s changes to the root `.env` and Hermes's default
+profile affect what a live Telegram command actually does. This is exactly
+the distinction issue #59 exposed: the inline-override escape hatch was
+never the live skill-dispatch path to begin with, and is not a substitute
+for actually installing a client.

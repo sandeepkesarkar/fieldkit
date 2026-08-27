@@ -89,10 +89,30 @@ If either check fails, report the error and stop. Otherwise run:
 
 ```bash
 cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
-timeout 660 python3 scripts/process_photos.py --project "<extracted_project_name>" 2>&1
+# Prefer GNU timeout, fall back to macOS's Homebrew-provided gtimeout
+# (coreutils), fall back to running with no hard timeout at all if neither
+# is installed -- stock macOS ships neither binary (confirmed: a walkthrough
+# doc previously claimed this fallback existed when the invocation below was
+# actually unconditional `timeout 660 ...`, which fails outright with
+# "command not found" on a machine lacking both — see
+# platform/docs/hermes/11-manual-e2e-walkthrough.md's pre-flight section).
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout 660"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout 660"
+else
+  TIMEOUT_BIN=""
+fi
+$TIMEOUT_BIN python3 scripts/process_photos.py --project "<extracted_project_name>" 2>&1
 ```
 
 Do not access Drive or generate the video yourself.
+If neither `timeout` nor `gtimeout` was found (the command above ran with no
+wrapper at all), there is no enforced 11-minute hard cap on this machine —
+this is a real, expected degraded-but-working mode, not a failure; the
+pipeline itself is still bounded by Drive/network timeouts, just not by this
+skill's own deadline. `brew install coreutils` (provides `gtimeout`) restores
+the hard cap.
 If the exit code is 124, report: "⏱️ Video generation timed out — try with fewer photos."
 If the exit code is non-zero (and not 124), report it as an error: "Script failed (exit <code>): <output>"
 Otherwise relay the output verbatim to the user. Do not summarise or paraphrase.

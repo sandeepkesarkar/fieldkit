@@ -26,14 +26,27 @@ Source: [`platform/.specify/003-hermes-runtime/spec.md`](../../.specify/003-herm
 > section, since an inaccurate "verification" doc is worse than none. The
 > corrected verdicts are in "Acceptance Criteria — Final Status" below.
 
+> **Superseded by issue #61 (2026-08-26):** "Running more than one client's
+> cron entries concurrently" below describes a design this project's
+> architecture has since explicitly retired, not merely deferred. This
+> fieldkit install runs exactly ONE client at a time, switched via
+> `platform/photo-agent/scripts/install_client.sh` (see
+> [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md)) —
+> the concurrent-per-client-profile design the section below was written to
+> support was the direct root cause of issue #59 (a live skill invocation
+> silently resolving `CLIENT_NAME` against the wrong client's credentials).
+> The section is left below as historical record of the mechanism (the
+> per-invocation `CLIENT_NAME=` override itself is harmless and still works,
+> still tested — it just isn't a supported way to run two clients' flows
+> side by side going forward) — do not follow it to stand up a second
+> concurrent client.
+
 > **Addendum (issue #45):** the crontab lines shown throughout this doc
 > (below, and the ones actually live on the Mac Mini as of this writing) all
 > rely on the shared root `.env`'s `CLIENT_NAME` — the single-client-at-a-
-> time posture these lines were written under. See "Running more than one
-> client's cron entries concurrently" below for the per-entry override that
-> makes two clients' cron-driven flows safe to run side by side, once
-> that's actually needed. **This addendum is documentation only** — the
-> live crontab itself has not been changed by it; migrating the live
+> time posture these lines were written under, and (per the note above) the
+> posture this project has committed to permanently. **This addendum is
+> documentation only** — the live crontab itself has not been changed by it; migrating the live
 > entries to per-client overrides is a separate, later step.
 
 ## Summary
@@ -167,6 +180,11 @@ other two lines — only the script path and (in the second edit) the
 interpreter path changed.
 
 ## Running more than one client's cron entries concurrently (issue #45)
+
+> **Superseded by issue #61 — do not follow this section to add a second
+> concurrent client.** This project runs exactly one client at a time; see
+> the note at the top of this document and
+> [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md).
 
 The crontab entries above (and the ones actually live on the Mac Mini) all
 depend on the shared root `fieldkit/.env`'s `CLIENT_NAME` — every cron tick
