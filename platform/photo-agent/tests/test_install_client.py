@@ -34,6 +34,21 @@ _INSTALL_SCRIPT = _PLATFORM_PHOTO_AGENT / "scripts" / "install_client.sh"
 
 _HERMES_STUB = """#!/usr/bin/env bash
 echo "STUB_HERMES_CALL: $*" >> "$HERMES_STUB_LOG"
+if [ "$1" = "-p" ]; then
+  PROFILE="$2"
+  if [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
+    VARNAME="HERMES_STUB_PROFILE_STATUS_${PROFILE}"
+    STATUS="${!VARNAME:-not-running}"
+    case "$STATUS" in
+      running) echo "Gateway: running" ;;
+      not-running) echo "Gateway: not running" ;;
+      ambiguous) echo "???unparseable???" ;;
+      command-fails) exit 7 ;;
+    esac
+    exit 0
+  fi
+  exit 0
+fi
 if [ "$1" = "gateway" ] && [ "$2" = "status" ]; then
   if [ -f "$HERMES_STUB_RUNNING_MARKER" ]; then
     echo "Gateway: running"
@@ -478,6 +493,37 @@ def test_symlinked_client_directory_escaping_clients_root_is_rejected(sandbox):
     assert not (sandbox["fieldkit_root"] / ".env").exists()
 
 
+def test_symlinked_client_env_FILE_escaping_the_client_directory_is_rejected(sandbox):
+    """THE SECURITY-4 GAP THE REVIEW LIVE-REPRODUCED: a prior version of
+    this script validated/canonicalized the CLIENT DIRECTORY but not the
+    .env FILE itself -- an in-tree symlink AT clients/<name>/src/photo-agent/.env
+    pointing to an arbitrary file outside the repo was followed transparently
+    by [ -f ], the value parser, AND `chmod 600` (the review reproduced this
+    live: even --dry-run mutated the external target's permissions from
+    0644 to 0600). This must now be rejected outright, and --dry-run must
+    make literally zero permission changes to it."""
+    outside_dir = sandbox["fieldkit_root"].parent / "outside_secret"
+    outside_dir.mkdir()
+    outside_env = outside_dir / "secret.env"
+    outside_env.write_text("TELEGRAM_BOT_TOKEN=exfiltrated\n")
+    os.chmod(outside_env, 0o644)
+
+    client_dir = sandbox["fieldkit_root"] / "clients" / "symclient" / "src" / "photo-agent"
+    client_dir.mkdir(parents=True)
+    (client_dir / ".env").symlink_to(outside_env)
+
+    for args in (["--dry-run"], ["--no-restart"]):
+        result = _run("symclient", sandbox, *args)
+        assert result.returncode != 0
+        assert "outside" in result.stderr.lower()
+        # The external symlink target must never be touched -- not its
+        # permissions, not its content -- regardless of --dry-run or a
+        # real attempted run.
+        assert stat.S_IMODE(outside_env.stat().st_mode) == 0o644
+        assert outside_env.read_text() == "TELEGRAM_BOT_TOKEN=exfiltrated\n"
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+
+
 # ---------------------------------------------------------------------------
 # SECURITY-1 / SECURITY-3: no secret value ever appears as another process's
 # command-line argument (ps/process-listing exposure) -- verified by
@@ -644,13 +690,23 @@ def test_lock_is_released_after_a_failed_run(sandbox):
     assert not (sandbox["hermes_home"] / ".install_client.lock").exists()
 
 
-def test_failed_config_set_rolls_back_config_yaml_and_leaves_gateway_stopped(sandbox):
-    """ENGINEERING-1 / ENGINEERING-3: a failure partway through the
-    `hermes config set` sequence must not leave the gateway restarted on
-    half-applied config, and must restore whatever config.yaml looked like
-    before this install attempt."""
+def test_failed_config_set_rolls_back_config_yaml_and_touches_zero_live_env_files(sandbox):
+    """THE ENGINEERING-1 TRANSACTIONALITY PROOF, STRENGTHENED per the
+    second review round: a failure partway through the `hermes config set`
+    sequence must not leave the gateway restarted on half-applied config,
+    must restore config.yaml to exactly what it was before this attempt,
+    AND -- unlike the first version of this fix, which the review correctly
+    rejected -- must leave BOTH live .env files completely untouched, not
+    just individually self-consistent. The installer now runs the entire
+    fallible `hermes config set` sequence BEFORE either .env file is
+    committed (atomically renamed from its staged temp file), so a failure
+    here means neither .env file was ever written to at all."""
     config_yaml = sandbox["hermes_home"] / "config.yaml"
     config_yaml.write_text("model:\n  provider: original-provider\n  default: original-model\n")
+    root_env = sandbox["fieldkit_root"] / ".env"
+    hermes_env = sandbox["hermes_home"] / ".env"
+    root_env.write_text("CLIENT_NAME=preexisting\nFIELDKIT_ROOT=/preexisting\n")
+    hermes_env.write_text("TELEGRAM_BOT_TOKEN=preexisting-token\n")
 
     _write_client_env(sandbox["fieldkit_root"], "acme")
     result = _run(
@@ -667,13 +723,59 @@ def test_failed_config_set_rolls_back_config_yaml_and_leaves_gateway_stopped(san
     calls = _log_calls(sandbox)
     assert not any("gateway start" in c for c in calls)
 
-    # hermes .env WAS already switched (it's self-consistent on its own --
-    # only the separate hermes-CLI config.yaml sequence failed) -- this is
-    # a deliberate, documented design choice, not an oversight: re-running
-    # the installer after fixing the underlying config-set failure is the
-    # supported recovery path.
-    hermes_env = (sandbox["hermes_home"] / ".env").read_text()
-    assert "CLIENT_NAME=acme" in hermes_env
+    # BOTH live .env files are completely untouched -- byte-for-byte their
+    # pre-install content, not "acme" anywhere in either.
+    assert root_env.read_text() == "CLIENT_NAME=preexisting\nFIELDKIT_ROOT=/preexisting\n"
+    assert hermes_env.read_text() == "TELEGRAM_BOT_TOKEN=preexisting-token\n"
+
+    # No leaked temp files from the staged-but-never-committed rebuild.
+    leaked = list(sandbox["fieldkit_root"].glob(".install_client.*")) + list(sandbox["hermes_home"].glob(".install_client.*"))
+    assert leaked == [], f"leaked temp files: {leaked}"
+
+
+def test_failed_config_set_with_no_preexisting_config_yaml_deletes_it_not_leaves_partial(sandbox):
+    """The other half of the ENGINEERING-1 fix: on a machine where
+    config.yaml never existed before this install attempt (this run's own
+    `hermes config set` calls would be the ones creating it), a failure
+    partway through must DELETE it, not leave a half-applied file that
+    looks like a real, intentional prior configuration."""
+    config_yaml = sandbox["hermes_home"] / "config.yaml"
+    assert not config_yaml.exists()
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox,
+        extra_env={"HERMES_STUB_FAIL_CONFIG_KEY": "model.default"},
+    )
+    assert result.returncode != 0
+    assert "did not exist before" in result.stderr.lower()
+    assert not config_yaml.exists()
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+    assert not (sandbox["hermes_home"] / ".env").exists()
+
+
+def test_cleanup_trap_installed_immediately_after_each_mktemp_not_only_after_both():
+    """A small, cheap fix flagged alongside the main findings: if the trap
+    covering the FIRST staged temp file were only installed after BOTH
+    mktemp calls succeeded, a failure on the second mktemp (disk full,
+    permission race, etc.) would exit under `set -e` before any trap
+    existed to clean up the first file, leaking it. Verified structurally
+    (a live race on the second mktemp specifically, after the writability
+    preflight has already passed, isn't reliably reproducible as a
+    black-box subprocess test): the trap for ROOT_ENV_TMP must be
+    installed on the line immediately following its own mktemp call, not
+    deferred until after HERMES_ENV_TMP's mktemp also runs."""
+    src = _INSTALL_SCRIPT.read_text()
+    root_tmp_idx = src.index('ROOT_ENV_TMP="$(mktemp')
+    hermes_tmp_idx = src.index('HERMES_ENV_TMP="$(mktemp')
+    assert root_tmp_idx < hermes_tmp_idx
+    between = src[root_tmp_idx:hermes_tmp_idx]
+    assert "trap " in between, (
+        "expected a `trap` installation between ROOT_ENV_TMP's mktemp and "
+        "HERMES_ENV_TMP's mktemp, covering ROOT_ENV_TMP alone, so a "
+        "failure on the second mktemp can't leak the first temp file"
+    )
+    assert 'rm -f "$ROOT_ENV_TMP"' in between
 
 
 def test_no_command_available_fails_before_any_write(sandbox):
@@ -697,40 +799,99 @@ def test_no_command_available_fails_before_any_write(sandbox):
 
 
 # ---------------------------------------------------------------------------
-# SECURITY-5 / stale non-default profiles: surfaced, never touched, and the
-# retirement instructions now stress ordering (retire the old profile
-# FIRST -- see the module docstring update and 09-per-client-model-profiles.md).
+# SECURITY-5, STRENGTHENED per the second review round: a stale non-default
+# profile's gateway being CONFIRMED RUNNING (or its status being
+# unconfirmable) must ABORT the install outright, before touching anything
+# live -- not merely warn about it after the new default-profile gateway is
+# already up (which the review correctly identified as reproducing the
+# exact two-gateways-live exposure this script exists to prevent). Only a
+# stale profile CONFIRMED not running is safe to proceed past, with a
+# cleanup reminder printed on success.
 # ---------------------------------------------------------------------------
 
-def test_stale_non_default_profiles_are_surfaced_not_touched(sandbox):
+def test_stale_profile_confirmed_running_aborts_before_any_mutation(sandbox):
     stale_profile_dir = sandbox["hermes_home"] / "profiles" / "mercury"
     stale_profile_dir.mkdir(parents=True)
     (stale_profile_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=stale-should-not-be-touched\n")
 
     _write_client_env(sandbox["fieldkit_root"], "acme")
-    result = _run("acme", sandbox, "--no-restart")
-    assert result.returncode == 0, result.stderr
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_PROFILE_STATUS_mercury": "running"},
+    )
+    assert result.returncode != 0
+    assert "mercury" in result.stderr
+    assert "confirmed running" in result.stderr.lower()
+    assert "hermes -p mercury gateway stop" in result.stderr
+    assert "hermes profile delete mercury" in result.stderr
 
-    assert "mercury" in result.stdout
-    assert "hermes -p mercury gateway stop" in result.stdout
-    assert "hermes profile delete mercury" in result.stdout
+    # Zero live mutation: the default gateway was never even queried-and-
+    # stopped, let alone had its .env files committed.
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+    assert not (sandbox["hermes_home"] / ".env").exists()
+    calls = _log_calls(sandbox)
+    assert not any("gateway stop" in c and "-p" not in c for c in calls)
     assert (stale_profile_dir / ".env").read_text() == "TELEGRAM_BOT_TOKEN=stale-should-not-be-touched\n"
 
 
-def test_stale_profile_warning_stresses_retiring_first(sandbox):
+def test_stale_profile_ambiguous_status_aborts_same_as_running(sandbox):
+    """An unconfirmable status for a stale profile is treated exactly like
+    'confirmed running' -- fail closed, don't guess it's safe."""
     stale_profile_dir = sandbox["hermes_home"] / "profiles" / "mercury"
     stale_profile_dir.mkdir(parents=True)
     _write_client_env(sandbox["fieldkit_root"], "acme")
-    result = _run("acme", sandbox, "--no-restart")
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_PROFILE_STATUS_mercury": "ambiguous"},
+    )
+    assert result.returncode != 0
+    assert "could not be confirmed" in result.stderr.lower()
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+
+
+def test_stale_profile_confirmed_not_running_proceeds_with_cleanup_note(sandbox):
+    stale_profile_dir = sandbox["hermes_home"] / "profiles" / "mercury"
+    stale_profile_dir.mkdir(parents=True)
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_PROFILE_STATUS_mercury": "not-running"},
+    )
     assert result.returncode == 0, result.stderr
-    assert "immediately" in result.stdout.lower() or "may still be live" in result.stdout.lower()
+    assert (sandbox["fieldkit_root"] / ".env").read_text().count("CLIENT_NAME=acme") == 1
+    assert "mercury" in result.stdout
+    assert "hermes profile delete mercury" in result.stdout
 
 
 def test_no_stale_profiles_prints_no_retirement_section(sandbox):
     _write_client_env(sandbox["fieldkit_root"], "acme")
     result = _run("acme", sandbox, "--no-restart")
     assert result.returncode == 0, result.stderr
-    assert "retire" not in result.stdout.lower()
+    assert "retire" not in result.stdout.lower() and "delete" not in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# ENGINEERING-3, STRENGTHENED: an ambiguous status for the DEFAULT profile's
+# own gateway (command failure or unrecognized output) must abort the
+# install entirely -- proceeding as if it were "not running" is exactly the
+# wrong guess to make when the actual answer might be "running", since that
+# would let the script overwrite live credential files out from under a
+# gateway that's still reading them.
+# ---------------------------------------------------------------------------
+
+def test_ambiguous_default_gateway_status_aborts_before_any_mutation(sandbox):
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_STOPPED_TEXT": "???unparseable???"},
+    )
+    assert result.returncode != 0
+    assert "could not determine" in result.stderr.lower()
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+    assert not (sandbox["hermes_home"] / ".env").exists()
+    calls = _log_calls(sandbox)
+    assert not any("gateway stop" in c for c in calls)
+    assert not any("config set" in c for c in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -768,39 +929,84 @@ def _resolve_via_real_process_photos(fieldkit_root: Path, ambient_env: dict) -> 
     )
 
 
-def _simulate_hermes_gateway_env_reload(hermes_env_path: Path, ambient_env: dict) -> dict:
-    """Model exactly what hermes_cli/env_loader.py::load_hermes_dotenv()
-    does to a Hermes gateway process's own os.environ on every turn
-    (verified against this machine's installed Hermes; see
-    platform/docs/hermes/09-per-client-model-profiles.md): load
-    <HERMES_HOME>/.env into the environment with override=True. This is
-    what a real gateway subprocess's inherited environment would actually
-    look like at the moment it spawns a skill's terminal-tool subprocess --
-    NOT the raw ambient_env by itself (that would understate the fix, per
-    the review's Engineering-5 finding), and not a hand-constructed
-    "already correct" env either (that would prove nothing about staleness,
-    per the same finding)."""
-    from dotenv import dotenv_values
+# ENGINEERING-5, SECOND REVIEW ROUND: the first version of this proof
+# reimplemented Hermes's reload logic (dotenv_values + dict.update) instead
+# of calling Hermes's ACTUAL installed loader -- the review correctly
+# pointed out that a reimplementation proves nothing about Hermes's real
+# load-order/override semantics, and would keep "passing" even if Hermes's
+# own behavior changed. Fixed: invoke the real, installed
+# hermes_cli.env_loader.load_hermes_dotenv() via Hermes's own venv
+# interpreter, against an isolated scratch HERMES_HOME -- never this
+# machine's real ~/.hermes. Skips cleanly (not a failure) on a machine
+# without this exact Hermes install, so the suite stays portable.
+_HERMES_INSTALL_DIR = Path.home() / ".hermes" / "hermes-agent"
+_HERMES_VENV_PYTHON = _HERMES_INSTALL_DIR / "venv" / "bin" / "python"
+_REAL_HERMES_AVAILABLE = (
+    _HERMES_VENV_PYTHON.exists()
+    and (_HERMES_INSTALL_DIR / "hermes_cli" / "env_loader.py").exists()
+)
+_skip_without_real_hermes = pytest.mark.skipif(
+    not _REAL_HERMES_AVAILABLE,
+    reason="real installed Hermes (~/.hermes/hermes-agent) not found on this machine",
+)
 
-    reloaded = dict(ambient_env)
-    if hermes_env_path.exists():
-        reloaded.update({k: v for k, v in dotenv_values(hermes_env_path).items() if v is not None})
-    return reloaded
+
+def _reload_via_real_hermes_env_loader(hermes_env_path: Path, ambient_env: dict) -> dict:
+    """Invoke Hermes's OWN installed `load_hermes_dotenv()` (not a
+    reimplementation) against an isolated scratch HERMES_HOME, with the
+    given ambient_env as the starting process environment, and return what
+    os.environ looks like afterward. This is exactly what a real Hermes
+    gateway process's environment looks like at the moment it spawns a
+    skill's terminal-tool subprocess -- proving install_client.sh's fix
+    (writing CLIENT_NAME into Hermes's own .env) actually works against
+    Hermes's real load-order/override semantics, not our understanding of
+    them. `load_external_secrets=False` skips optional secret-manager
+    integrations irrelevant to this proof and not present in this sandbox
+    anyway. Never touches this machine's real ~/.hermes -- hermes_home is
+    always the isolated sandbox path passed in."""
+    snippet = (
+        "import sys, os\n"
+        f"sys.path.insert(0, {str(_HERMES_INSTALL_DIR)!r})\n"
+        f"os.environ.update({ambient_env!r})\n"
+        "from pathlib import Path\n"
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        f"load_hermes_dotenv(hermes_home=Path({str(hermes_env_path.parent)!r}), load_external_secrets=False)\n"
+        "import json\n"
+        "print('HERMES_RELOADED_ENV_JSON=' + json.dumps(dict(os.environ)))\n"
+    )
+    # A controlled base environment (not this test process's full inherited
+    # env) so the proof isn't sensitive to whatever happens to be in the
+    # runner's own shell.
+    base_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+    result = subprocess.run(
+        [str(_HERMES_VENV_PYTHON), "-c", snippet],
+        env=base_env,
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (
+        f"real Hermes env_loader invocation failed:\n{result.stderr}"
+    )
+    import json
+    line = next(l for l in result.stdout.splitlines() if l.startswith("HERMES_RELOADED_ENV_JSON="))
+    return json.loads(line[len("HERMES_RELOADED_ENV_JSON="):])
 
 
-def test_stale_ambient_client_name_does_not_survive_hermes_reload(sandbox):
-    """THE ENGINEERING-6 / #59-CLOSURE CRUX TEST. Simulates the actually
-    dangerous scenario the review demanded coverage for: a Hermes gateway
-    subprocess whose OWN inherited environment already carries a STALE
-    CLIENT_NAME (left over from before this install, e.g. from the
-    process's own prior turn, a leftover shell export baked into a launchd
-    plist, or simply not having been restarted in a while) -- proving that
-    after install_client.sh switches the active client, that stale value
-    cannot win, because Hermes's own env-reload mechanism (override=True
-    from HERMES_HOME/.env, which the installer now writes CLIENT_NAME into)
-    corrects it before any skill subprocess ever sees it. This is the
-    reason CLIENT_NAME is written into Hermes's .env at all, not just the
-    root .env -- see the script's own module docstring."""
+@_skip_without_real_hermes
+def test_stale_ambient_client_name_does_not_survive_real_hermes_reload(sandbox):
+    """THE ENGINEERING-6 / #59-CLOSURE CRUX TEST, using Hermes's REAL
+    installed reload code (see ENGINEERING-5 above), not a
+    reimplementation. Simulates the actually dangerous scenario the review
+    demanded coverage for: a Hermes gateway subprocess whose OWN inherited
+    environment already carries a STALE CLIENT_NAME (left over from before
+    this install, e.g. from the process's own prior turn, a leftover shell
+    export baked into a launchd plist, or simply not having been restarted
+    in a while) -- proving that after install_client.sh switches the
+    active client, that stale value cannot win, because Hermes's own
+    load_hermes_dotenv() (override=True from HERMES_HOME/.env, which the
+    installer now writes CLIENT_NAME into) corrects it before any skill
+    subprocess ever sees it. This is the reason CLIENT_NAME is written
+    into Hermes's .env at all, not just the root .env -- see the script's
+    own module docstring."""
     _write_client_env(sandbox["fieldkit_root"], "newclient")
     install_result = _run("newclient", sandbox, "--no-restart")
     assert install_result.returncode == 0, install_result.stderr
@@ -811,13 +1017,14 @@ def test_stale_ambient_client_name_does_not_survive_hermes_reload(sandbox):
     # reload.
     stale_ambient_env = {"CLIENT_NAME": "some_stale_client_from_before"}
 
-    corrected_env = _simulate_hermes_gateway_env_reload(
+    corrected_env = _reload_via_real_hermes_env_loader(
         sandbox["hermes_home"] / ".env", stale_ambient_env,
     )
     assert corrected_env["CLIENT_NAME"] == "newclient", (
-        "Hermes's own override=True reload of its .env must correct a "
-        "stale CLIENT_NAME -- if this fails, install_client.sh is not "
-        "writing CLIENT_NAME into Hermes's .env correctly"
+        "Hermes's REAL, installed load_hermes_dotenv() must correct a "
+        "stale CLIENT_NAME on reload -- if this fails, install_client.sh "
+        "is not writing CLIENT_NAME into Hermes's .env correctly, or "
+        "Hermes's own override semantics changed underneath this proof"
     )
 
     resolve_result = _resolve_via_real_process_photos(sandbox["fieldkit_root"], corrected_env)
@@ -826,13 +1033,15 @@ def test_stale_ambient_client_name_does_not_survive_hermes_reload(sandbox):
     assert "some_stale_client_from_before" not in resolve_result.stdout
 
 
+@_skip_without_real_hermes
 def test_switching_installed_client_corrects_the_ambient_env_each_time(sandbox):
-    """The same proof as above, run across two consecutive switches, each
-    time starting from the OTHER client's name as the stale ambient value
-    -- confirming this isn't a one-shot fluke of a specific stale value."""
+    """The same proof as above, using Hermes's real reload code, run
+    across two consecutive switches, each time starting from the OTHER
+    client's name as the stale ambient value -- confirming this isn't a
+    one-shot fluke of a specific stale value."""
     _write_client_env(sandbox["fieldkit_root"], "clienta")
     assert _run("clienta", sandbox, "--no-restart").returncode == 0
-    corrected_a = _simulate_hermes_gateway_env_reload(
+    corrected_a = _reload_via_real_hermes_env_loader(
         sandbox["hermes_home"] / ".env", {"CLIENT_NAME": "whatever_was_here_before"},
     )
     first = _resolve_via_real_process_photos(sandbox["fieldkit_root"], corrected_a)
@@ -840,7 +1049,7 @@ def test_switching_installed_client_corrects_the_ambient_env_each_time(sandbox):
 
     _write_client_env(sandbox["fieldkit_root"], "clientb")
     assert _run("clientb", sandbox, "--no-restart").returncode == 0
-    corrected_b = _simulate_hermes_gateway_env_reload(
+    corrected_b = _reload_via_real_hermes_env_loader(
         sandbox["hermes_home"] / ".env", {"CLIENT_NAME": "clienta"},  # stale = the PREVIOUS install
     )
     second = _resolve_via_real_process_photos(sandbox["fieldkit_root"], corrected_b)

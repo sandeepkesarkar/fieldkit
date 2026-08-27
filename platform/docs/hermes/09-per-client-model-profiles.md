@@ -50,32 +50,58 @@ platform/photo-agent/scripts/install_client.sh <client-name>
 ```
 
 Reads `clients/<client-name>/src/photo-agent/.env` (must already exist and
-be filled in — copy from `.env.example` first) and:
+be filled in — copy from `.env.example` first) and, in this exact order:
 
-1. Writes `CLIENT_NAME=<client-name>` into the repo-root `fieldkit/.env`
-   (upsert — replaces any prior value, never duplicates or appends a
-   second line).
-2. Backs up `~/.hermes/.env`, then writes that client's `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_ALLOWED_USERS`, and provider API key into it.
-3. Forces the sticky profile to `default` (`hermes profile use default`,
-   guarding against a stray `hermes profile use <other>` left over from
-   past experimentation) and runs `hermes config set` for
-   `model.provider`, `model.default`, and `skills.external_dirs` — always
-   against the default profile, never a named one.
-4. Restarts the default gateway (`launchctl kickstart -k
-   gui/$(id -u)/ai.hermes.gateway`, falling back to `hermes gateway restart`
-   if `launchctl` isn't on `PATH`).
-5. If it finds any leftover profile directories under `~/.hermes/profiles/`
-   (pre-#61 state — e.g. `mercury`, `venus`), prints exact retirement
-   commands for a human to run. **It never touches those directories
-   itself** — they're live state from before this architecture decision,
-   and mutating already-running, non-default profile state is not this
-   script's job (same posture as every other live-infrastructure change in
-   this project's history: the automation proposes, a human disposes).
+1. **Validates and canonicalizes paths first, with zero side effects.**
+   The client name is checked against `^[A-Za-z0-9_-]+$` before it ever
+   touches a path; both the resolved client directory AND the resolved
+   `.env` file itself (not just its parent directory) are symlink-resolved
+   and verified to still live under `clients/` — a symlink at either level
+   pointing outside the repo is rejected outright, never followed.
+2. **Checks whether any leftover, non-default Hermes profile
+   (`~/.hermes/profiles/<name>/` — pre-#61 state, e.g. `mercury`, `venus`)
+   has a gateway that's currently running.** If any is confirmed running,
+   or its status can't be confirmed at all, the install **aborts here**,
+   before touching anything live, with the exact retirement commands to
+   run first — never merely warns about this after the fact once a new
+   gateway is already up (that would recreate the exact two-gateways-live
+   exposure issue #59 was about). **It never touches those profiles
+   itself** either way — they're live state from before this architecture
+   decision, and mutating already-running, non-default profile state is
+   not this script's job (same posture as every other live-infrastructure
+   change in this project's history: the automation proposes, a human
+   disposes).
+3. **Checks the default profile's own gateway status** and stops it first
+   if running — an unrecognized/ambiguous status also aborts here rather
+   than guessing "not running."
+4. **Stages** a full rebuild of both the repo-root `fieldkit/.env`
+   (`CLIENT_NAME`, `FIELDKIT_ROOT`) and Hermes's default profile `.env`
+   (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `CLIENT_NAME`, and only
+   the selected provider's API key) as temp files — **not written to their
+   live locations yet.** Every managed key is stripped from whatever
+   existed before and re-added fresh: a stale `OPENAI_API_KEY` left over
+   from a prior OpenAI-backed client cannot survive a switch to an
+   Anthropic-backed one, and no key can end up duplicated.
+5. **Runs `hermes config set`** (`model.provider`, `model.default`,
+   `skills.external_dirs`, always against the forced-sticky `default`
+   profile) against a backed-up `config.yaml`. **Only if every one of
+   these calls succeeds** does the script proceed to the next step — a
+   failure here rolls `config.yaml` back to exactly what it was before
+   this attempt (deleted outright if this run would have created it fresh)
+   and leaves **both staged `.env` files completely uncommitted** — the
+   live files are untouched, not merely self-consistent with each other.
+6. **Only now, after every fallible step above has succeeded**, atomically
+   commits both staged `.env` files into place and starts the gateway
+   again.
 
-Flags: `--dry-run` (print the plan, touch nothing, run no `hermes`/
-`launchctl` commands), `--no-restart` (apply config, skip the gateway
-restart).
+There is no window where one live file reflects the new client's config and
+another still reflects the old one, and no window where the gateway
+observes a half-written file.
+
+Flags: `--dry-run` (print the plan; makes **zero** filesystem changes of
+any kind — no `mkdir`, no `chmod`, no lock, no temp file — and runs no
+`hermes` commands), `--no-restart` (apply config, leave the gateway
+stopped).
 
 **Required fields in `clients/<name>/src/photo-agent/.env`** (added to
 `platform/photo-agent/.env.example` and every client's own `.env.example`):
@@ -168,29 +194,27 @@ anymore. If `~/.hermes/profiles/<name>/` directories exist on a machine
 from before this decision (mercury, venus), `install_client.sh` will detect
 and report them.
 
-**Retirement order matters, and it is NOT "run `install_client.sh` first,
-retire the old profile whenever" — that ordering was flagged in review as
-recreating exactly the kind of exposure issue #59 was about.** A leftover
-per-client-profile gateway (e.g. `ai.hermes.gateway-mercury`) is a
-**separate, independent launchd service with its own Telegram bot** —
-`install_client.sh` never touches it, in either direction, at any point in
-its run. That means if it's still running, it stays fully live and
-reachable on its own bot **regardless of what `install_client.sh` does to
-the default profile** — installing a new client does not "take over" from
-it or shut it down. Confirmed live on this machine: the default gateway and
-`ai.hermes.gateway-mercury` were both found running simultaneously, well
-after this architecture had already shifted away from the per-profile
-model — the leftover profile doesn't retire itself just because it's no
-longer the intended design.
+**Retirement order matters, and `install_client.sh` now enforces it rather
+than merely documenting it** — an earlier version let the install proceed
+regardless and only warned about a leftover profile after the fact, which
+review correctly identified as recreating exactly the kind of exposure
+issue #59 was about, and which was confirmed live on this machine: the
+default gateway and `ai.hermes.gateway-mercury` were both found running
+simultaneously, well after this architecture had already shifted away from
+the per-profile model — a leftover profile doesn't retire itself just
+because it's no longer the intended design. A leftover per-client-profile
+gateway is a **separate, independent launchd service with its own Telegram
+bot** — `install_client.sh` never touches it, in either direction, at any
+point in its run. That means if it's still running, it stays fully live and
+reachable on its own bot regardless of what `install_client.sh` does to the
+default profile — installing a new client does not "take over" from it or
+shut it down.
 
-**So: retire every leftover per-client profile's gateway BEFORE (or as the
-very first step of) switching to the single-install model on a given
-machine — never treat it as optional cleanup to get to "eventually."**
-Until you do, that old profile's bot can still accept and act on commands
-with its own client's credentials at the same time as the newly-installed
-default-profile bot is doing the same for a different client — two live,
-reachable identities at once is the exposure, not any particular ordering
-of file writes:
+**So: `install_client.sh` checks every leftover per-client profile's
+gateway status BEFORE touching anything live, and refuses to proceed at
+all if any is confirmed running or its status can't be confirmed** — it
+prints the exact retirement commands and exits non-zero rather than
+installing anyway. Retire it, then re-run the install:
 
 ```bash
 hermes -p <name> gateway stop
