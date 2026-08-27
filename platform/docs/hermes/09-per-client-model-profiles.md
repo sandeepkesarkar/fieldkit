@@ -50,49 +50,81 @@ platform/photo-agent/scripts/install_client.sh <client-name>
 ```
 
 Reads `clients/<client-name>/src/photo-agent/.env` (must already exist and
-be filled in — copy from `.env.example` first) and, in this exact order:
+be filled in — copy from `.env.example` first) and, in this exact order
+(kept in sync with the script itself — if this list and the code ever
+disagree, the code is authoritative and this doc has drifted):
 
 1. **Validates and canonicalizes paths first, with zero side effects.**
    The client name is checked against `^[A-Za-z0-9_-]+$` before it ever
    touches a path; both the resolved client directory AND the resolved
    `.env` file itself (not just its parent directory) are symlink-resolved
    and verified to still live under `clients/` — a symlink at either level
-   pointing outside the repo is rejected outright, never followed.
+   pointing outside the repo is rejected outright, never followed. Prints
+   the plan and, if `--dry-run` was passed, exits here — before the first
+   side-effecting line of any kind (no `mkdir`, no `chmod`, no lock, no
+   temp file).
 2. **Checks whether any leftover, non-default Hermes profile
    (`~/.hermes/profiles/<name>/` — pre-#61 state, e.g. `mercury`, `venus`)
-   has a gateway that's currently running.** If any is confirmed running,
-   or its status can't be confirmed at all, the install **aborts here**,
-   before touching anything live, with the exact retirement commands to
-   run first — never merely warns about this after the fact once a new
-   gateway is already up (that would recreate the exact two-gateways-live
-   exposure issue #59 was about). **It never touches those profiles
-   itself** either way — they're live state from before this architecture
-   decision, and mutating already-running, non-default profile state is
-   not this script's job (same posture as every other live-infrastructure
-   change in this project's history: the automation proposes, a human
-   disposes).
-3. **Checks the default profile's own gateway status** and stops it first
-   if running — an unrecognized/ambiguous status also aborts here rather
-   than guessing "not running."
-4. **Stages** a full rebuild of both the repo-root `fieldkit/.env`
-   (`CLIENT_NAME`, `FIELDKIT_ROOT`) and Hermes's default profile `.env`
+   has a gateway that's currently running — before ANY mutation of any
+   kind, not merely before the live `.env` files.** If any is confirmed
+   running, or its status can't be confirmed at all, the install **aborts
+   here**, before even the preflight command/writability checks or the
+   lock, with the exact retirement commands to run first — never merely
+   warns about this after the fact once a new gateway is already up (that
+   would recreate the exact two-gateways-live exposure issue #59 was
+   about). **It never touches those profiles itself** either way — they're
+   live state from before this architecture decision, and mutating
+   already-running, non-default profile state is not this script's job
+   (same posture as every other live-infrastructure change in this
+   project's history: the automation proposes, a human disposes).
+3. **Preflight, lock, and staging.** Confirms `hermes` is on `PATH`;
+   creates and locks down `HERMES_HOME` (`chmod 700`); confirms both target
+   directories are writable; takes a `mkdir`-based lock so a concurrent
+   invocation refuses immediately rather than racing; stages a full
+   rebuild of both the repo-root `fieldkit/.env` (`CLIENT_NAME`,
+   `FIELDKIT_ROOT`) and Hermes's default profile `.env`
    (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `CLIENT_NAME`, and only
    the selected provider's API key) as temp files — **not written to their
    live locations yet.** Every managed key is stripped from whatever
    existed before and re-added fresh: a stale `OPENAI_API_KEY` left over
    from a prior OpenAI-backed client cannot survive a switch to an
    Anthropic-backed one, and no key can end up duplicated.
+4. **Checks the DEFAULT profile's own gateway status** and stops it first
+   if running — an unrecognized/ambiguous status also aborts here rather
+   than guessing "not running."
 5. **Runs `hermes config set`** (`model.provider`, `model.default`,
    `skills.external_dirs`, always against the forced-sticky `default`
-   profile) against a backed-up `config.yaml`. **Only if every one of
-   these calls succeeds** does the script proceed to the next step — a
-   failure here rolls `config.yaml` back to exactly what it was before
-   this attempt (deleted outright if this run would have created it fresh)
-   and leaves **both staged `.env` files completely uncommitted** — the
-   live files are untouched, not merely self-consistent with each other.
-6. **Only now, after every fallible step above has succeeded**, atomically
-   commits both staged `.env` files into place and starts the gateway
-   again.
+   profile) against a backed-up `config.yaml` (content AND original file
+   mode both captured, so a restore can't leave the file more permissive
+   than it started — `hermes config set` itself can rewrite `config.yaml`
+   via its own atomic write partway through this sequence, which changes
+   its mode as a side effect). **Only if every one of these calls
+   succeeds** does the script proceed to the next step — a failure here
+   rolls `config.yaml` back to exactly what it was (content and mode)
+   before this attempt (deleted outright if this run would have created it
+   fresh) and leaves **both staged `.env` files completely uncommitted** —
+   the live files are untouched, not merely self-consistent with each
+   other.
+6. **Commits.** Only now, after every fallible step above has succeeded:
+   fixes the client's own source `.env` permissions (deferred to here, not
+   done at validation time, so a failure before this point never mutates
+   it); commits Hermes's `.env` first (it's the file that actually governs
+   live skill dispatch — the #59 exposure this script exists to close — so
+   if the second commit below ever fails, the file that matters most is
+   already correct); then commits the root `.env`. POSIX offers no true
+   multi-file transaction, so if the second commit fails after the first
+   succeeds, the script does not pretend that can't happen — it prints
+   exactly which file is already correct and how to finish the fix by
+   re-running.
+7. **Re-checks every stale profile's status one more time, immediately
+   before actually starting the new default-profile gateway** — closing
+   the gap where a stale profile's gateway could start in the window
+   between step 2's check and this final moment. Both `.env` files are
+   already committed by this point regardless of this recheck's outcome
+   (they're correct for the client being installed); what's refused, if a
+   stale profile is now found running, is only the new gateway's start —
+   this script never itself creates a moment where two gateways with two
+   different clients' credentials are both live.
 
 There is no window where one live file reflects the new client's config and
 another still reflects the old one, and no window where the gateway

@@ -366,13 +366,207 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-# The client's own source .env should never be group/world readable either
-# — fix it rather than just warn, matching the chmod 600 convention every
-# .env.example in this repo already documents. Only reached for a real
-# (non-dry-run) install, and only ever applied to CLIENT_ENV_REAL (the
-# already-verified, in-bounds resolved path) — never to whatever a symlink
-# might have pointed at, since that case was already rejected above.
-chmod 600 "$CLIENT_ENV" 2>/dev/null || true
+# NOTE: fixing the client's own source .env's permissions (chmod 600) is
+# deliberately NOT done here. An earlier version did it at this point --
+# before the fallible `hermes config set` sequence and the stale-profile
+# checks below -- which meant a failed install still left one real,
+# pre-existing file mutated, contradicting "zero filesystem mutation on
+# failure." It's now done only as part of the final commit, alongside the
+# ROOT_ENV/HERMES_ENV chmods, after every fallible step has succeeded --
+# see the "Commit point" section near the bottom of this script.
+
+# --- Gateway status: FAIL CLOSED on anything ambiguous. A command failure
+# or unrecognized output is treated as "assume running" for a stale
+# non-default profile (the more dangerous unknown to get wrong is "assumed
+# retired when it's actually still live") and as "abort, don't guess" for
+# the default profile this script is about to reconfigure — proceeding on
+# a wrong guess in either direction is exactly the kind of exposure this
+# script exists to prevent, so an ambiguous read is never treated as
+# license to proceed. ---------------------------------------------------
+#
+# The classifier below is tuned to Hermes's REAL `gateway status` output
+# contract on macOS (this project's actual deployment target), read
+# directly from hermes_cli/gateway.py's `launchd_status()` and
+# `_print_gateway_process_mismatch()` — NOT invented/guessed strings. A
+# naive "contains the word running" heuristic (this script's own earlier
+# version) never matches the single most common real output line at all:
+#   ✓ Gateway is supervised by launchd (PID 462)
+# — which contains neither "running" nor any negation of it, so the old
+# classifier misclassified a genuinely running gateway as "ambiguous" and
+# aborted every real install on this machine. Confirmed live (read-only
+# query, no live state touched) against both the default profile and
+# mercury's still-running leftover profile — both real captures are used
+# verbatim as test fixtures in test_install_client.py, not reconstructed.
+#
+# Full real-output contract (macOS/launchd path, `launchd_status()`):
+#   POSITIVE (running) fragments actually printed by Hermes:
+#     "is supervised by launchd"            -- the common case (PID N)
+#     "is running"                          -- covers every other real
+#       phrasing Hermes uses for a confirmed live process: "Detached
+#       fallback process is running (PID N)", "Detached gateway process
+#       is running (PID N)", "Gateway is running (PID: N)" (no-service-
+#       installed-but-a-manual-PID-found case), "Gateway is running as a
+#       detached fallback process" and "Gateway process is running for
+#       this profile" (the process/service mismatch warnings), "Gateway
+#       service is installed and running" (setup wizard's own phrasing,
+#       included for robustness even though `gateway status` itself
+#       doesn't emit it). None of Hermes's real NEGATIVE phrasings below
+#       contain "is running" as a substring (verified directly against
+#       the source: "is NOT running" has "not" between "is" and
+#       "running", so it does not match) -- confirmed safe to check
+#       broadly rather than needing every exact phrase enumerated.
+#   NEGATIVE (not running) fragments:
+#     "is not running"                      -- catch-all no-service-found case
+#     "service is not loaded"               -- launchd hasn't loaded the def
+#     "not supervising it"                  -- registered but not supervised,
+#                                                AND no detached fallback found
+#                                                (if one WAS found, "is running"
+#                                                is also printed and wins, since
+#                                                POSITIVE is checked first)
+#     "No fallback process is running"      -- an EXPLICIT NEGATIVE despite
+#                                                containing the substring "is
+#                                                running" ("process is
+#                                                running" reads as a positive
+#                                                fragment on its own) -- this
+#                                                exact confusion was caught
+#                                                live while testing this
+#                                                classifier: a naive
+#                                                POSITIVE-checked-first regex
+#                                                misclassified this phrase as
+#                                                running. Checked with
+#                                                explicit precedence below,
+#                                                before the generic POSITIVE
+#                                                check, specifically because
+#                                                of this.
+#     "service is not installed"            -- gateway install was never run
+#   Anything else: ambiguous -- fail closed, abort.
+#
+# _gateway_status [extra hermes args...] -- echoes one of:
+#   running | not-running | ambiguous
+# Never mutates anything -- pure query.
+_gateway_status() {
+  local out rc
+  out="$(HERMES_HOME="$HERMES_HOME" hermes "$@" gateway status 2>&1)"; rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "ambiguous"; return
+  fi
+  # This specific phrase is checked FIRST, ahead of the generic POSITIVE
+  # check below, because it contains "is running" as a literal substring
+  # ("No fallback process IS RUNNING") while meaning the opposite.
+  if printf '%s' "$out" | grep -qE 'No fallback process is running'; then
+    echo "not-running"; return
+  fi
+  # POSITIVE checked next and wins outright over the remaining generic
+  # negative patterns -- a confirmed-live detached process must count as
+  # running even alongside a "service not loaded" line about launchd's own
+  # supervision of it.
+  if printf '%s' "$out" | grep -qE 'is supervised by launchd|is running'; then
+    echo "running"; return
+  fi
+  if printf '%s' "$out" | grep -qE 'is not running|service is not loaded|not supervising it|service is not installed'; then
+    echo "not-running"; return
+  fi
+  echo "ambiguous"
+}
+
+# --- Stale non-default Hermes profiles (e.g. ~/.hermes/profiles/mercury from
+# before issue #61): checked and, if any is confirmed running, this install
+# is ABORTED — before touching anything live — rather than merely warned
+# about after the fact once the new default-profile gateway is already up.
+# A leftover per-client-profile gateway is a fully separate, independently-
+# running launchd service this script never starts or stops in any other
+# code path; if it's still live, it stays reachable on its own Telegram bot
+# with its own client's credentials regardless of what this script does to
+# the default profile, so the two-gateways-live exposure this script exists
+# to prevent can only actually be prevented by refusing to proceed until
+# it's retired. See platform/docs/hermes/09-per-client-model-profiles.md
+# for the full writeup and the exact retirement commands (printed below
+# too).
+#
+# Called TWICE: once here, before ANY mutation of any kind (mkdir, chmod,
+# lock, temp file) -- not merely before the live .env files, as an earlier
+# version did, which left a real window where a stale profile's gateway
+# could still be confirmed live only after this script had already created
+# directories, taken the lock, and staged secrets -- and once again,
+# immediately before the final `hermes gateway start` call near the bottom
+# of this script, to close the TOCTOU gap where a stale profile's gateway
+# could start in the interval between the first check and this script
+# actually bringing up the new one. Populates (overwriting on each call)
+# the global stale_running / stale_not_running / stale_ambiguous arrays;
+# the LATER call's stale_not_running is what the final success-path cleanup
+# reminder uses, since it's the freshest snapshot. Declared unconditionally
+# so referencing their length later under `set -u` never hits an
+# unbound-variable error on a bash without the 4.4+ fix for `"${arr[@]}"`
+# on an empty array (this machine's stock /bin/bash is 3.2.57, which has
+# that exact bug — confirmed via direct testing).
+stale_running=()
+stale_not_running=()
+stale_ambiguous=()
+# _abort_if_stale_profiles_running early|late -- the message differs by
+# call site: the EARLY call (before any mutation) can truthfully say
+# nothing has happened yet; the LATE call (right before `gateway start`,
+# after both .env files are already committed) must NOT claim that, since
+# claiming "refusing to install" at that point would be actively
+# misleading -- the install (the file switch) already succeeded; only
+# starting the new gateway is being withheld.
+_abort_if_stale_profiles_running() {
+  local stage="$1"
+  stale_running=()
+  stale_not_running=()
+  stale_ambiguous=()
+  [ -d "$HERMES_HOME/profiles" ] || return 0
+  local d p
+  for d in "$HERMES_HOME"/profiles/*/; do
+    [ -d "$d" ] || continue
+    p="$(basename "$d")"
+    case "$(_gateway_status -p "$p")" in
+      running) stale_running+=("$p") ;;
+      not-running) stale_not_running+=("$p") ;;
+      *) stale_ambiguous+=("$p") ;;
+    esac
+  done
+  if [ "${#stale_running[@]}" -eq 0 ] && [ "${#stale_ambiguous[@]}" -eq 0 ]; then
+    # Any remaining stale profiles are directories that exist but whose
+    # gateway is confirmed NOT running -- safe to proceed, just worth a
+    # cleanup reminder at the very end (see the success-path note below).
+    return 0
+  fi
+  if [ "$stage" = "late" ]; then
+    echo "ERROR: a stale, non-default Hermes profile started running between this" >&2
+    echo "script's initial check and now (a race, not a bug in the check itself)." >&2
+    echo "$ROOT_ENV and $HERMES_ENV were ALREADY switched to '$CLIENT' above and are" >&2
+    echo "NOT being reverted -- they're correct for '$CLIENT'. What's being refused" >&2
+    echo "is starting the new default-profile gateway, which would otherwise create" >&2
+    echo "the exact two-gateways-live exposure issue #59 was about, right now:" >&2
+  else
+    echo "ERROR: refusing to install '$CLIENT' — at least one stale, non-default" >&2
+    echo "Hermes profile still has a gateway that is running (or whose status" >&2
+    echo "could not be confirmed, which this script treats the same way):" >&2
+  fi
+  for p in "${stale_running[@]:-}"; do [ -n "$p" ] && echo "  - $p (confirmed RUNNING)" >&2; done
+  for p in "${stale_ambiguous[@]:-}"; do [ -n "$p" ] && echo "  - $p (status could not be confirmed)" >&2; done
+  echo >&2
+  if [ "$stage" = "late" ]; then
+    echo "Retire it, then start the (already-switched) gateway yourself:" >&2
+  else
+    echo "This is exactly the two-gateways-live exposure issue #59 was about —" >&2
+    echo "retire each one FIRST, then re-run install_client.sh $CLIENT:" >&2
+  fi
+  echo >&2
+  for p in "${stale_running[@]:-}" "${stale_ambiguous[@]:-}"; do
+    [ -n "$p" ] || continue
+    echo "  hermes -p $p gateway stop" >&2
+    echo "  hermes -p $p gateway uninstall" >&2
+    echo "  hermes profile delete $p" >&2
+    echo >&2
+  done
+  if [ "$stage" = "late" ]; then
+    echo "  HERMES_HOME=\"$HERMES_HOME\" hermes gateway start" >&2
+  fi
+  exit 1
+}
+
+_abort_if_stale_profiles_running early
 
 # --- Preflight: required commands and target-directory writability, before
 # generating or touching anything secret. -------------------------------
@@ -485,85 +679,11 @@ for _f_k in "$ROOT_ENV_TMP:CLIENT_NAME" "$ROOT_ENV_TMP:FIELDKIT_ROOT" \
   fi
 done
 
-# --- Gateway status: FAIL CLOSED on anything ambiguous. A command failure
-# or unrecognized output is treated as "assume running" for a stale
-# non-default profile (the more dangerous unknown to get wrong is "assumed
-# retired when it's actually still live") and as "abort, don't guess" for
-# the default profile this script is about to reconfigure — proceeding on
-# a wrong guess in either direction is exactly the kind of exposure this
-# script exists to prevent, so an ambiguous read is never treated as
-# license to proceed. ---------------------------------------------------
-# _gateway_status [extra hermes args...] -- echoes one of:
-#   running | not-running | ambiguous
-# Never mutates anything -- pure query.
-_gateway_status() {
-  local out rc
-  out="$(HERMES_HOME="$HERMES_HOME" hermes "$@" gateway status 2>&1)"; rc=$?
-  if [ $rc -ne 0 ]; then
-    echo "ambiguous"; return
-  fi
-  if printf '%s' "$out" | grep -qiE 'not running|stopped|not[[:space:]]+installed'; then
-    echo "not-running"; return
-  fi
-  if printf '%s' "$out" | grep -qi 'running'; then
-    echo "running"; return
-  fi
-  echo "ambiguous"
-}
-
-# --- Stale non-default Hermes profiles (e.g. ~/.hermes/profiles/mercury from
-# before issue #61): checked and, if any is confirmed running, this install
-# is ABORTED here — before touching anything live — rather than merely
-# warned about after the fact once the new default-profile gateway is
-# already up. A leftover per-client-profile gateway is a fully separate,
-# independently-running launchd service this script never starts or stops
-# in any other code path; if it's still live, it stays reachable on its
-# own Telegram bot with its own client's credentials regardless of what
-# this script does to the default profile, so the two-gateways-live
-# exposure this script exists to prevent can only actually be prevented by
-# refusing to proceed until it's retired. See
-# platform/docs/hermes/09-per-client-model-profiles.md for the full
-# writeup and the exact retirement commands (printed below too). ------------
-# Declared unconditionally (not just inside the `if -d profiles` block
-# below) so referencing their length later under `set -u` never hits an
-# unbound-variable error when no profiles/ directory exists at all.
-stale_running=()
-stale_not_running=()
-stale_ambiguous=()
-if [ -d "$HERMES_HOME/profiles" ]; then
-  for d in "$HERMES_HOME"/profiles/*/; do
-    [ -d "$d" ] || continue
-    p="$(basename "$d")"
-    case "$(_gateway_status -p "$p")" in
-      running) stale_running+=("$p") ;;
-      not-running) stale_not_running+=("$p") ;;
-      *) stale_ambiguous+=("$p") ;;
-    esac
-  done
-  if [ "${#stale_running[@]}" -gt 0 ] || [ "${#stale_ambiguous[@]}" -gt 0 ]; then
-    echo "ERROR: refusing to install '$CLIENT' — at least one stale, non-default" >&2
-    echo "Hermes profile still has a gateway that is running (or whose status" >&2
-    echo "could not be confirmed, which this script treats the same way):" >&2
-    for p in "${stale_running[@]:-}"; do [ -n "$p" ] && echo "  - $p (confirmed RUNNING)" >&2; done
-    for p in "${stale_ambiguous[@]:-}"; do [ -n "$p" ] && echo "  - $p (status could not be confirmed)" >&2; done
-    echo >&2
-    echo "This is exactly the two-gateways-live exposure issue #59 was about —" >&2
-    echo "retire each one FIRST, then re-run install_client.sh $CLIENT:" >&2
-    echo >&2
-    for p in "${stale_running[@]:-}" "${stale_ambiguous[@]:-}"; do
-      [ -n "$p" ] || continue
-      echo "  hermes -p $p gateway stop" >&2
-      echo "  hermes -p $p gateway uninstall" >&2
-      echo "  hermes profile delete $p" >&2
-      echo >&2
-    done
-    exit 1
-  fi
-  # Any remaining stale profiles are directories that exist but whose
-  # gateway is confirmed NOT running -- safe to proceed, just worth a
-  # cleanup reminder at the very end (see the success-path note below).
-fi
-
+# Default-profile gateway status check -- both _gateway_status and
+# _abort_if_stale_profiles_running are already defined above, before any
+# mutation. This is the DEFAULT profile's own status (not a stale
+# non-default one), checked here, right before the fallible config-set
+# sequence, so it can be stopped first if running.
 case "$(_gateway_status)" in
   running)
     GATEWAY_WAS_RUNNING=1
@@ -581,16 +701,38 @@ case "$(_gateway_status)" in
     ;;
 esac
 
-# Snapshot config.yaml (if it exists) so the fallible `hermes config set`
-# sequence below can be rolled back exactly to this state on any failure --
-# including the case where this run is the FIRST one ever on this machine
-# and config.yaml doesn't exist yet at all: on failure, it is then deleted
-# outright (not left half-written), never "restored" from a snapshot that
-# was never taken.
+# Portable file-mode capture (macOS's BSD `stat` and Linux's GNU `stat`
+# take incompatible flags for this -- `%OLp` vs `%a` -- so, consistent with
+# `_realpath` above, this uses python3, already a hard dependency of every
+# sibling script in this repo). Returns a plain octal string like "640",
+# suitable for `chmod` directly.
+_file_mode() {
+  python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$1"
+}
+
+# Snapshot config.yaml -- content AND mode -- (if it exists) so the fallible
+# `hermes config set` sequence below can be rolled back exactly to this
+# state on any failure, including the case where this run is the FIRST one
+# ever on this machine and config.yaml doesn't exist yet at all: on
+# failure, it is then deleted outright (not left half-written), never
+# "restored" from a snapshot that was never taken.
+#
+# The mode is captured and explicitly re-applied on rollback, not left to
+# `cp`'s own default behavior -- a real gap found live while testing this
+# fix: `hermes config set` can rewrite config.yaml via its own atomic
+# write (a fresh inode with a fresh, more permissive default mode), so by
+# the time a LATER `hermes config set` call in this same sequence fails,
+# the live config.yaml's mode may already differ from what it was before
+# this script ever touched it. `cp` alone preserves whatever mode the
+# CURRENT (already-rewritten-by-hermes) destination inode has, not the
+# ORIGINAL mode from before this run -- confirmed live: a 0640 original
+# became 0666 after a simulated failure, using `cp` alone for restore.
 CONFIG_EXISTED_BEFORE=0
 HERMES_CONFIG_BACKUP=""
+HERMES_CONFIG_ORIGINAL_MODE=""
 if [ -f "$HERMES_CONFIG" ]; then
   CONFIG_EXISTED_BEFORE=1
+  HERMES_CONFIG_ORIGINAL_MODE="$(_file_mode "$HERMES_CONFIG")"
   HERMES_CONFIG_BACKUP="$HERMES_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
   cp "$HERMES_CONFIG" "$HERMES_CONFIG_BACKUP"
   chmod 600 "$HERMES_CONFIG_BACKUP"
@@ -600,7 +742,8 @@ _rollback_hermes_config_and_fail() {
   echo "ERROR: 'hermes config set' failed — rolling back and leaving the gateway STOPPED." >&2
   if [ "$CONFIG_EXISTED_BEFORE" -eq 1 ]; then
     cp "$HERMES_CONFIG_BACKUP" "$HERMES_CONFIG"
-    echo "  Restored $HERMES_CONFIG from $HERMES_CONFIG_BACKUP" >&2
+    chmod "$HERMES_CONFIG_ORIGINAL_MODE" "$HERMES_CONFIG"
+    echo "  Restored $HERMES_CONFIG from $HERMES_CONFIG_BACKUP (mode $HERMES_CONFIG_ORIGINAL_MODE)" >&2
   else
     rm -f "$HERMES_CONFIG"
     echo "  Removed $HERMES_CONFIG (it did not exist before this install attempt)" >&2
@@ -639,12 +782,49 @@ if [ -f "$HERMES_ENV" ]; then
   chmod 600 "$HERMES_ENV_AUDIT_BACKUP"
 fi
 
-mv -f "$ROOT_ENV_TMP" "$ROOT_ENV"
-chmod 600 "$ROOT_ENV"
-mv -f "$HERMES_ENV_TMP" "$HERMES_ENV"
+# The client's own source .env's permissions are fixed here, as the first
+# real mutation of the commit phase -- deferred from validation time (see
+# the NOTE near the top of this script) so a failure anywhere before this
+# point leaves it, like every other live file, completely untouched.
+chmod 600 "$CLIENT_ENV" 2>/dev/null || true
+
+# --- Two-file commit ordering, and why: Hermes's own .env is committed
+# FIRST, not root .env. Hermes's .env is the file that actually governs
+# LIVE SKILL DISPATCH (see the module docstring's "Why CLIENT_NAME is also
+# written into Hermes's own .env" section) -- the exact path issue #59 was
+# about. The root .env only matters for the ad-hoc CLIENT_NAME= inline-
+# override path and for a bare cron/manual invocation with no ambient
+# CLIENT_NAME at all. If the second `mv` below were ever to fail after the
+# first succeeded (both are local, same-filesystem renames of already-
+# validated, already-staged temp files -- about as reliable an operation
+# as this script performs, but not a mathematical impossibility), THIS
+# ordering means the file that matters most for #59 is already correct;
+# the recovery message below explains exactly what state that leaves and
+# how to fix it, rather than silently claiming it can't happen. ------------
+mv -f "$HERMES_ENV_TMP" "$HERMES_ENV" || {
+  echo "ERROR: failed to commit $HERMES_ENV -- the client switch was NOT applied at all (this was the first of two commits; the second, $ROOT_ENV, was never attempted). Re-run: install_client.sh $CLIENT" >&2
+  exit 1
+}
 chmod 600 "$HERMES_ENV"
 
+mv -f "$ROOT_ENV_TMP" "$ROOT_ENV" || {
+  echo "ERROR: $HERMES_ENV was already switched to '$CLIENT' (this is the file that governs live Hermes skill dispatch -- the #59 exposure this script exists to close), but $ROOT_ENV failed to commit and may still show the PREVIOUS client. This only affects cron/manual invocations that read CLIENT_NAME with no ambient override; a live Hermes-dispatched command already correctly resolves to '$CLIENT'. Re-run install_client.sh $CLIENT to fix $ROOT_ENV too -- Hermes's .env is already correct, so re-running is safe and will simply re-commit both consistently." >&2
+  exit 1
+}
+chmod 600 "$ROOT_ENV"
+
 if [ "$NO_RESTART" -eq 0 ]; then
+  # TOCTOU recheck (issue #62 review Security-5b): re-verify no stale
+  # non-default profile has started running in the window between the
+  # FIRST check (before any mutation, at the very top of this script) and
+  # this, the last possible moment before the new default-profile gateway
+  # actually comes up. Both live .env files are already correctly
+  # committed above regardless of this recheck's outcome -- if it now
+  # finds a stale profile running, the switch itself is NOT undone (that
+  # would reintroduce its own inconsistency, and the files are correct for
+  # the client being installed), but the NEW gateway is refused a start,
+  # so this script never itself creates a two-gateways-live moment.
+  _abort_if_stale_profiles_running late
   HERMES_HOME="$HERMES_HOME" hermes gateway start
 fi
 

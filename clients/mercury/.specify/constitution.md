@@ -148,10 +148,20 @@ privacy.
 - macOS for deployment
 
 ### Hermes Integration
+
+> **Superseded by issue #61 — the dedicated-profile design described below
+> is retired, not current.** This project now runs exactly one client at a
+> time via Hermes's single DEFAULT profile only, switched with
+> `platform/photo-agent/scripts/install_client.sh mercury` — see
+> [`platform/docs/hermes/09-per-client-model-profiles.md`](../../../platform/docs/hermes/09-per-client-model-profiles.md)
+> for the current, authoritative mechanism. The paragraphs below are left
+> as historical record of the original design (and the real, verified
+> Hermes CLI behavior they documented remains accurate as CLI behavior);
+> they do not describe how mercury is actually configured today.
+
 - Self-hosted Hermes Agent runtime on Mac Mini
 - Model calls route to **Anthropic's API only** — this is explicit, not inherited from a
-  repo-wide default, and is enforced via a dedicated `mercury` Hermes profile, separate
-  from `_demo`'s default profile
+  repo-wide default
 - Verified live against the installed Hermes CLI (v0.20.5): profile targeting uses
   `hermes -p mercury <command>` (undocumented but confirmed real — scopes a single
   invocation to that profile, leaves the global sticky default untouched), after a one-time

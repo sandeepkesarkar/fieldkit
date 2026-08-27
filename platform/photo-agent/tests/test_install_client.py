@@ -32,16 +32,41 @@ _PLATFORM_PHOTO_AGENT = Path(__file__).parents[1]
 _INSTALL_SCRIPT = _PLATFORM_PHOTO_AGENT / "scripts" / "install_client.sh"
 
 
+# Status text below matches Hermes's REAL macOS/launchd output contract
+# (see install_client.sh's own _gateway_status doc comment, and
+# _REAL_HERMES_STATUS_* fixtures in this file for verbatim live captures)
+# -- not arbitrary placeholder strings. Using realistic phrasing here is
+# what makes these tests actually exercise the real classifier logic
+# rather than a simplified stand-in for it.
 _HERMES_STUB = """#!/usr/bin/env bash
 echo "STUB_HERMES_CALL: $*" >> "$HERMES_STUB_LOG"
 if [ "$1" = "-p" ]; then
   PROFILE="$2"
   if [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
+    # TOCTOU-race simulation (issue #62 review Security-5b): if
+    # HERMES_STUB_TOCTOU_COUNTER_DIR is set, the Nth query for this
+    # profile returns "not-running" for query 1 and "running" for every
+    # query after that -- modeling a stale profile's gateway starting up
+    # in the window between the installer's early check and its later
+    # recheck right before `gateway start`.
+    if [ -n "${HERMES_STUB_TOCTOU_COUNTER_DIR:-}" ]; then
+      COUNTER_FILE="$HERMES_STUB_TOCTOU_COUNTER_DIR/$PROFILE"
+      COUNT=0
+      [ -f "$COUNTER_FILE" ] && COUNT="$(cat "$COUNTER_FILE")"
+      COUNT=$((COUNT + 1))
+      echo "$COUNT" > "$COUNTER_FILE"
+      if [ "$COUNT" -eq 1 ]; then
+        echo "✗ Gateway service is not loaded"
+      else
+        echo "✓ Gateway is supervised by launchd (PID 777)"
+      fi
+      exit 0
+    fi
     VARNAME="HERMES_STUB_PROFILE_STATUS_${PROFILE}"
     STATUS="${!VARNAME:-not-running}"
     case "$STATUS" in
-      running) echo "Gateway: running" ;;
-      not-running) echo "Gateway: not running" ;;
+      running) echo "✓ Gateway is supervised by launchd (PID 999)" ;;
+      not-running) echo "✗ Gateway service is not loaded" ;;
       ambiguous) echo "???unparseable???" ;;
       command-fails) exit 7 ;;
     esac
@@ -51,9 +76,9 @@ if [ "$1" = "-p" ]; then
 fi
 if [ "$1" = "gateway" ] && [ "$2" = "status" ]; then
   if [ -f "$HERMES_STUB_RUNNING_MARKER" ]; then
-    echo "Gateway: running"
+    echo "✓ Gateway is supervised by launchd (PID 462)"
   else
-    echo "${HERMES_STUB_STOPPED_TEXT:-Gateway: not running}"
+    echo "${HERMES_STUB_STOPPED_TEXT:-✗ Gateway service is not loaded}"
   fi
   exit 0
 fi
@@ -65,13 +90,21 @@ if [ "$1" = "gateway" ] && [ "$2" = "start" ]; then
   touch "$HERMES_STUB_RUNNING_MARKER"
   exit "${HERMES_STUB_START_EXIT:-0}"
 fi
-if [ "$1" = "config" ] && [ "$2" = "set" ] && [ -n "${HERMES_STUB_FAIL_CONFIG_KEY:-}" ]; then
-  case "$3" in
-    "$HERMES_STUB_FAIL_CONFIG_KEY")
-      echo "STUB: simulated failure on $3" >&2
-      exit 1
-      ;;
-  esac
+if [ "$1" = "config" ] && [ "$2" = "set" ]; then
+  # Simulate what Hermes's real CLI does: `config set` rewrites
+  # config.yaml via its own atomic write, which means the LIVE file's
+  # permission bits can differ from whatever they were before this
+  # process ever started -- this is the real mechanism behind the
+  # ENGINEERING-1c mode-preservation bug (a later call in this same
+  # sequence failing must restore the file to its ORIGINAL mode, not
+  # whatever mode Hermes's own rewrite happened to leave it in).
+  if [ -n "${HERMES_STUB_CONFIG_SET_REWRITES_MODE:-}" ] && [ -n "${HERMES_HOME:-}" ] && [ -f "$HERMES_HOME/config.yaml" ]; then
+    chmod "$HERMES_STUB_CONFIG_SET_REWRITES_MODE" "$HERMES_HOME/config.yaml"
+  fi
+  if [ -n "${HERMES_STUB_FAIL_CONFIG_KEY:-}" ] && [ "$3" = "$HERMES_STUB_FAIL_CONFIG_KEY" ]; then
+    echo "STUB: simulated failure on $3" >&2
+    exit 1
+  fi
 fi
 exit 0
 """
@@ -648,20 +681,106 @@ def test_gateway_not_running_is_not_stopped_but_is_started(sandbox):
 
 
 def test_gateway_status_negative_phrase_containing_running_substring_is_not_misread_as_running(sandbox):
-    """Regression guard for a real false-positive risk: naive
-    `grep -qi running` on `hermes gateway status`'s output would match the
-    substring "running" inside "not running" and incorrectly treat a
-    STOPPED gateway as running. Confirm the stub's default "not running"
-    phrasing (which contains that exact substring) is correctly read as
-    NOT running -- i.e. `gateway stop` is never called for it."""
+    """Regression guard for a REAL false-positive bug caught live while
+    building this classifier: Hermes's own real output for "no detached
+    fallback process" is the literal phrase "No fallback process is
+    running" -- which contains "is running" as a substring ("process IS
+    RUNNING") despite meaning the opposite. A naive POSITIVE-checked-first
+    classifier misclassified this exact phrase as running. Confirm it's
+    still correctly read as NOT running -- i.e. `gateway stop` is never
+    called for it."""
     _write_client_env(sandbox["fieldkit_root"], "acme")
     result = _run(
         "acme", sandbox,
-        extra_env={"HERMES_STUB_STOPPED_TEXT": "Gateway: not running"},
+        extra_env={
+            "HERMES_STUB_STOPPED_TEXT": (
+                "⚠ Gateway service is registered but launchd is not supervising it\n"
+                "✗ No fallback process is running"
+            ),
+        },
     )
     assert result.returncode == 0, result.stderr
     calls = _log_calls(sandbox)
     assert not any("gateway stop" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# ENGINEERING-3, THE ACTUAL FIX: the classifier must recognize this
+# machine's REAL installed Hermes's status output, not just generic
+# "running"/"not running" substrings. Confirmed via live reproduction: the
+# real, most common output line -- "✓ Gateway is supervised by launchd
+# (PID N)" -- contains neither "running" nor a negation of it, so the
+# original naive classifier misclassified a genuinely running gateway as
+# ambiguous and aborted every real install on this machine (safe, but
+# operationally broken). These tests use VERBATIM captures from this
+# machine's real `hermes gateway status` (both the default profile and
+# mercury's still-running leftover profile), not reconstructed strings.
+# ---------------------------------------------------------------------------
+
+_REAL_HERMES_STATUS_DEFAULT_PROFILE = """Launchd plist: /Users/sandeep_a_k/Library/LaunchAgents/ai.hermes.gateway.plist
+⚠ Service definition is stale relative to the current Hermes install
+  Run: hermes gateway start
+✓ Gateway is supervised by launchd (PID 462)
+  Auto-start at login and auto-restart on crash are available.
+
+Other profiles:
+  ✓ mercury          — PID 614
+"""
+
+_REAL_HERMES_STATUS_MERCURY_PROFILE = """Launchd plist: /Users/sandeep_a_k/Library/LaunchAgents/ai.hermes.gateway-mercury.plist
+✓ Service definition matches the current Hermes install
+✓ Gateway is supervised by launchd (PID 446)
+  Auto-start at login and auto-restart on crash are available.
+
+Other profiles:
+  ✓ default          — PID 462
+"""
+
+
+def _extract_gateway_status_function() -> str:
+    """Pull the real `_gateway_status() { ... }` function body verbatim out
+    of install_client.sh, so this test exercises the actual shipped
+    classifier logic -- not a hand-copied re-transcription of it that could
+    silently drift out of sync with the real script."""
+    src = _INSTALL_SCRIPT.read_text()
+    start = src.index("_gateway_status() {")
+    end = src.index("\n}\n", start) + 3
+    return src[start:end]
+
+
+@pytest.mark.parametrize(
+    "real_capture",
+    [_REAL_HERMES_STATUS_DEFAULT_PROFILE, _REAL_HERMES_STATUS_MERCURY_PROFILE],
+    ids=["real-default-profile-capture", "real-mercury-profile-capture"],
+)
+def test_classifier_recognizes_real_captured_hermes_running_output(tmp_path, real_capture):
+    """Both fixtures above are VERBATIM `hermes gateway status` output,
+    captured live and read-only from this machine's real installed Hermes
+    v0.20.5, against the real (still-running, untouched by this test)
+    default profile and mercury's leftover profile -- not invented
+    strings. Both must classify as "running". Exercises the real,
+    unmodified `_gateway_status` function extracted straight out of
+    install_client.sh, called against a tiny stub `hermes` that echoes the
+    verbatim capture, rather than re-deriving the classifier's logic by
+    hand in Python."""
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "hermes"
+    stub.write_text(f"#!/usr/bin/env bash\ncat <<'REALCAPTURE'\n{real_capture}\nREALCAPTURE\nexit 0\n")
+    stub.chmod(0o755)
+
+    script = _extract_gateway_status_function() + "\n_gateway_status\n"
+    result = subprocess.run(
+        ["/bin/bash", "-c", script],
+        # stub_dir first so the `hermes` lookup finds the stub, but the
+        # rest of the real PATH stays too -- the stub's own
+        # `#!/usr/bin/env bash` shebang needs `env` to still be able to
+        # find a real `bash` to execute it with.
+        env={"PATH": f"{stub_dir}:{os.environ.get('PATH', '')}", "HERMES_HOME": str(tmp_path)},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "running"
 
 
 def test_concurrent_install_refuses_immediately_via_lock(sandbox):
@@ -733,6 +852,41 @@ def test_failed_config_set_rolls_back_config_yaml_and_touches_zero_live_env_file
     assert leaked == [], f"leaked temp files: {leaked}"
 
 
+def test_failed_config_set_restores_config_yaml_ORIGINAL_mode_not_hermes_rewritten_mode(sandbox):
+    """THE ENGINEERING-1a FIX: `cp` alone preserves whatever mode the
+    destination inode CURRENTLY has at copy time -- but by the time a
+    LATER `hermes config set` call in this same sequence fails, Hermes's
+    own earlier `config set` calls may have already rewritten config.yaml
+    via its own atomic write, leaving it with a different (often more
+    permissive) mode than it had before this script ever ran. Confirmed
+    live: a 0640 original became 0666 after a simulated failure using `cp`
+    alone for restore. The fix captures the ORIGINAL mode explicitly
+    before any mutation and re-applies it explicitly on rollback,
+    independent of whatever mode the file has by the time of failure."""
+    config_yaml = sandbox["hermes_home"] / "config.yaml"
+    config_yaml.write_text("model:\n  provider: original-provider\n")
+    os.chmod(config_yaml, 0o640)
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox,
+        extra_env={
+            "HERMES_STUB_FAIL_CONFIG_KEY": "skills.external_dirs",
+            # Simulates model.provider's own `config set` call rewriting
+            # config.yaml with a permissive mode, same as the real `hermes`
+            # CLI's own atomic-write behavior -- BEFORE the later
+            # skills.external_dirs call fails.
+            "HERMES_STUB_CONFIG_SET_REWRITES_MODE": "666",
+        },
+    )
+    assert result.returncode != 0
+    assert config_yaml.read_text() == "model:\n  provider: original-provider\n"
+    assert stat.S_IMODE(config_yaml.stat().st_mode) == 0o640, (
+        "config.yaml's mode must be restored to its ORIGINAL value (0640), "
+        "not whatever mode hermes's own config-set rewrite left it in (0666)"
+    )
+
+
 def test_failed_config_set_with_no_preexisting_config_yaml_deletes_it_not_leaves_partial(sandbox):
     """The other half of the ENGINEERING-1 fix: on a machine where
     config.yaml never existed before this install attempt (this run's own
@@ -752,6 +906,71 @@ def test_failed_config_set_with_no_preexisting_config_yaml_deletes_it_not_leaves
     assert not config_yaml.exists()
     assert not (sandbox["fieldkit_root"] / ".env").exists()
     assert not (sandbox["hermes_home"] / ".env").exists()
+
+
+def test_failed_config_set_leaves_client_source_env_permissions_untouched(sandbox):
+    """THE ENGINEERING-1b FIX: an earlier version chmod'd the client's own
+    SOURCE .env (a real, pre-existing file) to 0600 immediately after the
+    --dry-run check -- well before the fallible `hermes config set`
+    sequence -- so a failed install still left one real file mutated,
+    contradicting "zero filesystem mutation on failure." That chmod now
+    happens only as part of the final commit, after every fallible step
+    has already succeeded. Confirmed here: a client .env deliberately left
+    at a non-default mode (0644) is STILL 0644 after a simulated
+    config-set failure -- the chmod line never ran."""
+    client_env = _write_client_env(sandbox["fieldkit_root"], "acme")
+    os.chmod(client_env, 0o644)
+
+    result = _run(
+        "acme", sandbox,
+        extra_env={"HERMES_STUB_FAIL_CONFIG_KEY": "model.default"},
+    )
+    assert result.returncode != 0
+    assert stat.S_IMODE(client_env.stat().st_mode) == 0o644, (
+        "the client source .env's permissions must be untouched by a "
+        "failed install -- the chmod 600 must only happen after the "
+        "fallible hermes config set sequence has fully succeeded"
+    )
+
+
+def test_hermes_env_committed_before_root_env_governs_live_dispatch_first(sandbox):
+    """THE ENGINEERING-1c FIX: the two final commits (Hermes's .env, then
+    root .env) are still two sequential operations, not a single atomic
+    unit -- POSIX offers no true multi-file transaction primitive. The
+    defensible choice: commit Hermes's .env FIRST, since it's the file
+    that actually governs LIVE SKILL DISPATCH (see the module docstring's
+    "Why CLIENT_NAME is also written into Hermes's own .env" section) --
+    the exact path issue #59 was about -- so if the second commit (root
+    .env) ever fails after the first succeeds, the file that matters most
+    for #59 is already correct. Forced here via macOS's `chflags uchg`
+    (user-immutable) on a PRE-EXISTING root .env, which blocks a `mv -f`
+    onto it without restricting the directory's general writability (so
+    the earlier writability preflight still passes -- this specifically
+    exercises the LATE two-file-commit failure, not an early abort)."""
+    if sys.platform != "darwin":
+        pytest.skip("chflags is macOS-specific; this test needs a different "
+                     "immutability mechanism on other platforms")
+
+    root_env = sandbox["fieldkit_root"] / ".env"
+    root_env.write_text("CLIENT_NAME=preexisting\nFIELDKIT_ROOT=/preexisting\n")
+    subprocess.run(["chflags", "uchg", str(root_env)], check=True)
+    try:
+        _write_client_env(sandbox["fieldkit_root"], "acme")
+        result = _run("acme", sandbox, "--no-restart")
+        assert result.returncode != 0
+        assert "already switched to 'acme'" in result.stderr
+        assert "governs live hermes skill dispatch" in result.stderr.lower()
+
+        # Hermes's .env (the file that matters most for #59) IS already
+        # correctly committed, despite the overall install failing.
+        hermes_env_content = (sandbox["hermes_home"] / ".env").read_text()
+        assert "CLIENT_NAME=acme" in hermes_env_content
+
+        # root .env's rename genuinely failed -- still the pre-existing
+        # content, not "acme".
+        assert root_env.read_text() == "CLIENT_NAME=preexisting\nFIELDKIT_ROOT=/preexisting\n"
+    finally:
+        subprocess.run(["chflags", "nouchg", str(root_env)], check=True)
 
 
 def test_cleanup_trap_installed_immediately_after_each_mktemp_not_only_after_both():
@@ -834,6 +1053,36 @@ def test_stale_profile_confirmed_running_aborts_before_any_mutation(sandbox):
     assert (stale_profile_dir / ".env").read_text() == "TELEGRAM_BOT_TOKEN=stale-should-not-be-touched\n"
 
 
+def test_stale_profile_running_check_happens_before_ANY_mutation_not_just_before_env_files(sandbox):
+    """THE SECURITY-5a FIX: an earlier version ran the stale-profile check
+    AFTER preflight command/writability checks, HERMES_HOME creation and
+    chmod, lock acquisition, and secret temp-file staging -- meaning a
+    "checked before touching anything" claim was false; several real
+    mutations already happened before the abort. Confirmed here by giving
+    HERMES_HOME a distinctive starting mode (0755, not the 0700 this script
+    would normally set) and confirming it is STILL 0755 after an aborted
+    run -- proving the `chmod 700 "$HERMES_HOME"` preflight line, and
+    everything after it (lock, staging), never executed."""
+    os.chmod(sandbox["hermes_home"], 0o755)
+    stale_profile_dir = sandbox["hermes_home"] / "profiles" / "mercury"
+    stale_profile_dir.mkdir(parents=True)
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_PROFILE_STATUS_mercury": "running"},
+    )
+    assert result.returncode != 0
+
+    # HERMES_HOME's mode is untouched -- the preflight chmod never ran.
+    assert stat.S_IMODE(sandbox["hermes_home"].stat().st_mode) == 0o755
+    # No lock was ever taken.
+    assert not (sandbox["hermes_home"] / ".install_client.lock").exists()
+    # No staged temp files were ever created.
+    assert list(sandbox["hermes_home"].glob(".install_client.*")) == []
+    assert list(sandbox["fieldkit_root"].glob(".install_client.*")) == []
+
+
 def test_stale_profile_ambiguous_status_aborts_same_as_running(sandbox):
     """An unconfirmable status for a stale profile is treated exactly like
     'confirmed running' -- fail closed, don't guess it's safe."""
@@ -861,6 +1110,47 @@ def test_stale_profile_confirmed_not_running_proceeds_with_cleanup_note(sandbox)
     assert (sandbox["fieldkit_root"] / ".env").read_text().count("CLIENT_NAME=acme") == 1
     assert "mercury" in result.stdout
     assert "hermes profile delete mercury" in result.stdout
+
+
+def test_toctou_recheck_refuses_gateway_start_if_stale_profile_starts_in_the_interim(sandbox):
+    """THE SECURITY-5b FIX: a stale non-default profile's gateway could, in
+    principle, start running in the window between the installer's FIRST
+    check (before any mutation) and the moment it actually calls `hermes
+    gateway start` for the newly-switched default profile -- the first
+    check alone can't catch that race. Simulated via a stub that reports
+    "not running" on the first status query for this profile (the early
+    check) and "running" on every query after (the recheck immediately
+    before `gateway start`). The install's file changes are NOT reverted
+    (they're already correct for the new client), but starting the new
+    gateway is refused -- so this script never itself creates a moment
+    where two gateways with different clients' credentials are both live."""
+    stale_profile_dir = sandbox["hermes_home"] / "profiles" / "mercury"
+    stale_profile_dir.mkdir(parents=True)
+    counter_dir = sandbox["hermes_home"] / "toctou_counters"
+    counter_dir.mkdir()
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox,  # deliberately WITHOUT --no-restart: the TOCTOU
+        # recheck only runs on the path that's about to call `gateway start`.
+        extra_env={"HERMES_STUB_TOCTOU_COUNTER_DIR": str(counter_dir)},
+    )
+    assert result.returncode != 0
+    assert "started running between this" in result.stderr.lower() or "race" in result.stderr.lower()
+    assert "mercury" in result.stderr
+
+    # The file switch itself is NOT reverted -- both live files already
+    # correctly reflect 'acme'.
+    assert (sandbox["fieldkit_root"] / ".env").read_text().count("CLIENT_NAME=acme") == 1
+    assert "CLIENT_NAME=acme" in (sandbox["hermes_home"] / ".env").read_text()
+
+    # But the new gateway was never actually started.
+    calls = _log_calls(sandbox)
+    assert not any("gateway start" in c for c in calls)
+
+    # Confirms the TOCTOU mechanism actually fired twice (early + late),
+    # not that the test accidentally only ran the check once.
+    assert int((counter_dir / "mercury").read_text().strip()) >= 2
 
 
 def test_no_stale_profiles_prints_no_retirement_section(sandbox):
