@@ -168,10 +168,17 @@ if [ "$1" = "list" ] && [ "$#" -eq 1 ]; then
   exit 0
 fi
 if [ "$1" = "list" ] && [ -n "${2:-}" ]; then
-  # `launchctl list <label>` -- a single-service lookup. Real launchctl
-  # dumps a full plist-like dict; this stub only ever needs to expose a
-  # `"PID" = N;` line for a live one, since that's all the script's own
-  # _launchctl_label_has_live_pid parser looks for.
+  # `launchctl list <label>` -- a single-service lookup. The install
+  # script no longer issues this call at all (round 6: it now parses the
+  # PID directly out of the bare `launchctl list` table above instead) --
+  # this branch exists purely so a test can PROVE that by making it fail
+  # loudly (HERMES_STUB_LAUNCHCTL_LABEL_QUERY_FAILS, simulating codex's
+  # real observed exit 75) and confirming the install still behaves
+  # correctly, since it should never reach this branch in the first place.
+  if [ -n "${HERMES_STUB_LAUNCHCTL_LABEL_QUERY_FAILS:-}" ]; then
+    echo "STUB: simulated launchctl list <label> failure (exit 75)" >&2
+    exit 75
+  fi
   if [ -n "$LIST_FILE" ] && [ -f "$LIST_FILE" ]; then
     PID="$(awk -F'\\t' -v label="$2" '$3 == label {print $1}' "$LIST_FILE" | head -n1)"
     if [ -n "$PID" ] && [ "$PID" != "-" ]; then
@@ -1421,6 +1428,46 @@ def test_orphaned_launchd_service_with_no_profile_directory_is_detected_and_bloc
     assert "orphaned" in result.stderr
     assert "confirmed running" in result.stderr.lower()
     assert not (sandbox["fieldkit_root"] / ".env").exists()
+
+
+def test_orphan_detection_survives_a_failing_label_specific_query(sandbox):
+    """THE SECURITY-5 ROUND-6 FIX, as codex's exact combined regression:
+    the bare `launchctl list` call succeeds and ALREADY shows a live PID
+    for an orphaned label (`999  0  ai.hermes.gateway-orphaned`) -- but a
+    SEPARATE, per-label `launchctl list ai.hermes.gateway-orphaned` query
+    fails on its own (simulated here with the codex-observed exit 75).
+    A prior version of this script issued that second query to decide
+    aliveness and silently read its failure as "not running", discarding
+    the positive PID evidence the bare list had already provided --
+    installer exits 0, both .env files get written, orphan reported as
+    confirmed-not-running while actually alive with PID 999. Fixed by
+    parsing the PID directly out of the bare list's own output and never
+    issuing that second query at all. This test proves the fix by making
+    the (now-unused) second-query branch fail loudly if it's ever hit --
+    the install must still correctly abort."""
+    _write_launchctl_entries(sandbox, [
+        ("462", "0", "ai.hermes.gateway"),
+        ("999", "0", "ai.hermes.gateway-orphaned"),
+    ])
+    assert not (sandbox["hermes_home"] / "profiles" / "orphaned").exists()
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_LAUNCHCTL_LABEL_QUERY_FAILS": "1"},
+    )
+    assert result.returncode != 0
+    assert "orphaned" in result.stderr
+    assert "confirmed running" in result.stderr.lower()
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+    assert not (sandbox["hermes_home"] / ".env").exists()
+
+    # Confirm the fix's actual mechanism: the install never even issues
+    # the fragile per-label query in the first place, so its simulated
+    # failure was never reached -- not that the install happened to
+    # tolerate a failure it actually hit.
+    calls = _log_calls(sandbox)
+    assert not any("list ai.hermes.gateway-orphaned" in c for c in calls)
 
 
 def test_orphaned_launchd_service_with_no_live_pid_does_not_block(sandbox):

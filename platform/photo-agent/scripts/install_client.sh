@@ -555,16 +555,35 @@ _contains() {
   return 1
 }
 
-# _launchctl_gateway_candidates -- echoes, one per line, the profile-name
-# portion of every LOADED `ai.hermes.gateway-<name>` launchd service,
-# enumerated DIRECTLY via `launchctl list` -- independent of whether
-# `$HERMES_HOME/profiles/<name>/` still exists as a directory. This is
-# what catches an ORPHANED service: a profile directory that was deleted
-# or renamed, whose launchd service definition is nonetheless still loaded
-# and potentially alive with credentials in memory -- a scenario Hermes's
-# own source acknowledges renamed/orphan profiles create. The bare
-# `ai.hermes.gateway` label (the DEFAULT profile -- the one this script
-# itself manages) is deliberately excluded; it is never "stale".
+# _launchctl_gateway_candidates -- echoes, one per line, "<pid-or-dash><TAB><name>"
+# for every LOADED `ai.hermes.gateway-<name>` launchd service, enumerated
+# DIRECTLY via a SINGLE bare `launchctl list` call -- independent of
+# whether `$HERMES_HOME/profiles/<name>/` still exists as a directory.
+# This is what catches an ORPHANED service: a profile directory that was
+# deleted or renamed, whose launchd service definition is nonetheless
+# still loaded and potentially alive with credentials in memory -- a
+# scenario Hermes's own source acknowledges renamed/orphan profiles
+# create. The bare `ai.hermes.gateway` label (the DEFAULT profile -- the
+# one this script itself manages) is deliberately excluded; it is never
+# "stale".
+#
+# The PID column is carried through here (not just the name) so the
+# caller can classify aliveness directly from THIS SAME bare-list output
+# -- deliberately NOT via a second, separate `launchctl list <label>`
+# query per candidate. An earlier version of this script's caller did
+# issue that second per-label query, and codex's round-6 review fully
+# reproduced a fail-open bug in it: the bare list can succeed and already
+# show a live PID for an orphaned label (e.g. `999  0
+# ai.hermes.gateway-orphaned`), while the SEPARATE follow-up
+# `launchctl list ai.hermes.gateway-orphaned` query fails on its own
+# (observed exit 75) -- a failure that was then silently swallowed and
+# read as "no live PID", discarding the positive evidence the bare list
+# had already provided and letting the install proceed right underneath
+# a live orphan. There is no need for that second query at all: the bare
+# list's own PID column is already the authoritative, direct answer for
+# every label it lists -- reusing it here removes both the fail-open bug
+# and its root cause (a second fallible network round-trip to launchd)
+# in one move, rather than trying to make that second query fail closed.
 #
 # TWO distinct "nothing found" cases, handled differently -- do not
 # conflate them:
@@ -600,26 +619,8 @@ _launchctl_gateway_candidates() {
     return 1
   fi
   printf '%s\n' "$out" \
-    | awk '$3 ~ /^ai\.hermes\.gateway-/ {print $3}' \
-    | sed -E 's/^ai\.hermes\.gateway-//'
+    | awk '$3 ~ /^ai\.hermes\.gateway-/ {sub(/^ai\.hermes\.gateway-/, "", $3); print $1 "\t" $3}'
   return 0
-}
-
-# _launchctl_label_has_live_pid LABEL -- "running" if `launchctl list
-# LABEL` shows a numeric PID (a live, launchd-confirmed process), else
-# "not-running" (label not loaded at all, or loaded with no PID). Used as
-# a direct, independent aliveness signal for orphaned services -- `hermes
-# -p <name> gateway status` may itself behave unpredictably for a profile
-# whose directory no longer exists, so this doesn't rely on it for the
-# specifically-orphaned case.
-_launchctl_label_has_live_pid() {
-  local label="$1" line
-  line="$(launchctl list "$label" 2>/dev/null | grep '"PID"')" || true
-  if printf '%s' "$line" | grep -qE '[0-9]'; then
-    echo "running"
-  else
-    echo "not-running"
-  fi
 }
 
 # _abort_if_stale_profiles_running early|late -- the message differs by
@@ -680,20 +681,38 @@ _abort_if_stale_profiles_running() {
     fi
     exit 1
   fi
-  while IFS= read -r p; do
+  # launchctl_pid_labels collects the NAMES that the bare `launchctl list`
+  # call above already showed a live numeric PID for -- read straight out
+  # of $launchctl_raw, the SAME single query already captured, rather than
+  # issuing a second `launchctl list <label>` per candidate. codex's
+  # round-6 review fully reproduced why a second query is actively wrong,
+  # not just redundant: that second, separate query can itself fail
+  # (observed exit 75) even when the bare list it's re-deriving already
+  # succeeded and already contained the live-PID evidence needed -- and a
+  # prior version of this script silently swallowed that second failure
+  # and read it as "not running", discarding positive evidence already in
+  # hand. Parsing $launchctl_raw directly has no second round-trip to
+  # launchd to fail in the first place.
+  local launchctl_pid_labels=()
+  while IFS=$'\t' read -r pid p; do
     [ -n "$p" ] || continue
     _contains "$p" "${candidates[@]:-}" || candidates+=("$p")
+    if printf '%s' "$pid" | grep -qE '^[0-9]+$'; then
+      launchctl_pid_labels+=("$p")
+    fi
   done <<< "$launchctl_raw"
 
   for p in "${candidates[@]:-}"; do
     [ -n "$p" ] || continue
-    # A launchctl-confirmed live PID for this profile's label is direct,
-    # independent evidence -- it wins outright regardless of what `hermes
-    # -p <name> gateway status` says (which may itself be unreliable for
-    # an orphaned profile with no directory). Only when launchctl shows no
-    # live PID for this label (or has no opinion, e.g. not macOS) does the
-    # existing CLI-based check apply, exactly as before.
-    if [ "$(_launchctl_label_has_live_pid "ai.hermes.gateway-$p")" = "running" ]; then
+    # A launchctl-confirmed live PID for this profile's label (from the
+    # single bare-list query above) is direct, independent evidence -- it
+    # wins outright regardless of what `hermes -p <name> gateway status`
+    # says (which may itself be unreliable for an orphaned profile with no
+    # directory). Only when launchctl showed no live PID for this label
+    # (or had no opinion at all, e.g. not macOS, or the label is a
+    # directory-based candidate launchctl never listed) does the existing
+    # CLI-based check apply, exactly as before.
+    if _contains "$p" "${launchctl_pid_labels[@]:-}"; then
       stale_running+=("$p")
       continue
     fi
