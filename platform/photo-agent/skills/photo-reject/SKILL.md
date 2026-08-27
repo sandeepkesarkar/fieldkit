@@ -67,3 +67,14 @@ Run the script once and do not retry. Report the result as follows:
 If the exit code is non-zero, report it as an error: "Script failed (exit <code>): <output>"
 If the script exits with code 0 and no output, report: "No pending approval."
 Otherwise relay the output verbatim. Do not summarise or paraphrase.
+
+> **Contract (issue #63):** exit 0 with EMPTY stdout means "nothing was
+> pending" — that is the ONLY case with no output. A successful rejection
+> always prints a one-line confirmation (e.g. `Rejected: <project>`) before
+> exiting 0, so never report "No pending approval" when stdout is non-empty,
+> even though the exit code is 0 in both cases — check the output, not just
+> the exit code. Lock contention (another decision already being processed)
+> also exits 0 with non-empty output (e.g. `Already processing — try again
+> in a moment.`) — it falls under "otherwise relay the output verbatim"
+> above like any other non-empty-output case, not under "No pending
+> approval".

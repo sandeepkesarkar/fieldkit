@@ -118,6 +118,16 @@ def test_no_pending_approval_reject_exits_silently(mocker, env, lock_mock):
     main(_REJECT_ARGS)  # must not raise
 
 
+def test_no_pending_approval_prints_nothing_to_stdout(mocker, env, lock_mock, capsys):
+    """Issue #63: the genuine no-pending-approval case must be the ONLY one that
+    produces empty stdout — this is the signal Hermes's output-handling rule
+    relies on to distinguish it from a successful approve/reject."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
+    main(_APPROVE_ARGS)
+    assert capsys.readouterr().out == ""
+
+
 # ---------------------------------------------------------------------------
 # Approve path — actions
 # ---------------------------------------------------------------------------
@@ -172,11 +182,43 @@ def test_approve_clears_pending_approval(base):
     ca.state.clear_pending_approval.assert_called_once()
 
 
+def test_approve_confirmation_not_printed_if_clear_pending_approval_fails(base, capsys):
+    """Issue #63 follow-up: the 'Approved: <project>' confirmation must only ever
+    reach stdout after state.clear_pending_approval() has actually succeeded — if
+    it raises, the approval hasn't genuinely completed (the pending record is
+    still there), so the confirmation must not be printed even though every
+    other approve side effect (email, activity log, FB enqueue) already ran."""
+    import scripts.check_approval as ca
+    ca.state.clear_pending_approval.side_effect = RuntimeError("disk full")
+    with pytest.raises(RuntimeError):
+        main(_APPROVE_ARGS)
+    out = capsys.readouterr().out
+    assert "Approved:" not in out
+
+
+def test_reject_confirmation_not_printed_if_clear_pending_approval_fails(base, capsys):
+    """Same guarantee as above, for the reject path."""
+    import scripts.check_approval as ca
+    ca.state.clear_pending_approval.side_effect = RuntimeError("disk full")
+    with pytest.raises(RuntimeError):
+        main(_REJECT_ARGS)
+    out = capsys.readouterr().out
+    assert "Rejected:" not in out
+
+
 def test_approve_logs_approved(base):
     """approve path calls activity_log.log_approved() with the project name."""
     import scripts.check_approval as ca
     main(_APPROVE_ARGS)
     ca.activity_log.log_approved.assert_called_once_with(_PROJECT)
+
+
+def test_approve_prints_unambiguous_confirmation_to_stdout(base, capsys):
+    """Issue #63: a successful approval must print a one-line stdout confirmation
+    so Hermes never mistakes it for the no-pending-approval no-op case."""
+    main(_APPROVE_ARGS)
+    out = capsys.readouterr().out
+    assert out == f"Approved: {_PROJECT}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +296,40 @@ def test_reject_logs_rejected(base):
     import scripts.check_approval as ca
     main(_REJECT_ARGS)
     ca.activity_log.log_rejected.assert_called_once_with(_PROJECT)
+
+
+def test_reject_prints_unambiguous_confirmation_to_stdout(base, capsys):
+    """Issue #63: a successful rejection must print a one-line stdout confirmation
+    so Hermes never mistakes it for the no-pending-approval no-op case."""
+    main(_REJECT_ARGS)
+    out = capsys.readouterr().out
+    assert out == f"Rejected: {_PROJECT}\n"
+
+
+def test_approve_and_no_pending_stdout_are_distinguishable(mocker, env, lock_mock, capsys):
+    """Issue #63 end-to-end: capture stdout for a successful approve and for the
+    genuine no-pending-approval case in the same test and assert they differ —
+    this is exactly the ambiguity Hermes's output-handling rule was fooled by
+    before check_approval.py printed anything on success."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=_PENDING)
+    mocker.patch("scripts.check_approval.state.clear_pending_approval")
+    mocker.patch("scripts.check_approval.drive.delete")
+    mocker.patch("scripts.check_approval._send_approval_email")
+    mocker.patch("scripts.check_approval._notify_admin")
+    mocker.patch("scripts.check_approval.activity_log.log_approved")
+    mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
+    mocker.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    main(_APPROVE_ARGS)
+    success_out = capsys.readouterr().out
+    assert success_out != ""
+
+    mocker.patch("scripts.check_approval.state.get_pending_approval", return_value=None)
+    main(_APPROVE_ARGS)
+    no_pending_out = capsys.readouterr().out
+
+    assert no_pending_out == ""
+    assert success_out != no_pending_out
 
 
 # ---------------------------------------------------------------------------
@@ -580,10 +656,23 @@ def test_activity_log_error_on_reject_does_not_block_state_clear(base, mocker):
 # state.json race.
 # ---------------------------------------------------------------------------
 
-def test_lock_contention_exits_silently(mocker, env):
+def test_lock_contention_takes_no_action(mocker, env):
     """If check_approval.lock is held by another instance, main() exits without taking action."""
     mocker.patch("scripts.check_approval._load_env")
     mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=None)
     mock_get_pending = mocker.patch("scripts.check_approval.state.get_pending_approval")
     main(_APPROVE_ARGS)
     mock_get_pending.assert_not_called()
+
+
+def test_lock_contention_prints_distinct_nonempty_stdout(mocker, env, capsys):
+    """Issue #63 follow-up: lock contention must NOT be silent like the genuine
+    no-pending-approval case — it means another decision is actively being
+    processed, not that nothing is pending. It needs its own unambiguous,
+    non-empty stdout signal, distinct from both an approve/reject confirmation
+    and the empty-stdout no-pending-approval case."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=None)
+    main(_APPROVE_ARGS)
+    out = capsys.readouterr().out
+    assert out == "Already processing — try again in a moment.\n"
