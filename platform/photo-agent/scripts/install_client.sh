@@ -564,15 +564,45 @@ _contains() {
 # and potentially alive with credentials in memory -- a scenario Hermes's
 # own source acknowledges renamed/orphan profiles create. The bare
 # `ai.hermes.gateway` label (the DEFAULT profile -- the one this script
-# itself manages) is deliberately excluded; it is never "stale". Silently
-# yields nothing if `launchctl` isn't on PATH (non-macOS) rather than
-# erroring -- this source is additive to the directory scan, never a hard
-# requirement of it.
+# itself manages) is deliberately excluded; it is never "stale".
+#
+# TWO distinct "nothing found" cases, handled differently -- do not
+# conflate them:
+#   1. `launchctl` isn't on PATH at all (non-macOS). Legitimately not an
+#      error: orphan detection is additive to the directory scan on this
+#      platform, never a hard requirement of it. Yields nothing, sets no
+#      failure flag.
+#   2. `launchctl` IS on PATH but `launchctl list` itself FAILS (nonzero
+#      exit -- a permission issue, launchd transiently unavailable, etc.).
+#      This is NOT "no services found" -- it's "the answer is unknown",
+#      and a prior version of this function treated the two identically
+#      (silently returning empty either way), which is fail-OPEN: an
+#      orphaned gateway with no profile directory would go completely
+#      undetected and the install would proceed right underneath it,
+#      directly contradicting this script's own "running or unconfirmable
+#      aborts" policy applied everywhere else. Communicated to the caller
+#      via this function's own exit status (1 = enumeration failed, 0 =
+#      succeeded, possibly with zero candidates) -- NOT a global variable
+#      mutated from inside the function, because the caller consumes this
+#      function's output via `<(...)` process substitution or `$(...)`
+#      command substitution, BOTH of which run the function body in a
+#      SUBSHELL in bash; a variable assignment made inside that subshell
+#      is invisible to the parent shell once the subshell exits. This was
+#      caught and fixed during this round's own implementation, before it
+#      ever shipped as a real bug: an earlier draft set a global flag
+#      inside this function and checked it in the caller, which silently
+#      never worked for exactly this reason.
 _launchctl_gateway_candidates() {
   command -v launchctl >/dev/null 2>&1 || return 0
-  launchctl list 2>/dev/null \
+  local out rc
+  out="$(launchctl list 2>&1)"; rc=$?
+  if [ $rc -ne 0 ]; then
+    return 1
+  fi
+  printf '%s\n' "$out" \
     | awk '$3 ~ /^ai\.hermes\.gateway-/ {print $3}' \
     | sed -E 's/^ai\.hermes\.gateway-//'
+  return 0
 }
 
 # _launchctl_label_has_live_pid LABEL -- "running" if `launchctl list
@@ -612,10 +642,48 @@ _abort_if_stale_profiles_running() {
       _contains "$p" "${candidates[@]:-}" || candidates+=("$p")
     done
   fi
+  # Plain command substitution (not `< <(...)` process substitution) so
+  # the exit status is capturable at all -- process substitution's exit
+  # status is not visible to the enclosing command in bash, which is
+  # exactly why an earlier draft's failure-signaling attempt (a global
+  # variable mutated from inside the function) silently never worked (see
+  # that function's own comment for the full story).
+  #
+  # TWO more traps avoided here, both caught live while implementing this:
+  #   1. `local launchctl_raw=$(...)` (local + assignment on ONE line) is
+  #      a well-known bash gotcha where `$?` afterward reflects the
+  #      `local` builtin's own (always-0) exit status, not the command
+  #      substitution's -- `local` is declared on its own line instead.
+  #   2. Even with that split, `launchctl_raw="$(_launchctl_gateway_candidates)"`
+  #      as a bare assignment is a "simple command" whose own exit status
+  #      becomes the command substitution's exit status -- under this
+  #      script's `set -e`, a bare assignment like that failing aborts the
+  #      script IMMEDIATELY at that line, before the `if` below checking
+  #      $launchctl_rc ever runs at all (this was reproduced live: the
+  #      intended error message never printed, the script just silently
+  #      exited). Fixed with the standard idiom below: appending
+  #      `|| launchctl_rc=$?` makes the WHOLE statement's own exit status
+  #      always 0 (so `set -e` never fires here), while still capturing
+  #      the real failure code into launchctl_rc when the left side fails.
+  local launchctl_raw launchctl_rc=0
+  launchctl_raw="$(_launchctl_gateway_candidates)" || launchctl_rc=$?
+  if [ "$launchctl_rc" -ne 0 ]; then
+    echo "ERROR: 'launchctl list' failed — cannot confirm whether an orphaned," >&2
+    echo "non-default Hermes gateway service (one with no matching profile" >&2
+    echo "directory under $HERMES_HOME/profiles/, or any other) is currently" >&2
+    echo "loaded and running. Refusing to proceed on an unconfirmable answer —" >&2
+    echo "the same fail-closed policy this script applies to every other" >&2
+    echo "gateway-status check." >&2
+    if [ "$stage" = "late" ]; then
+      echo "$ROOT_ENV and $HERMES_ENV were ALREADY switched to '$CLIENT' above and are" >&2
+      echo "NOT being reverted -- only starting the new gateway is being refused." >&2
+    fi
+    exit 1
+  fi
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     _contains "$p" "${candidates[@]:-}" || candidates+=("$p")
-  done < <(_launchctl_gateway_candidates)
+  done <<< "$launchctl_raw"
 
   for p in "${candidates[@]:-}"; do
     [ -n "$p" ] || continue
@@ -848,6 +916,29 @@ if [ -f "$HERMES_CONFIG" ]; then
   chmod 600 "$HERMES_CONFIG_BACKUP"
 fi
 
+# Snapshot Hermes's .env -- content AND mode -- for the exact same reason
+# and at the exact same point as config.yaml just above: BEFORE the
+# fallible `hermes config set` sequence runs, not after it succeeds. A
+# prior version took this snapshot AFTER that sequence (right before the
+# file-commit renames instead), which is itself an unguarded, fallible
+# `cp`/`chmod` pair running under `set -e` with config.yaml ALREADY
+# applied by that point -- if the snapshot itself failed there, the script
+# would exit with config.yaml switched to the new client and no rollback
+# at all. Taking it here instead means a failure capturing this snapshot
+# happens before ANYTHING is mutated (the config-set sequence hasn't run
+# yet), so `set -e`'s plain abort is exactly the right, safe behavior for
+# it -- no rollback machinery is needed for a failure at this point.
+HERMES_ENV_EXISTED_BEFORE=0
+HERMES_ENV_BACKUP=""
+HERMES_ENV_ORIGINAL_MODE=""
+if [ -f "$HERMES_ENV" ]; then
+  HERMES_ENV_EXISTED_BEFORE=1
+  HERMES_ENV_ORIGINAL_MODE="$(_file_mode "$HERMES_ENV")"
+  HERMES_ENV_BACKUP="$HERMES_ENV.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$HERMES_ENV" "$HERMES_ENV_BACKUP"
+  chmod 600 "$HERMES_ENV_BACKUP"
+fi
+
 # Restores config.yaml to exactly its pre-install snapshot (content AND
 # mode), or deletes it if it didn't exist before this install attempt.
 # Shared by every failure path from this point on in the script: a
@@ -857,26 +948,59 @@ fi
 # while other live state stays on the old client. This is what closes the
 # "config.yaml already applied while both .env files are still old"
 # inconsistency a prior version of this script's error message implicitly
-# claimed couldn't happen. -----------------------------------------------
+# claimed couldn't happen.
+#
+# Reports its OWN actual outcome via its own echo statements (never
+# "Restored" unless the restore genuinely succeeded) and returns 1 on
+# failure -- a prior version's CALLERS printed "Restored $FILE" as an
+# assumed fact regardless of whether the cp/chmod inside actually
+# succeeded, which could itself lie about the true post-failure state.
+# Callers invoke this as `_restore_config_yaml || true` (not letting its
+# own nonzero return trip `set -e` early) so the script still reaches its
+# trailing "fix this and re-run" instructions even when the restore itself
+# failed -- the WARNING line already told the operator MANUAL INTERVENTION
+# is required at that point, which is a stronger signal than a truncated
+# script anyway. ------------------------------------------------------------
 _restore_config_yaml() {
   if [ "$CONFIG_EXISTED_BEFORE" -eq 1 ]; then
-    cp "$HERMES_CONFIG_BACKUP" "$HERMES_CONFIG" \
-      && chmod "$HERMES_CONFIG_ORIGINAL_MODE" "$HERMES_CONFIG" \
-      || echo "  WARNING: restoring $HERMES_CONFIG from $HERMES_CONFIG_BACKUP FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+    if cp "$HERMES_CONFIG_BACKUP" "$HERMES_CONFIG" && chmod "$HERMES_CONFIG_ORIGINAL_MODE" "$HERMES_CONFIG"; then
+      echo "  Restored $HERMES_CONFIG from $HERMES_CONFIG_BACKUP (mode $HERMES_CONFIG_ORIGINAL_MODE)" >&2
+    else
+      echo "  WARNING: restoring $HERMES_CONFIG from $HERMES_CONFIG_BACKUP FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+      return 1
+    fi
   else
-    rm -f "$HERMES_CONFIG" \
-      || echo "  WARNING: removing $HERMES_CONFIG FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+    if rm -f "$HERMES_CONFIG"; then
+      echo "  Removed $HERMES_CONFIG (it did not exist before this install attempt)" >&2
+    else
+      echo "  WARNING: removing $HERMES_CONFIG FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+      return 1
+    fi
+  fi
+}
+
+# Same contract as _restore_config_yaml above, for Hermes's .env.
+_restore_hermes_env() {
+  if [ "$HERMES_ENV_EXISTED_BEFORE" -eq 1 ]; then
+    if cp "$HERMES_ENV_BACKUP" "$HERMES_ENV" && chmod "$HERMES_ENV_ORIGINAL_MODE" "$HERMES_ENV"; then
+      echo "  Restored $HERMES_ENV from $HERMES_ENV_BACKUP (mode $HERMES_ENV_ORIGINAL_MODE)" >&2
+    else
+      echo "  WARNING: restoring $HERMES_ENV from $HERMES_ENV_BACKUP FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+      return 1
+    fi
+  else
+    if rm -f "$HERMES_ENV"; then
+      echo "  Removed $HERMES_ENV (it did not exist before this install attempt)" >&2
+    else
+      echo "  WARNING: removing $HERMES_ENV FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+      return 1
+    fi
   fi
 }
 
 _rollback_hermes_config_and_fail() {
   echo "ERROR: 'hermes config set' failed — rolling back and leaving the gateway STOPPED." >&2
-  _restore_config_yaml
-  if [ "$CONFIG_EXISTED_BEFORE" -eq 1 ]; then
-    echo "  Restored $HERMES_CONFIG from $HERMES_CONFIG_BACKUP (mode $HERMES_CONFIG_ORIGINAL_MODE)" >&2
-  else
-    echo "  Removed $HERMES_CONFIG (it did not exist before this install attempt)" >&2
-  fi
+  _restore_config_yaml || true
   echo "  $ROOT_ENV and $HERMES_ENV were NOT modified at all — both were still" >&2
   echo "  only uncommitted temp files at the point of failure, now discarded." >&2
   echo "  Fix whatever 'hermes config set' failed on, then re-run: install_client.sh $CLIENT" >&2
@@ -899,46 +1023,31 @@ HERMES_HOME="$HERMES_HOME" hermes config set model.provider "$HERMES_MODEL_PROVI
 HERMES_HOME="$HERMES_HOME" hermes config set model.default "$HERMES_MODEL_DEFAULT" || _rollback_hermes_config_and_fail
 HERMES_HOME="$HERMES_HOME" hermes config set skills.external_dirs "[\"$FIELDKIT_ROOT/platform/photo-agent/skills\"]" || _rollback_hermes_config_and_fail
 
-# --- Commit point: every fallible step above has succeeded. From here on,
-# two more fallible operations remain (the two file renames below) before
-# only the final gateway start is left. Neither rename is expected to fail
-# -- both are local, same-filesystem renames of already-validated, already-
-# staged temp files, about as reliable an operation as this script
-# performs -- but "not expected to fail" is not "provably cannot fail", and
-# a prior version of this script treated it as the latter: it backed up
-# Hermes's .env for audit purposes only, and printed "re-run to fix it"
-# guidance on a second-commit failure rather than actually rolling
-# anything back, while a first-commit failure didn't touch config.yaml at
-# all even though config.yaml had, by that point, already been switched to
-# the new client. Both were real gaps in the "no window where live files
-# disagree" claim this script makes. Fixed: config.yaml's already-captured
-# backup/mode (from before the `hermes config set` sequence) and a new,
-# equivalent backup/mode capture for Hermes's .env are BOTH kept available
-# until BOTH renames below have succeeded -- if either fails, whichever of
-# the three (config.yaml, and Hermes's .env if it was the one already
-# committed) already changed is rolled back to its exact pre-install state,
-# not left as "manual recovery guidance". ----------------------------------
-HERMES_ENV_EXISTED_BEFORE=0
-HERMES_ENV_BACKUP=""
-HERMES_ENV_ORIGINAL_MODE=""
-if [ -f "$HERMES_ENV" ]; then
-  HERMES_ENV_EXISTED_BEFORE=1
-  HERMES_ENV_ORIGINAL_MODE="$(_file_mode "$HERMES_ENV")"
-  HERMES_ENV_BACKUP="$HERMES_ENV.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$HERMES_ENV" "$HERMES_ENV_BACKUP"
-  chmod 600 "$HERMES_ENV_BACKUP"
-fi
-
-_restore_hermes_env() {
-  if [ "$HERMES_ENV_EXISTED_BEFORE" -eq 1 ]; then
-    cp "$HERMES_ENV_BACKUP" "$HERMES_ENV" \
-      && chmod "$HERMES_ENV_ORIGINAL_MODE" "$HERMES_ENV" \
-      || echo "  WARNING: restoring $HERMES_ENV from $HERMES_ENV_BACKUP FAILED -- MANUAL INTERVENTION REQUIRED." >&2
-  else
-    rm -f "$HERMES_ENV" \
-      || echo "  WARNING: removing $HERMES_ENV FAILED -- MANUAL INTERVENTION REQUIRED." >&2
-  fi
-}
+# --- Commit point: every fallible step above has succeeded, and both
+# config.yaml's and Hermes .env's pre-install snapshots (content + mode)
+# were ALREADY captured earlier, before the `hermes config set` sequence
+# ran (see the comment there) -- specifically so nothing fallible remains
+# unguarded between "config.yaml gets applied" and "a rollback path exists
+# for it". Two fallible operations remain here: the two file renames
+# below. Neither is expected to fail -- both are local, same-filesystem
+# renames of already-validated, already-staged temp files, about as
+# reliable an operation as this script performs -- but "not expected to
+# fail" is not "provably cannot fail", and a prior version of this script
+# treated it as the latter in two ways: it printed "re-run to fix it"
+# guidance on a second-rename failure rather than actually rolling
+# anything back, and its post-rename `chmod 600` calls (removed below —
+# see next paragraph) were themselves unguarded fallible operations that
+# could exit the script via bare `set -e` with config.yaml and/or Hermes's
+# .env already switched and no rollback triggered at all. -----------------
+#
+# The temp files staged earlier (chmod 600 "$ROOT_ENV_TMP" "$HERMES_ENV_TMP",
+# see the staging section above) are ALREADY mode 600 before either rename
+# below runs -- `mv`/rename(2) never changes a file's mode, only its
+# directory entry, confirmed directly (`mv -f` a 0600 file onto a new
+# name, the destination is still 0600). The post-rename `chmod 600` calls
+# a prior version had here were therefore both REDUNDANT and themselves an
+# unguarded failure point -- removed entirely rather than guarded, since
+# the correct fix for a redundant, avoidable mutation is to not perform it.
 
 # The client's own source .env's permissions are fixed here, as the first
 # real mutation of the commit phase -- deferred from validation time (see
@@ -956,23 +1065,25 @@ chmod 600 "$CLIENT_ENV" 2>/dev/null || true
 # about. If the SECOND rename below fails, this ordering plus the rollback
 # logic means either outcome is fully consistent: Hermes's .env (rolled
 # back along with config.yaml) ends up matching root .env's untouched old
-# state, never a mix. --------------------------------------------------
+# state, never a mix. Both `_restore_*` calls below are followed by
+# `|| true` so their own nonzero return (on a restore itself failing --
+# see their definitions above for why that's reported, not assumed away)
+# doesn't trip `set -e` before this block's own trailing diagnostic lines
+# have a chance to print. --------------------------------------------------
 mv -f "$HERMES_ENV_TMP" "$HERMES_ENV" || {
   echo "ERROR: failed to commit $HERMES_ENV -- rolling back config.yaml too (it was already applied by the successful 'hermes config set' sequence above), so nothing is left half-switched." >&2
-  _restore_config_yaml
-  echo "  Restored config.yaml to its pre-install state. Neither $HERMES_ENV nor $ROOT_ENV was modified. Re-run: install_client.sh $CLIENT" >&2
+  _restore_config_yaml || true
+  echo "  Neither $HERMES_ENV nor $ROOT_ENV was modified. Re-run: install_client.sh $CLIENT" >&2
   exit 1
 }
-chmod 600 "$HERMES_ENV"
 
 mv -f "$ROOT_ENV_TMP" "$ROOT_ENV" || {
   echo "ERROR: failed to commit $ROOT_ENV after $HERMES_ENV already succeeded -- rolling BOTH $HERMES_ENV and config.yaml back to their pre-install state, so nothing is left half-switched." >&2
-  _restore_hermes_env
-  _restore_config_yaml
-  echo "  Restored $HERMES_ENV and config.yaml. $ROOT_ENV was never modified (a failed rename leaves its target untouched, unlike a failed copy). Re-run: install_client.sh $CLIENT" >&2
+  _restore_hermes_env || true
+  _restore_config_yaml || true
+  echo "  $ROOT_ENV was never modified (a failed rename leaves its target untouched, unlike a failed copy). Re-run: install_client.sh $CLIENT" >&2
   exit 1
 }
-chmod 600 "$ROOT_ENV"
 
 if [ "$NO_RESTART" -eq 0 ]; then
   # TOCTOU recheck (issue #62 review Security-5b): re-verify no stale

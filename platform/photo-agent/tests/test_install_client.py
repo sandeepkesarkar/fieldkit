@@ -122,11 +122,46 @@ exit 0
 # single test, causing spurious failures unrelated to what's being tested.
 _LAUNCHCTL_STUB = """#!/usr/bin/env bash
 echo "STUB_LAUNCHCTL_CALL: $*" >> "$HERMES_STUB_LOG"
+
+# TOCTOU-race simulation for a genuinely ORPHANED service (no matching
+# profile directory at all): if HERMES_STUB_LAUNCHCTL_TOCTOU_COUNTER_FILE
+# is set, the FIRST bare `launchctl list` reports nothing (the orphan
+# hasn't "appeared" yet -- the early check); every query after that
+# (bare list, and the label-specific query) reports it present and alive.
+TOCTOU_COUNTER="${HERMES_STUB_LAUNCHCTL_TOCTOU_COUNTER_FILE:-}"
+TOCTOU_LABEL="${HERMES_STUB_LAUNCHCTL_TOCTOU_LABEL:-ai.hermes.gateway-orphaned}"
+if [ -n "$TOCTOU_COUNTER" ]; then
+  if [ "$1" = "list" ] && [ "$#" -eq 1 ]; then
+    COUNT=0
+    [ -f "$TOCTOU_COUNTER" ] && COUNT="$(cat "$TOCTOU_COUNTER")"
+    COUNT=$((COUNT + 1))
+    echo "$COUNT" > "$TOCTOU_COUNTER"
+    echo "462	0	ai.hermes.gateway"
+    if [ "$COUNT" -gt 1 ]; then
+      echo "999	0	$TOCTOU_LABEL"
+    fi
+    exit 0
+  fi
+  if [ "$1" = "list" ] && [ "$2" = "$TOCTOU_LABEL" ]; then
+    COUNT=0
+    [ -f "$TOCTOU_COUNTER" ] && COUNT="$(cat "$TOCTOU_COUNTER")"
+    if [ "$COUNT" -gt 1 ]; then
+      echo "\\"PID\\" = 999;"
+      exit 0
+    fi
+    exit 113
+  fi
+fi
+
 LIST_FILE="${HERMES_STUB_LAUNCHCTL_LIST_FILE:-}"
 if [ "$1" = "list" ] && [ "$#" -eq 1 ]; then
   # Bare `launchctl list` -- the whole table. Tab-separated PID/status/label
   # lines, matching real launchctl's own format, sourced from a file a test
   # can populate via HERMES_STUB_LAUNCHCTL_LIST_FILE.
+  if [ -n "${HERMES_STUB_LAUNCHCTL_LIST_FAILS:-}" ]; then
+    echo "STUB: simulated launchctl list failure" >&2
+    exit 1
+  fi
   if [ -n "$LIST_FILE" ] && [ -f "$LIST_FILE" ]; then
     cat "$LIST_FILE"
   fi
@@ -858,6 +893,64 @@ def test_classifier_recognizes_real_captured_hermes_running_output(tmp_path, rea
     assert result.stdout.strip() == "running"
 
 
+# THE ROUND-4 SUBSTRING-PRECEDENCE FIX, AS A REAL REGRESSION TEST: an
+# earlier round's fix for "No fallback process is running" (a negative
+# phrase containing "is running" as a literal substring) short-circuited
+# on that phrase and returned "not-running" immediately -- but Hermes's
+# own launchd_status() (the fallback-PID check) and
+# _print_gateway_process_mismatch() (an INDEPENDENT, broader process scan)
+# are two genuinely separate detection mechanisms that can disagree and
+# BOTH print in the SAME real output, reproduced directly from gateway.py's
+# real source shape (not invented): the fallback check finds nothing, but
+# the broader mismatch scan finds a live process anyway. The
+# implementation comment in install_client.sh referenced this exact
+# scenario as the reason for the round-4 fix; this is that scenario
+# committed as an actual, executable regression test, not just described
+# in prose.
+_HERMES_STATUS_COMBINED_NEGATIVE_AND_POSITIVE = """Launchd plist: /Users/sandeep_a_k/Library/LaunchAgents/ai.hermes.gateway-mercury.plist
+⚠ Gateway service is registered but launchd is not supervising it
+  launchd cannot manage the gateway on this macOS version.
+✗ No fallback process is running
+  Run: hermes gateway start
+  ⚠ Auto-start at login and auto-restart on crash are NOT available.
+
+⚠ Gateway process is running for this profile, but the service is not active
+  PID(s): 123
+  This is usually a manual foreground/tmux/nohup run, so `hermes gateway`
+  can refuse to start another copy until this process stops.
+"""
+
+
+def test_classifier_recognizes_real_hermes_process_service_mismatch_as_running(tmp_path):
+    """THE EXACT COMBINED CASE that made the round-3 classifier fail-open:
+    short-circuiting on "No fallback process is running" (checked FIRST,
+    before any positive check) returned "not-running" here even though a
+    live gateway PROCESS genuinely exists per the SAME output's own
+    independent mismatch warning. Fixed in round 4 by neutralizing the
+    negative phrase (stripping it from a COPY before the positive check
+    runs) instead of short-circuiting on it, so the independent positive
+    evidence a few lines later is still found. Must classify as
+    "running"."""
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "hermes"
+    stub.write_text(
+        "#!/usr/bin/env bash\ncat <<'REALCAPTURE'\n"
+        + _HERMES_STATUS_COMBINED_NEGATIVE_AND_POSITIVE
+        + "\nREALCAPTURE\nexit 0\n"
+    )
+    stub.chmod(0o755)
+
+    script = _extract_gateway_status_function() + "\n_gateway_status\n"
+    result = subprocess.run(
+        ["/bin/bash", "-c", script],
+        env={"PATH": f"{stub_dir}:{os.environ.get('PATH', '')}", "HERMES_HOME": str(tmp_path)},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "running"
+
+
 def test_concurrent_install_refuses_immediately_via_lock(sandbox):
     lock_dir = sandbox["hermes_home"] / ".install_client.lock"
     lock_dir.mkdir()
@@ -1406,6 +1499,66 @@ def test_orphan_check_runs_on_both_early_and_late_toctou_recheck(sandbox):
     # Confirms the check fired (at least) twice -- early AND late -- with
     # the launchctl-based scan active in both, not just directory-based.
     assert int((counter_dir / "mercury").read_text().strip()) >= 2
+
+
+def test_toctou_recheck_catches_a_TRUE_orphan_with_no_directory_at_all(sandbox):
+    """A STRONGER version of the test above, per review feedback that it
+    overstated what it proved: that test's "orphan" candidate had its
+    launchctl-reported PID present from the very FIRST query, so it never
+    actually exercised launchctl's own list output CHANGING between the
+    early and late checks -- only the ordinary directory-based mechanism
+    was genuinely racing there. This test instead has NO profile directory
+    at all (the true orphan scenario the whole feature exists for) and
+    makes `launchctl list`'s own bare output literally change between
+    calls: the orphaned service is entirely absent from the first query
+    (the early, pre-mutation check passes cleanly) and present with a live
+    PID on every query after (the late, pre-`gateway start` recheck)."""
+    assert not (sandbox["hermes_home"] / "profiles").exists()
+    toctou_counter = sandbox["hermes_home"] / "launchctl_toctou_counter"
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox,
+        extra_env={"HERMES_STUB_LAUNCHCTL_TOCTOU_COUNTER_FILE": str(toctou_counter)},
+    )
+    assert result.returncode != 0
+    assert "orphaned" in result.stderr
+    assert "started running between this" in result.stderr.lower() or "race" in result.stderr.lower()
+
+    # The file switch is NOT reverted -- both live files already correctly
+    # reflect 'acme' (same contract as the ordinary TOCTOU case).
+    assert (sandbox["fieldkit_root"] / ".env").read_text().count("CLIENT_NAME=acme") == 1
+    assert "CLIENT_NAME=acme" in (sandbox["hermes_home"] / ".env").read_text()
+
+    calls = _log_calls(sandbox)
+    assert not any("gateway start" in c for c in calls)
+    # The counter genuinely advanced past 1 -- proving launchctl was
+    # queried more than once and its answer changed, not that the test
+    # just got lucky on a single query.
+    assert int(toctou_counter.read_text().strip()) >= 2
+
+
+def test_launchctl_list_command_failure_aborts_the_install(sandbox):
+    """THE SECURITY-5 (round-5) FIX: a prior version of
+    _launchctl_gateway_candidates silently treated `launchctl list` itself
+    FAILING (nonzero exit -- a permission issue, launchd transiently
+    unavailable, etc.) identically to "no services found", which is
+    fail-OPEN: an orphaned gateway with no profile directory would go
+    completely undetected and the install would proceed right underneath
+    it. Confirmed here: with the stub `launchctl list` exiting nonzero,
+    the install must abort with a clear message, before touching any live
+    file -- exactly the same "running or unconfirmable aborts" policy
+    already applied to every per-profile status check."""
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox, "--no-restart",
+        extra_env={"HERMES_STUB_LAUNCHCTL_LIST_FAILS": "1"},
+    )
+    assert result.returncode != 0
+    assert "launchctl list" in result.stderr.lower()
+    assert "unconfirmable" in result.stderr.lower() or "cannot confirm" in result.stderr.lower()
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+    assert not (sandbox["hermes_home"] / ".env").exists()
 
 
 # ---------------------------------------------------------------------------
