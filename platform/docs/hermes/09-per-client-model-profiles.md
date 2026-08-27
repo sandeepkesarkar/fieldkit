@@ -166,7 +166,31 @@ is still accurate and was genuinely useful for understanding Hermes's
 mechanics — it's just not the mechanism this project uses in production
 anymore. If `~/.hermes/profiles/<name>/` directories exist on a machine
 from before this decision (mercury, venus), `install_client.sh` will detect
-and report them; retiring one is:
+and report them.
+
+**Retirement order matters, and it is NOT "run `install_client.sh` first,
+retire the old profile whenever" — that ordering was flagged in review as
+recreating exactly the kind of exposure issue #59 was about.** A leftover
+per-client-profile gateway (e.g. `ai.hermes.gateway-mercury`) is a
+**separate, independent launchd service with its own Telegram bot** —
+`install_client.sh` never touches it, in either direction, at any point in
+its run. That means if it's still running, it stays fully live and
+reachable on its own bot **regardless of what `install_client.sh` does to
+the default profile** — installing a new client does not "take over" from
+it or shut it down. Confirmed live on this machine: the default gateway and
+`ai.hermes.gateway-mercury` were both found running simultaneously, well
+after this architecture had already shifted away from the per-profile
+model — the leftover profile doesn't retire itself just because it's no
+longer the intended design.
+
+**So: retire every leftover per-client profile's gateway BEFORE (or as the
+very first step of) switching to the single-install model on a given
+machine — never treat it as optional cleanup to get to "eventually."**
+Until you do, that old profile's bot can still accept and act on commands
+with its own client's credentials at the same time as the newly-installed
+default-profile bot is doing the same for a different client — two live,
+reachable identities at once is the exposure, not any particular ordering
+of file writes:
 
 ```bash
 hermes -p <name> gateway stop
@@ -174,8 +198,11 @@ hermes -p <name> gateway uninstall
 hermes profile delete <name>
 ```
 
-Run these yourself — `install_client.sh` prints them but never runs them,
-since they act on live, already-running state outside this script's scope.
+Run these yourself, for every stale profile `install_client.sh` reports,
+**before** relying on the newly-installed client's identity as the only
+live one — `install_client.sh` prints these commands but never runs them
+itself, since they act on live, already-running state outside this
+script's scope (see its own module docstring for the full reasoning).
 
 ## What if I need to test a non-active client without switching?
 

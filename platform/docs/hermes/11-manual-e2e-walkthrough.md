@@ -28,6 +28,13 @@ client's name, its `DRIVE_ROOT_FOLDER_ID`, and its Telegram bot everywhere
 > gateway (`ai.hermes.gateway`) involved — no `-p <profile>` flags anywhere
 > in this doc.
 
+**Working directory:** every command below is written relative to the
+fieldkit repo root. Set it explicitly once, rather than assuming a fixed
+clone location:
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ~/src/fieldkit)"
+```
+
 ## 0. Pre-flight — confirm the install is actually ready for this
 
 Do this before touching Drive or Telegram. All read-only.
@@ -38,7 +45,7 @@ Do this before touching Drive or Telegram. All read-only.
    have every step below silently run against the wrong client's Drive
    folder, Telegram bot, and Facebook Page:
    ```bash
-   grep '^CLIENT_NAME=' ~/src/fieldkit/.env
+   grep '^CLIENT_NAME=' .env
    grep -E '^(TELEGRAM_BOT_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY)=' ~/.hermes/.env | cut -d= -f1
    ```
    Expect `CLIENT_NAME=mercury`, and the second command to at least confirm
@@ -86,24 +93,24 @@ Do this before touching Drive or Telegram. All read-only.
    [`09-per-client-model-profiles.md`](09-per-client-model-profiles.md#what-happened-to-per-client-hermes-profiles)
    if so).
 
-5. **`timeout`/`gtimeout` is actually available** —
-   `process-photos/SKILL.md` wraps its invocation in `timeout 660
-   python3 ...`, which depends on GNU `timeout` (or its Homebrew-installed
-   alias `gtimeout`) being on `PATH`. Stock macOS ships neither:
+5. **`timeout`/`gtimeout` availability** — `process-photos/SKILL.md`
+   itself now selects at runtime between GNU `timeout`, its Homebrew-
+   installed alias `gtimeout`, or (if neither exists) no wrapper at all —
+   this used to be an unconditional `timeout 660 python3 ...` that would
+   fail outright with "command not found" on a machine lacking both, which
+   is exactly what this Mac was confirmed to be missing (stock macOS ships
+   neither binary). Check which case you're in before a live test:
    ```bash
-   command -v timeout || command -v gtimeout || echo "MISSING"
+   command -v timeout || command -v gtimeout || echo "NEITHER -- no enforced timeout on this machine"
    ```
-   If this prints `MISSING`, the documented synchronous, 660s-capped
-   invocation in step 2 below cannot run as written on this machine. In
-   practice, the agent notices the `timeout`/`gtimeout` command itself
-   doesn't exist and self-recovers by invoking
-   `python3 scripts/process_photos.py --project ...` directly, without the
-   wrapper — a real, expected degraded-but-working fallback, not a silent
-   failure: you lose the 11-minute hard timeout enforcement, nothing else
-   changes. Either `brew install coreutils` (provides `gtimeout`) to get
-   the documented primary path, or be aware the direct-invocation fallback
-   is what you're actually testing. This is a real gap in this machine's
-   environment, independent of this doc.
+   If it prints `NEITHER`, the pipeline still runs correctly — you simply
+   lose the skill's own 11-minute hard cap (the pipeline itself remains
+   bounded by Drive/network timeouts, just not by this skill's own
+   deadline). `brew install coreutils` (provides `gtimeout`) restores the
+   hard cap. This is a real gap in this machine's environment, independent
+   of this doc — fixed at the SKILL.md level so the doc's claim and the
+   script's actual behavior can't drift apart again the way they did
+   before.
 
 6. **Cron legs this test doesn't touch are — at minimum — not visibly
    broken.** `upload_facebook.py` still runs on cron (unaffected by the
@@ -164,10 +171,15 @@ Open a Telegram chat with the client's bot (for `mercury`,
 `fieldkit_mercury_bot`). If you're unsure this is actually the bot bound to
 `TELEGRAM_BOT_TOKEN` in `clients/mercury/src/photo-agent/.env`, don't try to
 visually match the token to the username — a bot token isn't something you
-can eyeball against a `@username`. Ask Telegram directly instead:
+can eyeball against a `@username`. Ask Telegram directly instead — **not**
+by substituting the token into a `curl` URL argument (that puts it in
+`ps`/process-listing output for the command's whole runtime); pipe a `curl`
+config line containing the token via stdin instead, so the token never
+appears in any process's argv:
 ```bash
 grep '^TELEGRAM_BOT_TOKEN=' clients/mercury/src/photo-agent/.env | cut -d= -f2- \
-  | xargs -I{} curl -s "https://api.telegram.org/bot{}/getMe"
+  | awk '{print "url = \"https://api.telegram.org/bot" $0 "/getMe\""}' \
+  | curl -s -K -
 ```
 The `"username"` field in the response is the authoritative answer — compare
 that to the chat you're about to type into.
@@ -182,18 +194,21 @@ Type, as a normal message:
 
 - Hermes's gateway picks this up on its normal poll — no separate step to
   "start" anything.
-- The script runs **synchronously**, for up to 11 minutes (the skill enforces
-  a 660s timeout) — Drive folder lookup, photo count/name validation,
-  download, ffmpeg video generation, Drive upload of the result. For 2–5
-  photos at `SECONDS_PER_PHOTO=4` (mercury's configured value) this is
-  normally well under a minute; do not assume it's stuck just because
-  Telegram shows nothing yet.
+- The script runs **synchronously**, for up to 11 minutes IF this machine has
+  `timeout` or `gtimeout` on `PATH` — otherwise there's no enforced cap at
+  all (see step 5 of the pre-flight section above; `process-photos/SKILL.md`
+  now selects the wrapper it uses at runtime rather than assuming one
+  exists) — Drive folder lookup, photo count/name validation, download,
+  ffmpeg video generation, Drive upload of the result. For 2–5 photos at
+  `SECONDS_PER_PHOTO=4` (mercury's configured value) this is normally well
+  under a minute; do not assume it's stuck just because Telegram shows
+  nothing yet.
 - **Important, verified behavior:** `process_photos.py` contains no
   `print()` calls at all, on any path — confirmed by reading the script
   directly. All its own output goes through Python's `logging` module,
   configured at `WARNING` level to `stderr`
   (`logging.basicConfig(level=logging.WARNING, stream=sys.stderr)`), which
-  `timeout 660 python3 ... 2>&1` (see `process-photos/SKILL.md`) merges into
+  the `2>&1` at the end of `process-photos/SKILL.md`'s invocation merges into
   the single stream Hermes actually captures. On a clean successful run
   nothing hits `WARNING`, so that merged stream is empty and Hermes's own
   relay of the command's output will typically show as empty. Don't wait
@@ -298,14 +313,23 @@ Don't leave test artifacts sitting in a live client's Drive or Facebook Page.
    resolved in step 4 above (the fail-closed, project-matched lookup) — do
    **not** hand-copy a post id from memory or from the Page's UI feed, where
    it's easy to click the wrong post on a Page with real traffic:
+   Validate the post id looks like a real Facebook post id (`<page_id>_<post_id>`,
+   digits and one underscore) before using it for anything — a malformed
+   value here is a sign the lookup in step 4 went wrong, not something to
+   pass through regardless:
+   ```bash
+   [[ "$FB_POST_ID" =~ ^[0-9]+_[0-9]+$ ]] || { echo "REFUSING: FB_POST_ID doesn't look like a real post id: $FB_POST_ID" >&2; }
+   ```
+   Then delete it, passing the id through an environment variable rather
+   than interpolating it into the Python source directly:
    ```bash
    cd platform/photo-agent
-   CLIENT_NAME=mercury python3 -c "
+   CLIENT_NAME=mercury FB_POST_ID_TO_DELETE="$FB_POST_ID" python3 -c "
    import os
    from dotenv import load_dotenv
    load_dotenv('../../.env'); load_dotenv('../../clients/mercury/src/photo-agent/.env', override=True)
    from tools import facebook_api
-   facebook_api.delete_post(os.environ['FB_PAGE_ACCESS_TOKEN'], '$FB_POST_ID')
+   facebook_api.delete_post(os.environ['FB_PAGE_ACCESS_TOKEN'], os.environ['FB_POST_ID_TO_DELETE'])
    print('deleted')
    "
    ```
