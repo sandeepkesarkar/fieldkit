@@ -182,6 +182,30 @@ def test_approve_clears_pending_approval(base):
     ca.state.clear_pending_approval.assert_called_once()
 
 
+def test_approve_confirmation_not_printed_if_clear_pending_approval_fails(base, capsys):
+    """Issue #63 follow-up: the 'Approved: <project>' confirmation must only ever
+    reach stdout after state.clear_pending_approval() has actually succeeded — if
+    it raises, the approval hasn't genuinely completed (the pending record is
+    still there), so the confirmation must not be printed even though every
+    other approve side effect (email, activity log, FB enqueue) already ran."""
+    import scripts.check_approval as ca
+    ca.state.clear_pending_approval.side_effect = RuntimeError("disk full")
+    with pytest.raises(RuntimeError):
+        main(_APPROVE_ARGS)
+    out = capsys.readouterr().out
+    assert "Approved:" not in out
+
+
+def test_reject_confirmation_not_printed_if_clear_pending_approval_fails(base, capsys):
+    """Same guarantee as above, for the reject path."""
+    import scripts.check_approval as ca
+    ca.state.clear_pending_approval.side_effect = RuntimeError("disk full")
+    with pytest.raises(RuntimeError):
+        main(_REJECT_ARGS)
+    out = capsys.readouterr().out
+    assert "Rejected:" not in out
+
+
 def test_approve_logs_approved(base):
     """approve path calls activity_log.log_approved() with the project name."""
     import scripts.check_approval as ca
@@ -632,10 +656,25 @@ def test_activity_log_error_on_reject_does_not_block_state_clear(base, mocker):
 # state.json race.
 # ---------------------------------------------------------------------------
 
-def test_lock_contention_exits_silently(mocker, env):
+def test_lock_contention_takes_no_action(mocker, env):
     """If check_approval.lock is held by another instance, main() exits without taking action."""
     mocker.patch("scripts.check_approval._load_env")
     mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=None)
     mock_get_pending = mocker.patch("scripts.check_approval.state.get_pending_approval")
     main(_APPROVE_ARGS)
     mock_get_pending.assert_not_called()
+
+
+def test_lock_contention_prints_distinct_nonempty_stdout(mocker, env, capsys):
+    """Issue #63 follow-up: lock contention must NOT be silent like the genuine
+    no-pending-approval case — it means another decision is actively being
+    processed, not that nothing is pending. It needs its own unambiguous,
+    non-empty stdout signal, distinct from both an approve/reject confirmation
+    and the empty-stdout no-pending-approval case."""
+    mocker.patch("scripts.check_approval._load_env")
+    mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=None)
+    main(_APPROVE_ARGS)
+    out = capsys.readouterr().out
+    assert out != ""
+    assert not out.startswith("Approved:")
+    assert not out.startswith("Rejected:")

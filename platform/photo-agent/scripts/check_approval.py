@@ -22,7 +22,13 @@ A successful approve or reject also exits 0, but prints a one-line
 "Approved: <project>" / "Rejected: <project>" confirmation to stdout (issue
 #63) — exit 0 with EMPTY stdout is reserved exclusively for the
 nothing-pending case, so Hermes's output-handling rule (see the
-photo-approve/photo-reject SKILL.md files) can tell the two apart.
+photo-approve/photo-reject SKILL.md files) can tell the two apart. Lock
+contention (another check_approval.py instance already holds
+check_approval.lock — e.g. two /photo_approve or /photo_approve +
+/photo_reject commands dispatched in close succession) is a fourth,
+similarly distinct outcome: it also exits 0, but prints "Already
+processing — try again in a moment." rather than either an
+approve/reject confirmation or nothing.
 
 ---
 
@@ -258,6 +264,13 @@ def main(argv=None) -> None:
     lock_f = _try_acquire_check_lock()
     if lock_f is None:
         _log.debug("another check_approval instance is running — exiting")
+        # Issue #63 follow-up: this used to exit 0 with empty stdout, which
+        # is indistinguishable from the genuine no-pending-approval case
+        # (see _run()'s `record is None` branch and the module docstring).
+        # Lock contention means another approve/reject decision is actively
+        # being processed right now — not that nothing is pending — so it
+        # needs its own unambiguous, non-empty stdout signal.
+        print("Already processing — try again in a moment.")
         return
 
     try:
@@ -318,14 +331,7 @@ def _run(callback_data: str) -> None:
 
         _enqueue_facebook_upload(project_name, video_local_path, telegram_message_id)
 
-        # Issue #63: exit 0 with empty stdout is Hermes's signal (see the
-        # photo-approve/photo-reject SKILL.md "Output handling" sections)
-        # for "nothing was pending" — the `record is None` branch above.
-        # Without a stdout line here, a genuinely successful approval was
-        # indistinguishable from that no-op case, so Hermes reported "No
-        # pending approval" to the admin even though the approval (and any
-        # Facebook publish it enqueued) had already gone through.
-        print(f"Approved: {project_name}")
+        confirmation = f"Approved: {project_name}"
 
     else:  # reject
         # Drive delete is best-effort — failure is logged but does not block the rejection.
@@ -348,11 +354,24 @@ def _run(callback_data: str) -> None:
         except (ValueError, OSError) as exc:
             _log.error("activity log failed after rejection: %s", exc)
 
-        # Issue #63: see the matching comment on the approve branch above —
-        # same stdout contract applies to a successful rejection.
-        print(f"Rejected: {project_name}")
+        confirmation = f"Rejected: {project_name}"
 
+    # Issue #63: exit 0 with empty stdout is Hermes's signal (see the
+    # photo-approve/photo-reject SKILL.md "Output handling" sections) for
+    # "nothing was pending" — the `record is None` branch above. Without a
+    # stdout line here, a genuinely successful approval/rejection was
+    # indistinguishable from that no-op case, so Hermes reported "No
+    # pending approval" to the admin even though the decision (and any
+    # Facebook publish it enqueued) had already gone through.
+    #
+    # Printed only after clear_pending_approval() succeeds — not inside the
+    # if/else above — so a confirmation on stdout stays tightly coupled to
+    # "the state change genuinely completed": if clear_pending_approval()
+    # raises, this line is never reached and the script exits nonzero
+    # (uncaught exception), which the skills' output-handling rule already
+    # reports as a failure rather than a success.
     state.clear_pending_approval()
+    print(confirmation)
 
 
 if __name__ == "__main__":

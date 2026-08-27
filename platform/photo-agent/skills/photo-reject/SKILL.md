@@ -73,4 +73,8 @@ Otherwise relay the output verbatim. Do not summarise or paraphrase.
 > always prints a one-line confirmation (e.g. `Rejected: <project>`) before
 > exiting 0, so never report "No pending approval" when stdout is non-empty,
 > even though the exit code is 0 in both cases — check the output, not just
-> the exit code.
+> the exit code. Lock contention (another decision already being processed)
+> also exits 0 with non-empty output (e.g. `Already processing — try again
+> in a moment.`) — it falls under "otherwise relay the output verbatim"
+> above like any other non-empty-output case, not under "No pending
+> approval".
