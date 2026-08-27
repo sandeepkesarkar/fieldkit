@@ -675,6 +675,4 @@ def test_lock_contention_prints_distinct_nonempty_stdout(mocker, env, capsys):
     mocker.patch("scripts.check_approval._try_acquire_check_lock", return_value=None)
     main(_APPROVE_ARGS)
     out = capsys.readouterr().out
-    assert out != ""
-    assert not out.startswith("Approved:")
-    assert not out.startswith("Rejected:")
+    assert out == "Already processing — try again in a moment.\n"
