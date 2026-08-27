@@ -63,17 +63,25 @@ disagree, the code is authoritative and this doc has drifted):
    the plan and, if `--dry-run` was passed, exits here — before the first
    side-effecting line of any kind (no `mkdir`, no `chmod`, no lock, no
    temp file).
-2. **Checks whether any leftover, non-default Hermes profile
-   (`~/.hermes/profiles/<name>/` — pre-#61 state, e.g. `mercury`, `venus`)
-   has a gateway that's currently running — before ANY mutation of any
-   kind, not merely before the live `.env` files.** If any is confirmed
-   running, or its status can't be confirmed at all, the install **aborts
-   here**, before even the preflight command/writability checks or the
-   lock, with the exact retirement commands to run first — never merely
-   warns about this after the fact once a new gateway is already up (that
-   would recreate the exact two-gateways-live exposure issue #59 was
-   about). **It never touches those profiles itself** either way — they're
-   live state from before this architecture decision, and mutating
+2. **Checks whether any leftover, non-default Hermes gateway has a gateway
+   that's currently running — before ANY mutation of any kind, not merely
+   before the live `.env` files.** Candidates come from TWO independent
+   sources, unioned: directories under `~/.hermes/profiles/<name>/`
+   (pre-#61 state, e.g. `mercury`, `venus`), AND every loaded
+   `ai.hermes.gateway-<name>` launchd service enumerated directly via
+   `launchctl list`, regardless of whether that profile's directory still
+   exists. The second source exists specifically to catch an **orphaned**
+   service — a profile directory that was deleted or renamed while its
+   launchd service definition stayed loaded, potentially alive with
+   credentials in memory, which the directory scan alone would miss
+   entirely. If any candidate is confirmed running, or its status can't be
+   confirmed at all, the install **aborts here**, before even the
+   preflight command/writability checks or the lock, with the exact
+   retirement commands to run first — never merely warns about this after
+   the fact once a new gateway is already up (that would recreate the
+   exact two-gateways-live exposure issue #59 was about). **It never
+   touches those profiles or services itself** either way — they're live
+   state from before this architecture decision, and mutating
    already-running, non-default profile state is not this script's job
    (same posture as every other live-infrastructure change in this
    project's history: the automation proposes, a human disposes).
@@ -108,17 +116,24 @@ disagree, the code is authoritative and this doc has drifted):
 6. **Commits.** Only now, after every fallible step above has succeeded:
    fixes the client's own source `.env` permissions (deferred to here, not
    done at validation time, so a failure before this point never mutates
-   it); commits Hermes's `.env` first (it's the file that actually governs
-   live skill dispatch — the #59 exposure this script exists to close — so
-   if the second commit below ever fails, the file that matters most is
-   already correct); then commits the root `.env`. POSIX offers no true
-   multi-file transaction, so if the second commit fails after the first
-   succeeds, the script does not pretend that can't happen — it prints
-   exactly which file is already correct and how to finish the fix by
-   re-running.
-7. **Re-checks every stale profile's status one more time, immediately
-   before actually starting the new default-profile gateway** — closing
-   the gap where a stale profile's gateway could start in the window
+   it); a snapshot (content AND original file mode) of Hermes's `.env` is
+   captured, exactly like `config.yaml`'s in step 5; then commits Hermes's
+   `.env` first (it's the file that actually governs live skill dispatch —
+   the #59 exposure this script exists to close); then commits the root
+   `.env` last. POSIX offers no true multi-file transaction, so this
+   script does not pretend the two renames are one atomic operation — but
+   it keeps both snapshots available until BOTH renames succeed, and rolls
+   back whichever of them already changed on either failure: if the FIRST
+   rename fails, `config.yaml` (already applied by step 5) is restored,
+   and neither `.env` file was touched; if the SECOND rename fails after
+   the first succeeded, BOTH Hermes's `.env` and `config.yaml` are
+   restored to their pre-install state — the root `.env` was never touched
+   (a failed rename leaves its target untouched by definition), so every
+   live file ends up back on the OLD client, consistently, never a mix of
+   old and new.
+7. **Re-checks every stale profile's and orphaned service's status one
+   more time, immediately before actually starting the new default-profile
+   gateway** — closing the gap where one could start running in the window
    between step 2's check and this final moment. Both `.env` files are
    already committed by this point regardless of this recheck's outcome
    (they're correct for the client being installed); what's refused, if a
@@ -128,7 +143,10 @@ disagree, the code is authoritative and this doc has drifted):
 
 There is no window where one live file reflects the new client's config and
 another still reflects the old one, and no window where the gateway
-observes a half-written file.
+observes a half-written file — barring the restore step of a rollback
+itself failing, an essentially unreachable double-failure the script
+detects and reports loudly ("MANUAL INTERVENTION REQUIRED") rather than
+silently accepting.
 
 Flags: `--dry-run` (print the plan; makes **zero** filesystem changes of
 any kind — no `mkdir`, no `chmod`, no lock, no temp file — and runs no

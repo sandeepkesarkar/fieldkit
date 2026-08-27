@@ -32,12 +32,27 @@
 #   - Both live .env files (root and Hermes's) are staged in temp files and
 #     are NOT committed (atomically renamed into place) until AFTER every
 #     fallible `hermes config set` call has already succeeded — a failure
-#     anywhere in that sequence leaves BOTH .env files completely untouched
-#     (the temp files are discarded), and rolls config.yaml back to exactly
-#     what it was before this run (deleted outright if this run created it
-#     fresh, restored from a snapshot otherwise). There is no window where
-#     one live file reflects the new client and another still reflects the
-#     old one.
+#     in that sequence leaves BOTH .env files completely untouched (the
+#     temp files are discarded), and rolls config.yaml back to exactly what
+#     it was before this run. TWO more fallible operations remain even
+#     after that sequence succeeds, though: the two file renames that
+#     actually commit the staged `.env` files. Neither is expected to fail
+#     (both are local, same-filesystem renames of already-staged, already-
+#     validated files), but this script does not assume it — a snapshot
+#     (content AND original file mode) of whatever config.yaml and Hermes's
+#     .env looked like before this run is kept available until BOTH renames
+#     succeed, and a failure on EITHER one rolls back whichever of the two
+#     already changed (config.yaml, and Hermes's .env if it was the first
+#     rename that succeeded) to its exact pre-install state — not left as
+#     "manual recovery guidance". The root .env is the very last thing
+#     committed, and a failed rename leaves its own target untouched by
+#     definition (POSIX rename is atomic), so there is nothing to roll back
+#     for it specifically. Net result: there is no window where one live
+#     file reflects the new client and another still reflects the old one
+#     — barring the restore step of a rollback itself failing, an
+#     essentially unreachable double-failure this script detects and
+#     reports loudly ("MANUAL INTERVENTION REQUIRED") rather than silently
+#     accepting.
 #   - The client name is validated against a strict allowlist pattern before
 #     it ever touches a path, and BOTH the resolved client directory and the
 #     resolved client .env FILE (a symlink at either level, not just the
@@ -45,14 +60,20 @@
 #     clients/ before anything reads or touches them — no path traversal,
 #     no symlink escape at either level.
 #   - Gateway status (this profile's, and every stale non-default profile's)
-#     is checked BEFORE any live file is touched. An AMBIGUOUS status
-#     (command failure, unrecognized output) is treated as "assume running"
-#     and aborts the whole install — never as "assume stopped" — because
-#     proceeding on a wrong guess is exactly the two-gateways-live exposure
-#     this script exists to prevent. Any stale, non-default profile
-#     confirmed running aborts the install outright, with the exact
-#     retirement commands, rather than merely warning about it after the
-#     fact once the new gateway is already up.
+#     is checked BEFORE any live file is touched, using a classifier built
+#     from Hermes's own real status-reporting source (not guessed strings)
+#     — including reconciling two of Hermes's own INDEPENDENT liveness
+#     checks that can disagree in the same real output (see `_gateway_status`
+#     below for the full writeup). An AMBIGUOUS status (command failure,
+#     unrecognized output) is treated as "assume running" and aborts the
+#     whole install — never as "assume stopped" — because proceeding on a
+#     wrong guess is exactly the two-gateways-live exposure this script
+#     exists to prevent. Any stale, non-default profile confirmed running
+#     aborts the install outright, with the exact retirement commands,
+#     rather than merely warning about it after the fact once the new
+#     gateway is already up — checked once before any mutation, and once
+#     more immediately before the new gateway actually starts, closing the
+#     race window between those two moments.
 #   - A single mkdir-based lock file serializes concurrent installer runs —
 #     a second invocation refuses immediately rather than racing the first.
 #
@@ -427,43 +448,61 @@ fi
 #                                                containing the substring "is
 #                                                running" ("process is
 #                                                running" reads as a positive
-#                                                fragment on its own) -- this
-#                                                exact confusion was caught
-#                                                live while testing this
-#                                                classifier: a naive
-#                                                POSITIVE-checked-first regex
-#                                                misclassified this phrase as
-#                                                running. Checked with
-#                                                explicit precedence below,
-#                                                before the generic POSITIVE
-#                                                check, specifically because
-#                                                of this.
+#                                                fragment on its own).
 #     "service is not installed"            -- gateway install was never run
 #   Anything else: ambiguous -- fail closed, abort.
+#
+# THE SUBSTRING-PRECEDENCE BUG (found across two rounds of live testing --
+# get this right, it's the crux of the whole classifier):
+#   Round 1 fix: check "No fallback process is running" FIRST, before the
+#   generic POSITIVE check, so its "is running" substring can't misfire as
+#   positive. That fix was itself incomplete: `launchd_status()`'s own
+#   fallback-PID check ("No fallback process is running") and
+#   `_print_gateway_process_mismatch()`'s INDEPENDENT, broader process scan
+#   (`find_gateway_pids()`) are two genuinely different detection
+#   mechanisms that can DISAGREE and both print in the SAME real output --
+#   reproduced directly against gateway.py's real source:
+#     ✗ No fallback process is running
+#
+#     ⚠ Gateway process is running for this profile, but the service is not active
+#       PID(s): 123
+#   Checking the negative phrase first and returning immediately (the
+#   round-1 fix) made this combined, real, reproducible case return
+#   "not-running" even though a live gateway process genuinely exists --
+#   fail-OPEN, exactly backwards for this script's purpose.
+#
+#   Round 2 fix (this one): the negative phrase is stripped out of a COPY
+#   of the output BEFORE the generic POSITIVE check runs, rather than
+#   short-circuiting on it -- so any OTHER, independent positive evidence
+#   elsewhere in the output (the mismatch warning, a PID, "is supervised by
+#   launchd", etc.) is still found and wins, while the specific phrase that
+#   would otherwise false-positive on its own "is running" substring is
+#   neutralized either way. Positive evidence is checked FIRST on the
+#   stripped copy; only when NONE exists anywhere does the (unstripped)
+#   negative-phrase check run. See
+#   test_classifier_recognizes_real_hermes_process_service_mismatch_as_running
+#   in test_install_client.py for the fixture proving this, built directly
+#   from gateway.py's real _print_gateway_process_mismatch() source.
 #
 # _gateway_status [extra hermes args...] -- echoes one of:
 #   running | not-running | ambiguous
 # Never mutates anything -- pure query.
 _gateway_status() {
-  local out rc
+  local out rc stripped
   out="$(HERMES_HOME="$HERMES_HOME" hermes "$@" gateway status 2>&1)"; rc=$?
   if [ $rc -ne 0 ]; then
     echo "ambiguous"; return
   fi
-  # This specific phrase is checked FIRST, ahead of the generic POSITIVE
-  # check below, because it contains "is running" as a literal substring
-  # ("No fallback process IS RUNNING") while meaning the opposite.
-  if printf '%s' "$out" | grep -qE 'No fallback process is running'; then
-    echo "not-running"; return
-  fi
-  # POSITIVE checked next and wins outright over the remaining generic
-  # negative patterns -- a confirmed-live detached process must count as
-  # running even alongside a "service not loaded" line about launchd's own
-  # supervision of it.
-  if printf '%s' "$out" | grep -qE 'is supervised by launchd|is running'; then
+  # Neutralize (not short-circuit on) the one negative phrase that
+  # contains "is running" as a literal substring, so it can never
+  # masquerade as positive evidence -- but without discarding genuine,
+  # independent positive evidence that can legitimately appear alongside
+  # it in the same real output (see the long comment above).
+  stripped="$(printf '%s' "$out" | sed -E 's/No fallback process is running//g')"
+  if printf '%s' "$stripped" | grep -qE 'is supervised by launchd|is running'; then
     echo "running"; return
   fi
-  if printf '%s' "$out" | grep -qE 'is not running|service is not loaded|not supervising it|service is not installed'; then
+  if printf '%s' "$out" | grep -qE 'is not running|service is not loaded|not supervising it|service is not installed|No fallback process is running'; then
     echo "not-running"; return
   fi
   echo "ambiguous"
@@ -502,6 +541,57 @@ _gateway_status() {
 stale_running=()
 stale_not_running=()
 stale_ambiguous=()
+
+# _contains NEEDLE ARG... -- O(n) membership test. Not a bash-4+
+# associative array (bash 3.2, this machine's stock /bin/bash, has no
+# `declare -A`) -- the stale-profile candidate lists this dedupes are
+# always tiny (realistically 0-2 entries), so O(n^2) is irrelevant here.
+_contains() {
+  local needle="$1" x
+  shift
+  for x in "$@"; do
+    [ "$x" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# _launchctl_gateway_candidates -- echoes, one per line, the profile-name
+# portion of every LOADED `ai.hermes.gateway-<name>` launchd service,
+# enumerated DIRECTLY via `launchctl list` -- independent of whether
+# `$HERMES_HOME/profiles/<name>/` still exists as a directory. This is
+# what catches an ORPHANED service: a profile directory that was deleted
+# or renamed, whose launchd service definition is nonetheless still loaded
+# and potentially alive with credentials in memory -- a scenario Hermes's
+# own source acknowledges renamed/orphan profiles create. The bare
+# `ai.hermes.gateway` label (the DEFAULT profile -- the one this script
+# itself manages) is deliberately excluded; it is never "stale". Silently
+# yields nothing if `launchctl` isn't on PATH (non-macOS) rather than
+# erroring -- this source is additive to the directory scan, never a hard
+# requirement of it.
+_launchctl_gateway_candidates() {
+  command -v launchctl >/dev/null 2>&1 || return 0
+  launchctl list 2>/dev/null \
+    | awk '$3 ~ /^ai\.hermes\.gateway-/ {print $3}' \
+    | sed -E 's/^ai\.hermes\.gateway-//'
+}
+
+# _launchctl_label_has_live_pid LABEL -- "running" if `launchctl list
+# LABEL` shows a numeric PID (a live, launchd-confirmed process), else
+# "not-running" (label not loaded at all, or loaded with no PID). Used as
+# a direct, independent aliveness signal for orphaned services -- `hermes
+# -p <name> gateway status` may itself behave unpredictably for a profile
+# whose directory no longer exists, so this doesn't rely on it for the
+# specifically-orphaned case.
+_launchctl_label_has_live_pid() {
+  local label="$1" line
+  line="$(launchctl list "$label" 2>/dev/null | grep '"PID"')" || true
+  if printf '%s' "$line" | grep -qE '[0-9]'; then
+    echo "running"
+  else
+    echo "not-running"
+  fi
+}
+
 # _abort_if_stale_profiles_running early|late -- the message differs by
 # call site: the EARLY call (before any mutation) can truthfully say
 # nothing has happened yet; the LATE call (right before `gateway start`,
@@ -514,11 +604,31 @@ _abort_if_stale_profiles_running() {
   stale_running=()
   stale_not_running=()
   stale_ambiguous=()
-  [ -d "$HERMES_HOME/profiles" ] || return 0
-  local d p
-  for d in "$HERMES_HOME"/profiles/*/; do
-    [ -d "$d" ] || continue
-    p="$(basename "$d")"
+  local d p candidates=()
+  if [ -d "$HERMES_HOME/profiles" ]; then
+    for d in "$HERMES_HOME"/profiles/*/; do
+      [ -d "$d" ] || continue
+      p="$(basename "$d")"
+      _contains "$p" "${candidates[@]:-}" || candidates+=("$p")
+    done
+  fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    _contains "$p" "${candidates[@]:-}" || candidates+=("$p")
+  done < <(_launchctl_gateway_candidates)
+
+  for p in "${candidates[@]:-}"; do
+    [ -n "$p" ] || continue
+    # A launchctl-confirmed live PID for this profile's label is direct,
+    # independent evidence -- it wins outright regardless of what `hermes
+    # -p <name> gateway status` says (which may itself be unreliable for
+    # an orphaned profile with no directory). Only when launchctl shows no
+    # live PID for this label (or has no opinion, e.g. not macOS) does the
+    # existing CLI-based check apply, exactly as before.
+    if [ "$(_launchctl_label_has_live_pid "ai.hermes.gateway-$p")" = "running" ]; then
+      stale_running+=("$p")
+      continue
+    fi
     case "$(_gateway_status -p "$p")" in
       running) stale_running+=("$p") ;;
       not-running) stale_not_running+=("$p") ;;
@@ -738,14 +848,33 @@ if [ -f "$HERMES_CONFIG" ]; then
   chmod 600 "$HERMES_CONFIG_BACKUP"
 fi
 
+# Restores config.yaml to exactly its pre-install snapshot (content AND
+# mode), or deletes it if it didn't exist before this install attempt.
+# Shared by every failure path from this point on in the script: a
+# config-set failure, AND either of the two final file-commit failures
+# further below -- all three mean config.yaml (already applied to the new
+# client by the point any of them can happen) must not be left switched
+# while other live state stays on the old client. This is what closes the
+# "config.yaml already applied while both .env files are still old"
+# inconsistency a prior version of this script's error message implicitly
+# claimed couldn't happen. -----------------------------------------------
+_restore_config_yaml() {
+  if [ "$CONFIG_EXISTED_BEFORE" -eq 1 ]; then
+    cp "$HERMES_CONFIG_BACKUP" "$HERMES_CONFIG" \
+      && chmod "$HERMES_CONFIG_ORIGINAL_MODE" "$HERMES_CONFIG" \
+      || echo "  WARNING: restoring $HERMES_CONFIG from $HERMES_CONFIG_BACKUP FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+  else
+    rm -f "$HERMES_CONFIG" \
+      || echo "  WARNING: removing $HERMES_CONFIG FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+  fi
+}
+
 _rollback_hermes_config_and_fail() {
   echo "ERROR: 'hermes config set' failed — rolling back and leaving the gateway STOPPED." >&2
+  _restore_config_yaml
   if [ "$CONFIG_EXISTED_BEFORE" -eq 1 ]; then
-    cp "$HERMES_CONFIG_BACKUP" "$HERMES_CONFIG"
-    chmod "$HERMES_CONFIG_ORIGINAL_MODE" "$HERMES_CONFIG"
     echo "  Restored $HERMES_CONFIG from $HERMES_CONFIG_BACKUP (mode $HERMES_CONFIG_ORIGINAL_MODE)" >&2
   else
-    rm -f "$HERMES_CONFIG"
     echo "  Removed $HERMES_CONFIG (it did not exist before this install attempt)" >&2
   fi
   echo "  $ROOT_ENV and $HERMES_ENV were NOT modified at all — both were still" >&2
@@ -771,44 +900,76 @@ HERMES_HOME="$HERMES_HOME" hermes config set model.default "$HERMES_MODEL_DEFAUL
 HERMES_HOME="$HERMES_HOME" hermes config set skills.external_dirs "[\"$FIELDKIT_ROOT/platform/photo-agent/skills\"]" || _rollback_hermes_config_and_fail
 
 # --- Commit point: every fallible step above has succeeded. From here on,
-# only atomic, already-validated renames and a final gateway start remain.
-# --- An audit-only backup of the PREVIOUS hermes .env (not used for any
-# rollback logic -- by this point config.yaml is already correctly applied
-# and there is nothing left to roll back to) is taken purely so a human can
-# see what changed. --------------------------------------------------------
+# two more fallible operations remain (the two file renames below) before
+# only the final gateway start is left. Neither rename is expected to fail
+# -- both are local, same-filesystem renames of already-validated, already-
+# staged temp files, about as reliable an operation as this script
+# performs -- but "not expected to fail" is not "provably cannot fail", and
+# a prior version of this script treated it as the latter: it backed up
+# Hermes's .env for audit purposes only, and printed "re-run to fix it"
+# guidance on a second-commit failure rather than actually rolling
+# anything back, while a first-commit failure didn't touch config.yaml at
+# all even though config.yaml had, by that point, already been switched to
+# the new client. Both were real gaps in the "no window where live files
+# disagree" claim this script makes. Fixed: config.yaml's already-captured
+# backup/mode (from before the `hermes config set` sequence) and a new,
+# equivalent backup/mode capture for Hermes's .env are BOTH kept available
+# until BOTH renames below have succeeded -- if either fails, whichever of
+# the three (config.yaml, and Hermes's .env if it was the one already
+# committed) already changed is rolled back to its exact pre-install state,
+# not left as "manual recovery guidance". ----------------------------------
+HERMES_ENV_EXISTED_BEFORE=0
+HERMES_ENV_BACKUP=""
+HERMES_ENV_ORIGINAL_MODE=""
 if [ -f "$HERMES_ENV" ]; then
-  HERMES_ENV_AUDIT_BACKUP="$HERMES_ENV.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$HERMES_ENV" "$HERMES_ENV_AUDIT_BACKUP"
-  chmod 600 "$HERMES_ENV_AUDIT_BACKUP"
+  HERMES_ENV_EXISTED_BEFORE=1
+  HERMES_ENV_ORIGINAL_MODE="$(_file_mode "$HERMES_ENV")"
+  HERMES_ENV_BACKUP="$HERMES_ENV.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$HERMES_ENV" "$HERMES_ENV_BACKUP"
+  chmod 600 "$HERMES_ENV_BACKUP"
 fi
+
+_restore_hermes_env() {
+  if [ "$HERMES_ENV_EXISTED_BEFORE" -eq 1 ]; then
+    cp "$HERMES_ENV_BACKUP" "$HERMES_ENV" \
+      && chmod "$HERMES_ENV_ORIGINAL_MODE" "$HERMES_ENV" \
+      || echo "  WARNING: restoring $HERMES_ENV from $HERMES_ENV_BACKUP FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+  else
+    rm -f "$HERMES_ENV" \
+      || echo "  WARNING: removing $HERMES_ENV FAILED -- MANUAL INTERVENTION REQUIRED." >&2
+  fi
+}
 
 # The client's own source .env's permissions are fixed here, as the first
 # real mutation of the commit phase -- deferred from validation time (see
 # the NOTE near the top of this script) so a failure anywhere before this
-# point leaves it, like every other live file, completely untouched.
+# point leaves it, like every other live file, completely untouched. Not
+# part of the config.yaml/.env-files rollback set below: chmod 600 is
+# strictly permission-TIGHTENING and idempotent, nothing meaningful to
+# roll back regardless of whether the rest of this install succeeds.
 chmod 600 "$CLIENT_ENV" 2>/dev/null || true
 
 # --- Two-file commit ordering, and why: Hermes's own .env is committed
 # FIRST, not root .env. Hermes's .env is the file that actually governs
 # LIVE SKILL DISPATCH (see the module docstring's "Why CLIENT_NAME is also
 # written into Hermes's own .env" section) -- the exact path issue #59 was
-# about. The root .env only matters for the ad-hoc CLIENT_NAME= inline-
-# override path and for a bare cron/manual invocation with no ambient
-# CLIENT_NAME at all. If the second `mv` below were ever to fail after the
-# first succeeded (both are local, same-filesystem renames of already-
-# validated, already-staged temp files -- about as reliable an operation
-# as this script performs, but not a mathematical impossibility), THIS
-# ordering means the file that matters most for #59 is already correct;
-# the recovery message below explains exactly what state that leaves and
-# how to fix it, rather than silently claiming it can't happen. ------------
+# about. If the SECOND rename below fails, this ordering plus the rollback
+# logic means either outcome is fully consistent: Hermes's .env (rolled
+# back along with config.yaml) ends up matching root .env's untouched old
+# state, never a mix. --------------------------------------------------
 mv -f "$HERMES_ENV_TMP" "$HERMES_ENV" || {
-  echo "ERROR: failed to commit $HERMES_ENV -- the client switch was NOT applied at all (this was the first of two commits; the second, $ROOT_ENV, was never attempted). Re-run: install_client.sh $CLIENT" >&2
+  echo "ERROR: failed to commit $HERMES_ENV -- rolling back config.yaml too (it was already applied by the successful 'hermes config set' sequence above), so nothing is left half-switched." >&2
+  _restore_config_yaml
+  echo "  Restored config.yaml to its pre-install state. Neither $HERMES_ENV nor $ROOT_ENV was modified. Re-run: install_client.sh $CLIENT" >&2
   exit 1
 }
 chmod 600 "$HERMES_ENV"
 
 mv -f "$ROOT_ENV_TMP" "$ROOT_ENV" || {
-  echo "ERROR: $HERMES_ENV was already switched to '$CLIENT' (this is the file that governs live Hermes skill dispatch -- the #59 exposure this script exists to close), but $ROOT_ENV failed to commit and may still show the PREVIOUS client. This only affects cron/manual invocations that read CLIENT_NAME with no ambient override; a live Hermes-dispatched command already correctly resolves to '$CLIENT'. Re-run install_client.sh $CLIENT to fix $ROOT_ENV too -- Hermes's .env is already correct, so re-running is safe and will simply re-commit both consistently." >&2
+  echo "ERROR: failed to commit $ROOT_ENV after $HERMES_ENV already succeeded -- rolling BOTH $HERMES_ENV and config.yaml back to their pre-install state, so nothing is left half-switched." >&2
+  _restore_hermes_env
+  _restore_config_yaml
+  echo "  Restored $HERMES_ENV and config.yaml. $ROOT_ENV was never modified (a failed rename leaves its target untouched, unlike a failed copy). Re-run: install_client.sh $CLIENT" >&2
   exit 1
 }
 chmod 600 "$ROOT_ENV"

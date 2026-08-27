@@ -110,8 +110,51 @@ exit 0
 """
 
 
-def _write_stub(path: Path) -> None:
-    path.write_text(_HERMES_STUB)
+# A stub `launchctl` is placed on every sandbox's PATH, by default (unless
+# a test injects entries -- see HERMES_STUB_LAUNCHCTL_LIST_FILE below)
+# reporting NOTHING loaded. This is REQUIRED for test isolation, not
+# optional: install_client.sh's orphan-service detection (issue #62 review
+# Security-5, round 4) calls the real `launchctl` directly, independent of
+# HERMES_HOME sandboxing -- without this stub, every test on a machine
+# that happens to have Hermes gateways actually running (this development
+# machine does: `ai.hermes.gateway` and `ai.hermes.gateway-mercury`) would
+# leak that real, live state into the stale-profile candidate set of every
+# single test, causing spurious failures unrelated to what's being tested.
+_LAUNCHCTL_STUB = """#!/usr/bin/env bash
+echo "STUB_LAUNCHCTL_CALL: $*" >> "$HERMES_STUB_LOG"
+LIST_FILE="${HERMES_STUB_LAUNCHCTL_LIST_FILE:-}"
+if [ "$1" = "list" ] && [ "$#" -eq 1 ]; then
+  # Bare `launchctl list` -- the whole table. Tab-separated PID/status/label
+  # lines, matching real launchctl's own format, sourced from a file a test
+  # can populate via HERMES_STUB_LAUNCHCTL_LIST_FILE.
+  if [ -n "$LIST_FILE" ] && [ -f "$LIST_FILE" ]; then
+    cat "$LIST_FILE"
+  fi
+  exit 0
+fi
+if [ "$1" = "list" ] && [ -n "${2:-}" ]; then
+  # `launchctl list <label>` -- a single-service lookup. Real launchctl
+  # dumps a full plist-like dict; this stub only ever needs to expose a
+  # `"PID" = N;` line for a live one, since that's all the script's own
+  # _launchctl_label_has_live_pid parser looks for.
+  if [ -n "$LIST_FILE" ] && [ -f "$LIST_FILE" ]; then
+    PID="$(awk -F'\\t' -v label="$2" '$3 == label {print $1}' "$LIST_FILE" | head -n1)"
+    if [ -n "$PID" ] && [ "$PID" != "-" ]; then
+      echo "\\"PID\\" = $PID;"
+      exit 0
+    elif [ -n "$PID" ]; then
+      echo "\\"LastExitStatus\\" = 0;"
+      exit 0
+    fi
+  fi
+  exit 113
+fi
+exit 0
+"""
+
+
+def _write_stub(path: Path, content: str) -> None:
+    path.write_text(content)
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -127,7 +170,9 @@ def sandbox(tmp_path):
 
     log_path = tmp_path / "stub.log"
     running_marker = tmp_path / "gateway_running_marker"
-    _write_stub(stub_bin / "hermes")
+    launchctl_list_file = tmp_path / "launchctl_list.tsv"
+    _write_stub(stub_bin / "hermes", _HERMES_STUB)
+    _write_stub(stub_bin / "launchctl", _LAUNCHCTL_STUB)
 
     env = {
         "PATH": f"{stub_bin}:{os.environ.get('PATH', '')}",
@@ -136,12 +181,14 @@ def sandbox(tmp_path):
         "HERMES_HOME": str(hermes_home),
         "HERMES_STUB_LOG": str(log_path),
         "HERMES_STUB_RUNNING_MARKER": str(running_marker),
+        "HERMES_STUB_LAUNCHCTL_LIST_FILE": str(launchctl_list_file),
     }
     return {
         "fieldkit_root": fieldkit_root,
         "hermes_home": hermes_home,
         "log_path": log_path,
         "running_marker": running_marker,
+        "launchctl_list_file": launchctl_list_file,
         "env": env,
     }
 
@@ -569,15 +616,43 @@ def test_symlinked_client_env_FILE_escaping_the_client_directory_is_rejected(san
 def test_script_never_pipes_secret_values_through_sed():
     """sed was the mechanism the review flagged for both the argv-exposure
     finding and the unescaped-delimiter finding -- the fix removes sed from
-    the secret-writing path entirely rather than trying to escape it
-    perfectly. This is a structural guarantee, not just a behavior test:
-    confirm the fix is actually the "don't use sed for this" shape, not
-    "sed but escaped harder"."""
+    the SECRET-WRITING path entirely rather than trying to escape it
+    perfectly (that logic uses awk with only key names, and printf, as
+    checked below). This is a structural guarantee, not just a behavior
+    test: confirm no sed invocation ever appears inside the functions that
+    handle credential material (get_client_var, _rebuild_strip_managed_keys,
+    _emit_kv, or the commit-phase code itself).
+
+    A later fix (issue #62 round-4 review, Engineering-3) legitimately
+    introduced ONE sed invocation elsewhere in the script -- inside
+    `_gateway_status`, to strip a specific substring out of Hermes's own
+    STATUS TEXT (operational output, never a secret) before classifying
+    it. That single, scoped use is fine and expected; this test is scoped
+    to exclude it deliberately, not to re-litigate whether sed may exist
+    in the file at all."""
     script_src = _INSTALL_SCRIPT.read_text()
-    # Check for actual sed invocations, not the English substring "sed"
-    # (which legitimately appears in prose, e.g. "superseding").
     import re
-    assert re.search(r'(^|[|;&\s])sed(\s|$)', script_src, re.MULTILINE) is None
+
+    secret_handling_functions = [
+        "get_client_var() {",
+        "_rebuild_strip_managed_keys() {",
+        "_emit_kv() {",
+    ]
+    for marker in secret_handling_functions:
+        start = script_src.index(marker)
+        end = script_src.index("\n}\n", start) + 3
+        body = script_src[start:end]
+        assert re.search(r'(^|[|;&\s])sed(\s|$)', body, re.MULTILINE) is None, (
+            f"found a sed invocation inside {marker.split('(')[0]} -- secret "
+            f"values must never be piped through sed"
+        )
+
+    # And the commit-phase code (the mv/chmod block that actually writes
+    # live credential files) must not invoke sed either.
+    commit_start = script_src.index("# --- Commit point:")
+    commit_end = script_src.index('if [ "$NO_RESTART" -eq 0 ]')
+    commit_body = script_src[commit_start:commit_end]
+    assert re.search(r'(^|[|;&\s])sed(\s|$)', commit_body, re.MULTILINE) is None
 
 
 def test_hermes_env_rewrite_uses_awk_with_only_key_names_not_values():
@@ -933,44 +1008,84 @@ def test_failed_config_set_leaves_client_source_env_permissions_untouched(sandbo
     )
 
 
-def test_hermes_env_committed_before_root_env_governs_live_dispatch_first(sandbox):
-    """THE ENGINEERING-1c FIX: the two final commits (Hermes's .env, then
-    root .env) are still two sequential operations, not a single atomic
-    unit -- POSIX offers no true multi-file transaction primitive. The
-    defensible choice: commit Hermes's .env FIRST, since it's the file
-    that actually governs LIVE SKILL DISPATCH (see the module docstring's
-    "Why CLIENT_NAME is also written into Hermes's own .env" section) --
-    the exact path issue #59 was about -- so if the second commit (root
-    .env) ever fails after the first succeeds, the file that matters most
-    for #59 is already correct. Forced here via macOS's `chflags uchg`
-    (user-immutable) on a PRE-EXISTING root .env, which blocks a `mv -f`
-    onto it without restricting the directory's general writability (so
-    the earlier writability preflight still passes -- this specifically
+def test_second_commit_failure_rolls_back_hermes_env_and_config_yaml_fully(sandbox):
+    """THE ENGINEERING-1c FIX, ROUND 4 (real rollback, not manual-recovery
+    guidance): if the SECOND rename (root .env, committed last) fails
+    after the FIRST (Hermes .env) already succeeded, a prior version of
+    this script left Hermes .env AND config.yaml switched to the new
+    client while root .env stayed on the old one -- a genuine live-file
+    disagreement contradicting this script's own "no window where live
+    files disagree" claim. Fixed: on this failure, Hermes .env and
+    config.yaml are BOTH rolled back to their exact pre-install state
+    (content and mode), so every live file ends up back on the OLD
+    client, consistently -- not a new client in two files and an old
+    client in the third. Forced via macOS's `chflags uchg` (user-
+    immutable) on a pre-existing root .env, which blocks a `mv -f` onto
+    it without restricting the directory's general writability (so the
+    earlier writability preflight still passes -- this specifically
     exercises the LATE two-file-commit failure, not an early abort)."""
     if sys.platform != "darwin":
         pytest.skip("chflags is macOS-specific; this test needs a different "
                      "immutability mechanism on other platforms")
 
     root_env = sandbox["fieldkit_root"] / ".env"
+    hermes_env = sandbox["hermes_home"] / ".env"
+    config_yaml = sandbox["hermes_home"] / "config.yaml"
     root_env.write_text("CLIENT_NAME=preexisting\nFIELDKIT_ROOT=/preexisting\n")
+    hermes_env.write_text("TELEGRAM_BOT_TOKEN=preexisting-token\n")
+    config_yaml.write_text("model:\n  provider: preexisting-provider\n")
+    os.chmod(hermes_env, 0o640)
+    os.chmod(config_yaml, 0o640)
     subprocess.run(["chflags", "uchg", str(root_env)], check=True)
     try:
         _write_client_env(sandbox["fieldkit_root"], "acme")
         result = _run("acme", sandbox, "--no-restart")
         assert result.returncode != 0
-        assert "already switched to 'acme'" in result.stderr
-        assert "governs live hermes skill dispatch" in result.stderr.lower()
+        assert "rolling both" in result.stderr.lower()
 
-        # Hermes's .env (the file that matters most for #59) IS already
-        # correctly committed, despite the overall install failing.
-        hermes_env_content = (sandbox["hermes_home"] / ".env").read_text()
-        assert "CLIENT_NAME=acme" in hermes_env_content
-
-        # root .env's rename genuinely failed -- still the pre-existing
-        # content, not "acme".
+        # ALL THREE live files are back to their exact pre-install state --
+        # not "Hermes .env and config.yaml on acme, root .env on the old
+        # client" (the prior, contradictory behavior).
+        assert hermes_env.read_text() == "TELEGRAM_BOT_TOKEN=preexisting-token\n"
+        assert config_yaml.read_text() == "model:\n  provider: preexisting-provider\n"
         assert root_env.read_text() == "CLIENT_NAME=preexisting\nFIELDKIT_ROOT=/preexisting\n"
+        assert stat.S_IMODE(hermes_env.stat().st_mode) == 0o640
+        assert stat.S_IMODE(config_yaml.stat().st_mode) == 0o640
+        assert "acme" not in hermes_env.read_text()
+        assert "acme" not in config_yaml.read_text()
     finally:
         subprocess.run(["chflags", "nouchg", str(root_env)], check=True)
+
+
+def test_first_commit_failure_rolls_back_config_yaml_too(sandbox):
+    """THE OTHER HALF OF ENGINEERING-1c: if the FIRST rename (Hermes .env)
+    fails, config.yaml has ALREADY been applied to the new client by the
+    successful `hermes config set` sequence earlier in the script -- a
+    prior version's error message claimed "the client switch was NOT
+    applied at all" in this exact scenario, which was false: config.yaml
+    genuinely had been switched. Fixed: a first-commit failure now rolls
+    config.yaml back too, so the claim becomes true instead of merely
+    asserted. Forced via `chflags uchg` on a pre-existing Hermes .env."""
+    if sys.platform != "darwin":
+        pytest.skip("chflags is macOS-specific; this test needs a different "
+                     "immutability mechanism on other platforms")
+
+    hermes_env = sandbox["hermes_home"] / ".env"
+    config_yaml = sandbox["hermes_home"] / "config.yaml"
+    hermes_env.write_text("TELEGRAM_BOT_TOKEN=preexisting-token\n")
+    config_yaml.write_text("model:\n  provider: preexisting-provider\n")
+    subprocess.run(["chflags", "uchg", str(hermes_env)], check=True)
+    try:
+        _write_client_env(sandbox["fieldkit_root"], "acme")
+        result = _run("acme", sandbox, "--no-restart")
+        assert result.returncode != 0
+        assert "rolling back config.yaml too" in result.stderr.lower()
+
+        assert hermes_env.read_text() == "TELEGRAM_BOT_TOKEN=preexisting-token\n"
+        assert config_yaml.read_text() == "model:\n  provider: preexisting-provider\n"
+        assert not (sandbox["fieldkit_root"] / ".env").exists()
+    finally:
+        subprocess.run(["chflags", "nouchg", str(hermes_env)], check=True)
 
 
 def test_cleanup_trap_installed_immediately_after_each_mktemp_not_only_after_both():
@@ -1158,6 +1273,139 @@ def test_no_stale_profiles_prints_no_retirement_section(sandbox):
     result = _run("acme", sandbox, "--no-restart")
     assert result.returncode == 0, result.stderr
     assert "retire" not in result.stdout.lower() and "delete" not in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# SECURITY-5, ROUND 4: orphan launchd-service detection. The stale-profile
+# scan previously only enumerated directories under $HERMES_HOME/profiles/
+# -- but a profile directory can be deleted or renamed while its launchd
+# service (ai.hermes.gateway-<name>) stays loaded and alive with
+# credentials in memory. Confirmed against Hermes's own real source: its
+# service enumeration is independent of the profile directory tree. These
+# tests use the sandbox's stub `launchctl` (see HERMES_STUB_LAUNCHCTL_LIST_FILE)
+# to simulate exactly that disagreement -- a loaded, live launchd service
+# with NO matching profile directory at all.
+# ---------------------------------------------------------------------------
+
+def _write_launchctl_entries(sandbox, entries: list[tuple[str, str, str]]) -> None:
+    """entries: list of (pid_or_dash, status, label) tuples, matching real
+    `launchctl list`'s tab-separated table format."""
+    sandbox["launchctl_list_file"].write_text(
+        "\n".join(f"{pid}\t{status}\t{label}" for pid, status, label in entries) + "\n"
+    )
+
+
+def test_default_launchctl_stub_reports_nothing_confirming_test_isolation(sandbox):
+    """Sanity check for the isolation mechanism itself: with no
+    HERMES_STUB_LAUNCHCTL_LIST_FILE content written, the stub reports an
+    empty `launchctl list` -- proving no test in this file can accidentally
+    see this development machine's REAL running Hermes gateways
+    (ai.hermes.gateway, ai.hermes.gateway-mercury) leak into its
+    stale-profile candidate set."""
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--no-restart")
+    assert result.returncode == 0, result.stderr
+    assert "mercury" not in result.stdout  # would appear if real state leaked in
+
+
+def test_orphaned_launchd_service_with_no_profile_directory_is_detected_and_blocks(sandbox):
+    """THE CORE FIX: a launchd service (`ai.hermes.gateway-orphaned`) is
+    loaded and has a live PID, but NO `$HERMES_HOME/profiles/orphaned/`
+    directory exists at all (deleted or renamed, per the review's
+    scenario) -- the OLD directory-only scan would find nothing and let
+    the install proceed right underneath it. The install must instead
+    detect it via `launchctl list` directly and abort, exactly as for a
+    directory-based stale profile."""
+    _write_launchctl_entries(sandbox, [
+        ("462", "0", "ai.hermes.gateway"),  # the default profile -- must NOT trigger anything
+        ("999", "0", "ai.hermes.gateway-orphaned"),
+    ])
+    assert not (sandbox["hermes_home"] / "profiles" / "orphaned").exists()
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--no-restart")
+    assert result.returncode != 0
+    assert "orphaned" in result.stderr
+    assert "confirmed running" in result.stderr.lower()
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+
+
+def test_orphaned_launchd_service_with_no_live_pid_does_not_block(sandbox):
+    """The launchd service definition is loaded (still listed) but has no
+    live PID (`-` in the PID column, matching real launchctl's own
+    notation for a loaded-but-not-running service) -- must NOT block the
+    install, same as a directory-based stale profile confirmed not
+    running."""
+    _write_launchctl_entries(sandbox, [
+        ("462", "0", "ai.hermes.gateway"),
+        ("-", "0", "ai.hermes.gateway-orphaned"),
+    ])
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--no-restart")
+    assert result.returncode == 0, result.stderr
+    assert "orphaned" in result.stdout
+
+
+def test_default_profile_launchctl_label_is_never_treated_as_stale(sandbox):
+    """The bare `ai.hermes.gateway` label (no `-<name>` suffix) is the
+    DEFAULT profile -- the one this script itself manages -- and must
+    never be treated as a stale candidate, regardless of its own status."""
+    _write_launchctl_entries(sandbox, [("462", "0", "ai.hermes.gateway")])
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--no-restart")
+    assert result.returncode == 0, result.stderr
+    assert "retire" not in result.stdout.lower()
+    assert "delete" not in result.stdout.lower()
+
+
+def test_directory_and_launchctl_entry_for_same_profile_are_deduplicated(sandbox):
+    """A profile that has BOTH a `$HERMES_HOME/profiles/<name>/` directory
+    AND a matching loaded launchd service must be reported exactly once,
+    not twice, in the retirement instructions."""
+    stale_dir = sandbox["hermes_home"] / "profiles" / "mercury"
+    stale_dir.mkdir(parents=True)
+    _write_launchctl_entries(sandbox, [
+        ("462", "0", "ai.hermes.gateway"),
+        ("-", "0", "ai.hermes.gateway-mercury"),
+    ])
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--no-restart")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("hermes profile delete mercury") == 1
+
+
+def test_orphan_check_runs_on_both_early_and_late_toctou_recheck(sandbox):
+    """The orphan launchd-service scan must run on BOTH calls to
+    _abort_if_stale_profiles_running -- the early preflight AND the late
+    TOCTOU recheck immediately before `gateway start` -- not just the
+    first. Simulated via the SAME TOCTOU counter-file mechanism used for
+    the directory-based recheck test, but this time the profile is
+    orphaned (launchctl-only, no directory at all)."""
+    counter_dir = sandbox["hermes_home"] / "toctou_counters"
+    counter_dir.mkdir(parents=True)
+    # The launchctl list itself reports the orphaned service as running
+    # from the very first query -- what changes between early and late is
+    # whether `hermes -p orphaned gateway status` (the fallback path for
+    # any non-launchctl-confirmed candidate) would show it, which is
+    # irrelevant here since launchctl's own PID evidence wins outright
+    # and is checked BOTH times identically. This test instead confirms
+    # the ordinary (non-orphan) TOCTOU mechanism still works when an
+    # orphan is ALSO present and never running, proving both scans (
+    # directory + launchctl) run on every call rather than only once.
+    _write_launchctl_entries(sandbox, [("462", "0", "ai.hermes.gateway")])
+    stale_dir = sandbox["hermes_home"] / "profiles" / "mercury"
+    stale_dir.mkdir(parents=True)
+
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run(
+        "acme", sandbox,
+        extra_env={"HERMES_STUB_TOCTOU_COUNTER_DIR": str(counter_dir)},
+    )
+    assert result.returncode != 0
+    assert "mercury" in result.stderr
+    # Confirms the check fired (at least) twice -- early AND late -- with
+    # the launchctl-based scan active in both, not just directory-based.
+    assert int((counter_dir / "mercury").read_text().strip()) >= 2
 
 
 # ---------------------------------------------------------------------------
