@@ -81,18 +81,34 @@ class FFmpegVideoGenerator:
         return output_path
 
 
-def _scale_crop_filter(i: int, config: VideoConfig) -> str:
-    """Build the scale/crop/setsar/fps/zoompan filter segment for photo index i."""
+def _scale_crop_filter(i: int, config: VideoConfig, output_duration: float | None = None) -> str:
+    """Build the scale/crop/setsar/zoompan filter segment for photo index i.
+
+    Args:
+        i: Photo index (for labeling in filter graph)
+        config: Video configuration
+        output_duration: Override output duration in seconds (default: seconds_per_photo).
+                        For xfade chains, this should be seconds_per_photo + crossfade_duration.
+    """
     W, H, fps = config.width, config.height, config.fps
     spp = config.seconds_per_photo
-    # zoompan: slow Ken Burns zoom from 1.0 to 1.1 over the photo's duration
-    # d = duration in frames; z = zoom expression (linear interpolation)
-    # s = output size; the 'on' counter tracks frame number within this filter
+    duration = output_duration if output_duration is not None else spp
+    # Total output frames needed for this photo segment
+    total_frames = int(duration * fps)
+    # Zoom completes over seconds_per_photo (not the extended duration for xfade)
     zoom_frames = int(spp * fps)
+    # zoompan: slow Ken Burns zoom from 1.0 to 1.1 over seconds_per_photo,
+    # then holds at 1.1 for any remaining xfade buffer frames
+    # d = total output frames to generate (NOT frames per input!)
+    # fps = output frame rate (must match config.fps)
+    # z = zoom expression; min() ensures zoom maxes at 1.1 even past zoom_frames
+    # s = output size
+    # CRITICAL: zoompan must come BEFORE any fps filter, so it receives the still
+    # image as a single frame and generates total_frames outputs at fps rate.
     return (
         f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-        f"crop={W}:{H},setsar=1,fps={fps},"
-        f"zoompan=z='1+0.1*on/{zoom_frames}':d={zoom_frames}:s={W}x{H}[v{i}]"
+        f"crop={W}:{H},setsar=1,"
+        f"zoompan=z='min(1.1,1+0.1*on/{zoom_frames})':d={total_frames}:fps={fps}:s={W}x{H}[v{i}]"
     )
 
 
@@ -109,11 +125,9 @@ def _output_flags(config: VideoConfig) -> list[str]:
 
 
 def _build_single_photo_cmd(photo: Path, config: VideoConfig, output_path: Path) -> list[str]:
-    """FFmpeg command for N=1: -loop 1 keeps the still image source alive; -t fixes the duration."""
+    """FFmpeg command for N=1: read the still image once; zoompan expands it to full duration."""
     return [
         "ffmpeg",
-        "-loop", "1",
-        "-t", str(config.seconds_per_photo),
         "-i", str(photo),
         "-filter_complex", _scale_crop_filter(0, config),
         "-map", "[v0]",
@@ -123,21 +137,21 @@ def _build_single_photo_cmd(photo: Path, config: VideoConfig, output_path: Path)
 
 
 def _build_multi_photo_cmd(photos: list[Path], config: VideoConfig, output_path: Path) -> list[str]:
-    """FFmpeg command for N≥2: per-photo scale/crop followed by an xfade chain."""
+    """FFmpeg command for N≥2: per-photo zoompan followed by an xfade chain."""
     n = len(photos)
     spp = config.seconds_per_photo
     xfade = config.crossfade_duration
-    # Each still-image input needs -loop 1 and -t so FFmpeg generates enough
-    # frames for the xfade chain. spp + xfade gives the right-side input of
-    # each transition a sufficient buffer of frames.
-    input_duration = spp + xfade
+    # Each photo's zoompan filter generates spp + xfade seconds worth of frames,
+    # giving the xfade chain sufficient buffer for transitions.
+    zoompan_duration = spp + xfade
 
     cmd = ["ffmpeg"]
     for photo in photos:
-        cmd += ["-loop", "1", "-t", f"{input_duration:g}", "-i", str(photo)]
+        # Read each still image once; zoompan will expand it to zoompan_duration
+        cmd += ["-i", str(photo)]
 
-    # Per-photo scale/crop filters
-    filters = [_scale_crop_filter(i, config) for i in range(n)]
+    # Per-photo scale/crop/zoompan filters with extended duration for xfade
+    filters = [_scale_crop_filter(i, config, output_duration=zoompan_duration) for i in range(n)]
 
     # Xfade chain: N photos → N−1 transitions
     # offset[i] = (i + 1) × (seconds_per_photo − crossfade_duration)

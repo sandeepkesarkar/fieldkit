@@ -211,10 +211,10 @@ def test_generate_clock_frames_distinct_background_colors(tmp_path):
     # Extract the background color from the top-left corner of each frame
     bg_colors = []
     for frame_path in frames:
-        img = Image.open(frame_path)
-        # Sample the top-left pixel (background, not text)
-        bg_color = img.getpixel((10, 10))
-        bg_colors.append(bg_color)
+        with Image.open(frame_path) as img:
+            # Sample the top-left pixel (background, not text)
+            bg_color = img.getpixel((10, 10))
+            bg_colors.append(bg_color)
 
     # Verify that consecutive frames have different colors
     for i in range(len(bg_colors) - 1):
