@@ -559,19 +559,19 @@ def test_watermark_escapes_special_characters(tmp_path, gen, mock_ffmpeg_ok):
     assert "s Bar\\:" in fc  # Colon escaped even inside quotes
     assert "100% " in fc  # Percent and space protected by quotes
     assert "\\\\Cool\\\\" in fc  # Backslashes doubled
-    # ROUND 3: text_expansion=none disables %{...} expansion in drawtext
-    assert "text_expansion=none" in fc
+    # ROUND 3/4: expansion=none disables %{...} expansion in drawtext
+    assert "expansion=none" in fc
 
 
-def test_watermark_includes_text_expansion_none(tmp_path, gen, mock_ffmpeg_ok):
-    """text_expansion=none is present to disable %{...} expansion (ROUND 3 FIX)."""
+def test_watermark_includes_expansion_none(tmp_path, gen, mock_ffmpeg_ok):
+    """expansion=none is present to disable %{...} expansion (ROUND 3/4 FIX)."""
     cfg = VideoConfig(watermark_text="100%", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
-    # Must include text_expansion=none to prevent drawtext from interpreting
-    # % as the start of a %{...} metadata expansion sequence
-    assert "text_expansion=none" in fc
+    # Must include expansion=none (NOT text_expansion) to prevent drawtext
+    # from interpreting % as the start of a %{...} metadata expansion sequence
+    assert "expansion=none" in fc
     # The literal % character should be present in the text value
     assert "100%" in fc
 

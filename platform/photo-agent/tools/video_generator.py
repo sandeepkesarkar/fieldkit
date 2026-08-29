@@ -206,16 +206,17 @@ def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str]
     # box=1 enables background box, boxcolor with @alpha for opacity.
     # x position clamped to avoid negative/clipped rendering for long names on narrow output.
     #
-    # ROUND 3 FIX: Add text_expansion=none to disable drawtext's %{...} expansion.
+    # ROUND 3/4 FIX: Add expansion=none to disable drawtext's %{...} expansion.
     # After filtergraph parsing strips the quotes, drawtext's text-expansion stage
     # would interpret %{pts}, %{n}, etc. as metadata — a literal % in a client
     # display name (e.g. "100%") would be at risk of misinterpretation. Setting
-    # text_expansion=none treats the text value as fully literal with no dynamic
-    # expansion, which is exactly what's wanted for a static display name.
+    # expansion=none (NOT text_expansion — that was a round 4 typo) treats the
+    # text value as fully literal with no dynamic expansion, which is exactly
+    # what's wanted for a static display name.
     filter_segment = (
         f"{source_label}drawtext="
         f"text='{escaped_text}':"
-        f"text_expansion=none:"
+        f"expansion=none:"
         f"fontfile='{escaped_font_path}':"
         f"fontsize=28:"
         f"fontcolor=white:"
