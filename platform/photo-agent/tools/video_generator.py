@@ -28,6 +28,10 @@ class VideoConfig:
     seconds_per_photo: int = 4
     crossfade_duration: float = 0.5
     bitrate: str = "3M"
+    # Holds the final frame for this many extra seconds at the end of the video,
+    # so a viewer looping playback gets a moment to read it before it restarts.
+    # Set to 0 to disable.
+    freeze_duration: float = 1.5
 
     def __post_init__(self) -> None:
         if self.crossfade_duration < 0:
@@ -37,6 +41,8 @@ class VideoConfig:
                 f"crossfade_duration ({self.crossfade_duration}) must be less than "
                 f"seconds_per_photo ({self.seconds_per_photo}) — xfade offsets would be <= 0"
             )
+        if self.freeze_duration < 0:
+            raise ValueError(f"freeze_duration must be >= 0, got {self.freeze_duration}")
 
 
 class VideoGenerationError(Exception):
@@ -112,6 +118,21 @@ def _scale_crop_filter(i: int, config: VideoConfig, output_duration: float | Non
     )
 
 
+def _freeze_filter(config: VideoConfig, source_label: str) -> tuple[str, str]:
+    """Build a tpad filter segment that holds the last frame of source_label.
+
+    Args:
+        config: Video configuration (uses freeze_duration).
+        source_label: Bracketed input label, e.g. "[v0]" or "[xout]".
+
+    Returns (filter_segment, output_label) — output_label is always "[vout]".
+    """
+    return (
+        f"{source_label}tpad=stop_mode=clone:stop_duration={config.freeze_duration:g}[vout]",
+        "[vout]",
+    )
+
+
 def _output_flags(config: VideoConfig) -> list[str]:
     """Build the shared encoding output flags."""
     return [
@@ -126,11 +147,16 @@ def _output_flags(config: VideoConfig) -> list[str]:
 
 def _build_single_photo_cmd(photo: Path, config: VideoConfig, output_path: Path) -> list[str]:
     """FFmpeg command for N=1: read the still image once; zoompan expands it to full duration."""
+    filters = [_scale_crop_filter(0, config)]
+    map_label = "[v0]"
+    if config.freeze_duration > 0:
+        freeze_filter, map_label = _freeze_filter(config, "[v0]")
+        filters.append(freeze_filter)
     return [
         "ffmpeg",
         "-i", str(photo),
-        "-filter_complex", _scale_crop_filter(0, config),
-        "-map", "[v0]",
+        "-filter_complex", ";".join(filters),
+        "-map", map_label,
         *_output_flags(config),
         str(output_path),
     ]
@@ -166,9 +192,14 @@ def _build_multi_photo_cmd(photos: list[Path], config: VideoConfig, output_path:
             f"{left}{right}xfade=transition=fade:duration={xfade:g}:offset={offset:g}{out}"
         )
 
+    map_label = "[xout]"
+    if config.freeze_duration > 0:
+        freeze_filter, map_label = _freeze_filter(config, "[xout]")
+        filters.append(freeze_filter)
+
     cmd += [
         "-filter_complex", ";".join(filters),
-        "-map", "[xout]",
+        "-map", map_label,
         *_output_flags(config),
         str(output_path),
     ]
