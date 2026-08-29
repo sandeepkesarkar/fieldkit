@@ -227,6 +227,83 @@ def test_generate_clock_frames_distinct_background_colors(tmp_path):
         f"Expected at least 8 distinct colors, got {len(unique_colors)}"
 
 
+def test_generate_clock_frames_progress_bar_grows_monotonically(tmp_path):
+    """Progress bar width increases monotonically from first to last frame."""
+    from PIL import Image
+    n_frames = 8
+    _generate_clock_frames(n_frames, 1700000000, tmp_path)
+    frames = sorted(tmp_path.glob("frame_*.jpg"))
+
+    # Measure the width of the white progress bar at the bottom of each frame
+    bar_widths = []
+    for frame_path in frames:
+        with Image.open(frame_path) as img:
+            width, height = img.size
+            # Sample the bottom row to count white pixels (progress bar)
+            bottom_y = height - 3  # Middle of the 6px tall bar
+            white_count = 0
+            for x in range(width):
+                pixel = img.getpixel((x, bottom_y))
+                # White or near-white pixel (accounting for JPEG compression)
+                if all(c >= 240 for c in pixel):
+                    white_count += 1
+            bar_widths.append(white_count)
+
+    # Verify monotonic growth
+    for i in range(len(bar_widths) - 1):
+        assert bar_widths[i] < bar_widths[i + 1], \
+            f"Progress bar width did not increase from frame {i} to {i+1}: " \
+            f"{bar_widths[i]} >= {bar_widths[i+1]}"
+
+
+def test_generate_clock_frames_progress_bar_first_vs_last(tmp_path):
+    """First frame has small progress bar, last frame has full-width progress bar."""
+    from PIL import Image
+    n_frames = 10
+    _generate_clock_frames(n_frames, 1700000000, tmp_path)
+    frames = sorted(tmp_path.glob("frame_*.jpg"))
+
+    first_frame = frames[0]
+    last_frame = frames[-1]
+
+    with Image.open(first_frame) as img:
+        width, height = img.size
+        bottom_y = height - 3
+        first_white_count = sum(1 for x in range(width)
+                                if all(c >= 240 for c in img.getpixel((x, bottom_y))))
+
+    with Image.open(last_frame) as img:
+        bottom_y = height - 3
+        last_white_count = sum(1 for x in range(width)
+                               if all(c >= 240 for c in img.getpixel((x, bottom_y))))
+
+    # First frame should have ~1/n_frames width, last frame should have full width
+    assert first_white_count < width // 2, \
+        f"First frame progress bar too wide: {first_white_count} >= {width // 2}"
+    assert last_white_count > width * 0.95, \
+        f"Last frame progress bar not full-width: {last_white_count} <= {width * 0.95}"
+
+
+def test_generate_clock_frames_single_frame_no_crash(tmp_path):
+    """Generating a single frame (n_frames=1) does not crash and produces valid output."""
+    from PIL import Image
+    _generate_clock_frames(1, 1700000000, tmp_path)
+    frames = sorted(tmp_path.glob("frame_*.jpg"))
+    assert len(frames) == 1
+
+    # Verify the frame is valid and has a full-width progress bar (100% for 1/1)
+    with Image.open(frames[0]) as img:
+        width, height = img.size
+        assert width == 1080
+        assert height == 1920
+        # Check that progress bar is full-width
+        bottom_y = height - 3
+        white_count = sum(1 for x in range(width)
+                          if all(c >= 240 for c in img.getpixel((x, bottom_y))))
+        assert white_count > width * 0.95, \
+            f"Single frame progress bar not full-width: {white_count} <= {width * 0.95}"
+
+
 # ---------------------------------------------------------------------------
 # T014: Stage 2 — _upload_frames_to_drive
 # ---------------------------------------------------------------------------
