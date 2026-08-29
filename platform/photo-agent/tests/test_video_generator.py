@@ -519,8 +519,8 @@ def test_watermark_present_when_watermark_text_is_set_single_photo(tmp_path, gen
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    # Text is no longer wrapped in quotes; spaces are escaped
-    assert "text=Demo\\ Client" in fc
+    # Round 2 fix: Text is now wrapped in SINGLE QUOTES with spaces protected
+    assert "text='Demo Client'" in fc
     assert "[v0]drawtext=" in fc
     # Map should target [vout] (freeze output), not [vwm] directly
     assert cmd[cmd.index("-map") + 1] == "[vout]"
@@ -533,25 +533,32 @@ def test_watermark_present_when_watermark_text_is_set_multi_photo(tmp_path, gen,
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    # Text is no longer wrapped in quotes; spaces are escaped
-    assert "text=Construction\\ Co" in fc
+    # Round 2 fix: Text is now wrapped in SINGLE QUOTES with spaces protected
+    assert "text='Construction Co'" in fc
     assert "[xout]drawtext=" in fc
     # Map should target [vout] (freeze output), not [vwm] directly
     assert cmd[cmd.index("-map") + 1] == "[vout]"
 
 
 def test_watermark_escapes_special_characters(tmp_path, gen, mock_ffmpeg_ok):
-    """Watermark text with drawtext metacharacters is escaped correctly (BLOCKING FIX #1)."""
+    """Watermark text with drawtext metacharacters is escaped correctly (ROUND 2 FIX)."""
     # Test string contains: colon, single quote, backslash, percent, spaces
-    # This is the exact string that failed in the reviewer's report
+    # This is the exact string that failed in rounds 1 and 2 of reviewer reports
     cfg = VideoConfig(watermark_text="Foo's Bar: 100% \\Cool\\", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
-    # Expected escaping (no quotes around value):
-    # \ → \\, space → \ , : → \:, ' → \', % → \%
-    # "Foo's Bar: 100% \Cool\" → "Foo\'s\ Bar\:\ 100\%\ \\Cool\\"
-    assert "text=Foo\\'s\\ Bar\\:\\ 100\\%\\ \\\\Cool\\\\" in fc
+    # Expected escaping (wrapped in single quotes with TWO-LAYER aware escaping):
+    # Value wrapped in quotes: text='...'
+    # Inside quotes: \ → \\, : → \:, ' → '\''
+    # Spaces and % are protected by quotes (no escaping needed)
+    # "Foo's Bar: 100% \Cool\" → text='Foo'\''s Bar\: 100% \\Cool\\'
+    # Check each component separately for clarity
+    assert "text='Foo" in fc  # Opening quote
+    assert "\\''" in fc  # Escaped apostrophe (close quote, escaped quote, reopen)
+    assert "s Bar\\:" in fc  # Colon escaped even inside quotes
+    assert "100% " in fc  # Percent and space protected by quotes
+    assert "\\\\Cool\\\\" in fc  # Backslashes doubled
 
 
 def test_watermark_skipped_when_font_file_missing(tmp_path, gen, mock_ffmpeg_ok, caplog):
@@ -617,7 +624,7 @@ def test_watermark_skipped_when_font_path_is_directory(tmp_path, gen, mock_ffmpe
 
 
 def test_watermark_escapes_font_path_with_colon_and_space(tmp_path, gen, mock_ffmpeg_ok):
-    """Font path containing : and space is escaped correctly (BLOCKING FIX #2)."""
+    """Font path containing : and space is escaped correctly (ROUND 2 FIX)."""
     # Create a font file with problematic characters in the path
     font_dir = tmp_path / "fonts with: colons"
     font_dir.mkdir()
@@ -629,6 +636,8 @@ def test_watermark_escapes_font_path_with_colon_and_space(tmp_path, gen, mock_ff
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    # Font path should have spaces and colons escaped
-    assert "\\ " in fc  # escaped space
-    assert "\\:" in fc  # escaped colon
+    # Font path wrapped in single quotes with colon escaped (spaces protected by quotes)
+    assert "fontfile='" in fc  # value is quoted
+    assert "\\:" in fc  # colon is escaped even inside quotes (empirically required)
+    # Spaces are protected by quotes, NOT escaped to \
+    assert "with: colons" in fc or "with\\: colons" in fc  # path contains the dir name

@@ -124,31 +124,36 @@ def _scale_crop_filter(i: int, config: VideoConfig, output_duration: float | Non
     )
 
 
-def _escape_drawtext_value(text: str) -> str:
-    r"""Escape text for ffmpeg's drawtext filter (used without surrounding quotes).
+def _escape_for_quoted_filtergraph_value(text: str) -> str:
+    r"""Escape text for use inside SINGLE-QUOTED ffmpeg filtergraph option values.
 
-    FFmpeg's filtergraph parser requires backslash-escaping for special characters.
-    Since we use text=value (NOT text='value'), we must escape spaces along with
-    other metacharacters. Order matters: backslash must be escaped first.
+    FFmpeg's filtergraph parser has TWO parsing layers, and empirical testing shows
+    that COLONS are special even inside single-quoted values — they must be
+    backslash-escaped to prevent misinterpretation as option separators.
+
+    Escaping rules for text inside 'text=...' or 'fontfile=...':
+    1. Backslash: \ → \\ (backslash retains escape role)
+    2. Single quote: ' → '\'' (close quote, escaped quote outside, reopen)
+       CANNOT use \' inside quotes — that terminates the quote early
+    3. Colon: : → \: (empirically required even inside quotes — see round 2 bug)
+    4. Everything else (spaces, %, [, ], etc.) is protected by quotes
 
     Args:
-        text: Raw text value (e.g. "Foo's Bar: 100%")
+        text: Raw text value (e.g. "Foo's Bar: 100%" or "/tmp/test: fonts/Font.ttc")
 
     Returns:
-        Escaped text suitable for text=... in drawtext filter
-        (e.g. r"Foo\'s\ Bar\:\ 100\%")
+        Escaped text suitable for INSIDE single quotes in filter option values
+
+    Examples:
+        "Foo's Bar: 100%" → "Foo'\''s Bar\: 100%" → wrapped as 'Foo'\''s Bar\: 100%'
+        "/test: fonts/Font File.ttc" → "/test\: fonts/Font File.ttc"
+        "Test\Path" → "Test\\Path"
     """
-    # Order is critical: escape backslash first, then other chars that need backslash escaping
-    text = text.replace("\\", "\\\\")  # \ → \\
-    text = text.replace(" ", "\\ ")    # space → \ (required when not using quotes)
-    text = text.replace(":", "\\:")    # : → \: (option separator)
-    text = text.replace("'", "\\'")    # ' → \' (quote character)
-    text = text.replace("%", "\\%")    # % → \% (metadata expansion)
-    # Additional filtergraph metacharacters that could appear in display names
-    text = text.replace("[", "\\[")
-    text = text.replace("]", "\\]")
-    text = text.replace(";", "\\;")
-    text = text.replace(",", "\\,")
+    # Order is critical: backslash first, then colon, then single quote
+    text = text.replace("\\", "\\\\")  # \ → \\ (must be first!)
+    text = text.replace(":", "\\:")    # : → \: (required even inside quotes)
+    text = text.replace("'", "'\\''")  # ' → '\'' (close, escaped quote, reopen)
+    # Spaces, %, etc. are protected by the single quotes (no escaping needed)
     return text
 
 
@@ -184,15 +189,17 @@ def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str]
         )
         return None
 
-    # BLOCKING FIX #1: Use _escape_drawtext_value and do NOT wrap text in quotes.
-    # text='Foo\'s Bar' fails because the \' does not escape the quote inside '...',
-    # it terminates the quoted section early. Correct syntax is text=Foo\'s\ Bar
-    # (no quotes, escape spaces and special chars).
-    escaped_text = _escape_drawtext_value(config.watermark_text)
-
-    # BLOCKING FIX #2: Escape the font path as well. Paths containing : (option
-    # separator) or other metacharacters will corrupt the filter graph.
-    escaped_font_path = _escape_drawtext_value(str(font_path))
+    # ROUND 2 FIX: Use SINGLE-QUOTED filtergraph values (text='...', fontfile='...')
+    # to handle TWO-LAYER parsing correctly. The round 1 fix used bare backslash
+    # escaping (text=Foo\'s\ Bar\:...), but that only protects against the OUTER
+    # filtergraph parser consuming one layer of escaping — the resulting literal
+    # unescaped : is still seen as an option separator by the parser, causing
+    # "Error parsing a filter description" / "No option name near ...".
+    #
+    # Correct approach per ffmpeg filtergraph quoting rules: wrap values in single
+    # quotes, where only \ and ' need escaping (everything else is protected).
+    escaped_text = _escape_for_quoted_filtergraph_value(config.watermark_text)
+    escaped_font_path = _escape_for_quoted_filtergraph_value(str(font_path))
 
     # Semi-opaque background box for legibility against arbitrary photo backgrounds.
     # Position at bottom-right with padding. Font size 28 for 1080px width.
@@ -200,8 +207,8 @@ def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str]
     # x position clamped to avoid negative/clipped rendering for long names on narrow output.
     filter_segment = (
         f"{source_label}drawtext="
-        f"text={escaped_text}:"
-        f"fontfile={escaped_font_path}:"
+        f"text='{escaped_text}':"
+        f"fontfile='{escaped_font_path}':"
         f"fontsize=28:"
         f"fontcolor=white:"
         f"box=1:"
