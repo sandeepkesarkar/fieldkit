@@ -497,3 +497,88 @@ def test_generate_raises_on_empty_output(tmp_path, gen, mock_ffmpeg_ok):
     )
     with pytest.raises(VideoGenerationError, match="missing or empty"):
         gen.generate(make_photos(tmp_path, 2), VideoConfig(), tmp_path / "out.mp4")
+
+
+# ---------------------------------------------------------------------------
+# Watermark (CLIENT_DISPLAY_NAME)
+# ---------------------------------------------------------------------------
+
+def test_watermark_absent_when_watermark_text_is_none(tmp_path, gen, mock_ffmpeg_ok):
+    """When watermark_text is None, no drawtext filter appears in the command."""
+    cfg = VideoConfig(watermark_text=None)
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+
+
+def test_watermark_present_when_watermark_text_is_set_single_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=1 with watermark_text set, drawtext filter is present between [v0] and freeze."""
+    cfg = VideoConfig(watermark_text="Demo Client", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    assert "text='Demo Client'" in fc
+    assert "[v0]drawtext=" in fc
+    # Map should target [vout] (freeze output), not [vwm] directly
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+
+
+def test_watermark_present_when_watermark_text_is_set_multi_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2 with watermark_text set, drawtext filter is present after xfade."""
+    cfg = VideoConfig(watermark_text="Construction Co", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    assert "text='Construction Co'" in fc
+    assert "[xout]drawtext=" in fc
+    # Map should target [vout] (freeze output), not [vwm] directly
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+
+
+def test_watermark_escapes_special_characters(tmp_path, gen, mock_ffmpeg_ok):
+    """Watermark text with drawtext metacharacters is escaped correctly."""
+    # Test string contains: colon, single quote, backslash, percent
+    cfg = VideoConfig(watermark_text="Foo's Bar: 100% \\Cool\\", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    # Expected escaping: \ → \\, : → \:, ' → \', % → \%
+    assert "text='Foo\\'s Bar\\: 100\\% \\\\Cool\\\\'" in fc
+
+
+def test_watermark_skipped_when_font_file_missing(tmp_path, gen, mock_ffmpeg_ok, caplog):
+    """When watermark_font_path does not exist, the watermark is skipped with a warning."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/nonexistent/font.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+    assert "Watermark font file not found" in caplog.text
+    assert "skipping watermark" in caplog.text
+
+
+def test_watermark_single_photo_no_freeze(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=1 with watermark but no freeze, map targets [vwm] directly."""
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc", freeze_duration=0)
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    assert "[v0]drawtext=" in fc
+    assert cmd[cmd.index("-map") + 1] == "[vwm]"
+
+
+def test_watermark_multi_photo_no_freeze(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2 with watermark but no freeze, map targets [vwm] directly."""
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc", freeze_duration=0)
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    assert "[xout]drawtext=" in fc
+    assert cmd[cmd.index("-map") + 1] == "[vwm]"

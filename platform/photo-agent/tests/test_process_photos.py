@@ -715,3 +715,47 @@ def test_telegram_error_no_chat_id_skips_send_but_still_exits(monkeypatch, mocke
         proc._telegram_error("something broke")
     mock_send.assert_not_called()
     assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Client display name resolution
+# ---------------------------------------------------------------------------
+
+def test_resolve_client_display_name_uses_env_var_when_set(monkeypatch):
+    """When CLIENT_DISPLAY_NAME is set, it is returned as-is."""
+    import scripts.process_photos as proc
+    monkeypatch.setenv("CLIENT_DISPLAY_NAME", "My Custom Name")
+    monkeypatch.setenv("CLIENT_NAME", "_demo")
+    assert proc._resolve_client_display_name() == "My Custom Name"
+
+
+def test_resolve_client_display_name_derives_from_client_name_demo(monkeypatch):
+    """When CLIENT_DISPLAY_NAME is unset, derives from CLIENT_NAME: _demo → Demo."""
+    import scripts.process_photos as proc
+    monkeypatch.delenv("CLIENT_DISPLAY_NAME", raising=False)
+    monkeypatch.setenv("CLIENT_NAME", "_demo")
+    assert proc._resolve_client_display_name() == "Demo"
+
+
+def test_resolve_client_display_name_derives_from_client_name_construction_co(monkeypatch):
+    """When CLIENT_DISPLAY_NAME is unset, derives from CLIENT_NAME: _construction_co → Construction Co."""
+    import scripts.process_photos as proc
+    monkeypatch.delenv("CLIENT_DISPLAY_NAME", raising=False)
+    monkeypatch.setenv("CLIENT_NAME", "_construction_co")
+    assert proc._resolve_client_display_name() == "Construction Co"
+
+
+def test_resolve_client_display_name_derives_from_client_name_no_leading_underscore(monkeypatch):
+    """Derivation works correctly even if CLIENT_NAME has no leading underscore."""
+    import scripts.process_photos as proc
+    monkeypatch.delenv("CLIENT_DISPLAY_NAME", raising=False)
+    monkeypatch.setenv("CLIENT_NAME", "test_client")
+    assert proc._resolve_client_display_name() == "Test Client"
+
+
+def test_resolve_client_display_name_empty_env_var_falls_back_to_derivation(monkeypatch):
+    """When CLIENT_DISPLAY_NAME is set but empty/whitespace, derives from CLIENT_NAME."""
+    import scripts.process_photos as proc
+    monkeypatch.setenv("CLIENT_DISPLAY_NAME", "  ")
+    monkeypatch.setenv("CLIENT_NAME", "_demo")
+    assert proc._resolve_client_display_name() == "Demo"
