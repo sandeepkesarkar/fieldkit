@@ -32,6 +32,12 @@ class VideoConfig:
     # so a viewer looping playback gets a moment to read it before it restarts.
     # Set to 0 to disable.
     freeze_duration: float = 1.5
+    # Optional watermark text to burn into the video (e.g. client display name).
+    # When set, a drawtext filter is applied to the final composited output.
+    watermark_text: str | None = None
+    # Font file path for the watermark. Only used when watermark_text is set.
+    # If the file doesn't exist at generation time, the watermark is skipped with a warning.
+    watermark_font_path: str = "/System/Library/Fonts/Helvetica.ttc"
 
     def __post_init__(self) -> None:
         if self.crossfade_duration < 0:
@@ -118,6 +124,112 @@ def _scale_crop_filter(i: int, config: VideoConfig, output_duration: float | Non
     )
 
 
+def _escape_for_quoted_filtergraph_value(text: str) -> str:
+    r"""Escape text for use inside SINGLE-QUOTED ffmpeg filtergraph option values.
+
+    FFmpeg's filtergraph parser has TWO parsing layers, and empirical testing shows
+    that COLONS are special even inside single-quoted values — they must be
+    backslash-escaped to prevent misinterpretation as option separators.
+
+    Escaping rules for text inside 'text=...' or 'fontfile=...':
+    1. Backslash: \ → \\ (backslash retains escape role)
+    2. Single quote: ' → '\'' (close quote, escaped quote outside, reopen)
+       CANNOT use \' inside quotes — that terminates the quote early
+    3. Colon: : → \: (empirically required even inside quotes — see round 2 bug)
+    4. Everything else (spaces, %, [, ], etc.) is protected by quotes
+
+    Args:
+        text: Raw text value (e.g. "Foo's Bar: 100%" or "/tmp/test: fonts/Font.ttc")
+
+    Returns:
+        Escaped text suitable for INSIDE single quotes in filter option values
+
+    Examples:
+        "Foo's Bar: 100%" → "Foo'\''s Bar\: 100%" → wrapped as 'Foo'\''s Bar\: 100%'
+        "/test: fonts/Font File.ttc" → "/test\: fonts/Font File.ttc"
+        "Test\Path" → "Test\\Path"
+    """
+    # Order is critical: backslash first, then colon, then single quote
+    text = text.replace("\\", "\\\\")  # \ → \\ (must be first!)
+    text = text.replace(":", "\\:")    # : → \: (required even inside quotes)
+    text = text.replace("'", "'\\''")  # ' → '\'' (close, escaped quote, reopen)
+    # Spaces, %, etc. are protected by the single quotes (no escaping needed)
+    return text
+
+
+def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str] | None:
+    """Build a drawtext filter segment for the watermark if configured.
+
+    Args:
+        config: Video configuration (uses watermark_text and watermark_font_path).
+        source_label: Bracketed input label, e.g. "[vout]" or "[v0]".
+
+    Returns (filter_segment, output_label) tuple if watermark is configured and
+            font file exists, otherwise None. Output label is always "[vwm]".
+    """
+    if not config.watermark_text:
+        return None
+
+    # BLOCKING FIX #3: Check for non-empty string AND is_file() (not just exists()).
+    # Path("").exists() resolves to "." (current dir) which exists, and any directory
+    # also exists but is not a valid font file — both must skip gracefully.
+    if not config.watermark_font_path or not config.watermark_font_path.strip():
+        logger.warning(
+            "Watermark font path is empty — skipping watermark. "
+            "Set FIELDKIT_WATERMARK_FONT_PATH to a valid .ttf/.ttc file."
+        )
+        return None
+
+    font_path = Path(config.watermark_font_path)
+    if not font_path.is_file():
+        logger.warning(
+            "Watermark font file not found or is not a file at %s — skipping watermark. "
+            "Set FIELDKIT_WATERMARK_FONT_PATH to a valid .ttf/.ttc file.",
+            font_path
+        )
+        return None
+
+    # ROUND 2 FIX: Use SINGLE-QUOTED filtergraph values (text='...', fontfile='...')
+    # to handle TWO-LAYER parsing correctly. The round 1 fix used bare backslash
+    # escaping (text=Foo\'s\ Bar\:...), but that only protects against the OUTER
+    # filtergraph parser consuming one layer of escaping — the resulting literal
+    # unescaped : is still seen as an option separator by the parser, causing
+    # "Error parsing a filter description" / "No option name near ...".
+    #
+    # Correct approach per ffmpeg filtergraph quoting rules: wrap values in single
+    # quotes, where only \ and ' need escaping (everything else is protected).
+    escaped_text = _escape_for_quoted_filtergraph_value(config.watermark_text)
+    escaped_font_path = _escape_for_quoted_filtergraph_value(str(font_path))
+
+    # Semi-opaque background box for legibility against arbitrary photo backgrounds.
+    # Position at bottom-right with padding. Font size 28 for 1080px width.
+    # box=1 enables background box, boxcolor with @alpha for opacity.
+    # x position clamped to avoid negative/clipped rendering for long names on narrow output.
+    #
+    # ROUND 3/4 FIX: Add expansion=none to disable drawtext's %{...} expansion.
+    # After filtergraph parsing strips the quotes, drawtext's text-expansion stage
+    # would interpret %{pts}, %{n}, etc. as metadata — a literal % in a client
+    # display name (e.g. "100%") would be at risk of misinterpretation. Setting
+    # expansion=none (NOT text_expansion — that was a round 4 typo) treats the
+    # text value as fully literal with no dynamic expansion, which is exactly
+    # what's wanted for a static display name.
+    filter_segment = (
+        f"{source_label}drawtext="
+        f"text='{escaped_text}':"
+        f"expansion=none:"
+        f"fontfile='{escaped_font_path}':"
+        f"fontsize=28:"
+        f"fontcolor=white:"
+        f"box=1:"
+        f"boxcolor=black@0.6:"
+        f"boxborderw=8:"
+        f"x=max(20\\,w-text_w-20):"
+        f"y=h-text_h-20"
+        f"[vwm]"
+    )
+    return (filter_segment, "[vwm]")
+
+
 def _freeze_filter(config: VideoConfig, source_label: str) -> tuple[str, str]:
     """Build a tpad filter segment that holds the last frame of source_label.
 
@@ -149,9 +261,18 @@ def _build_single_photo_cmd(photo: Path, config: VideoConfig, output_path: Path)
     """FFmpeg command for N=1: read the still image once; zoompan expands it to full duration."""
     filters = [_scale_crop_filter(0, config)]
     map_label = "[v0]"
+
+    # Apply watermark if configured (after zoompan, before freeze)
+    watermark_result = _watermark_filter(config, "[v0]")
+    if watermark_result:
+        watermark_filter, map_label = watermark_result
+        filters.append(watermark_filter)
+
+    # Apply freeze if configured (after watermark)
     if config.freeze_duration > 0:
-        freeze_filter, map_label = _freeze_filter(config, "[v0]")
+        freeze_filter, map_label = _freeze_filter(config, map_label)
         filters.append(freeze_filter)
+
     return [
         "ffmpeg",
         "-i", str(photo),
@@ -193,8 +314,16 @@ def _build_multi_photo_cmd(photos: list[Path], config: VideoConfig, output_path:
         )
 
     map_label = "[xout]"
+
+    # Apply watermark if configured (after xfade chain, before freeze)
+    watermark_result = _watermark_filter(config, "[xout]")
+    if watermark_result:
+        watermark_filter, map_label = watermark_result
+        filters.append(watermark_filter)
+
+    # Apply freeze if configured (after watermark)
     if config.freeze_duration > 0:
-        freeze_filter, map_label = _freeze_filter(config, "[xout]")
+        freeze_filter, map_label = _freeze_filter(config, map_label)
         filters.append(freeze_filter)
 
     cmd += [

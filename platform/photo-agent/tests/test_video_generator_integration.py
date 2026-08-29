@@ -153,3 +153,119 @@ def test_nonexistent_input_raises_video_generation_error(tmp_path, gen):
     missing = [tmp_path / "ghost.jpg"]
     with pytest.raises(VideoGenerationError):
         gen.generate(missing, _TEST_CONFIG, tmp_path / "out.mp4")
+
+
+# ---------------------------------------------------------------------------
+# Watermark integration
+# ---------------------------------------------------------------------------
+
+def _has_drawtext_filter() -> bool:
+    """Check if FFmpeg has the drawtext filter available (requires libfreetype)."""
+    if FFMPEG is None:
+        return False
+    result = subprocess.run(
+        ["ffmpeg", "-filters"],
+        capture_output=True,
+        text=True,
+    )
+    return "drawtext" in result.stdout
+
+
+def test_watermark_produces_valid_output_single_photo(tmp_path, gen, single_image):
+    """N=1 with watermark configured produces a valid MP4 file."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=2,
+        watermark_text="Demo Client",
+        watermark_font_path="/System/Library/Fonts/Helvetica.ttc"
+    )
+    output = tmp_path / "out.mp4"
+    result = gen.generate(single_image, cfg, output)
+    assert result == output
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_watermark_produces_valid_output_multi_photo(tmp_path, gen, three_images):
+    """N=3 with watermark configured produces a valid MP4 file."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=2,
+        watermark_text="Construction Co",
+        watermark_font_path="/System/Library/Fonts/Helvetica.ttc"
+    )
+    output = tmp_path / "out.mp4"
+    result = gen.generate(three_images, cfg, output)
+    assert result == output
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_watermark_with_special_characters_produces_valid_output(tmp_path, gen, single_image):
+    """Watermark text containing apostrophe and other metacharacters works (BLOCKING FIX #1).
+
+    This is the exact test case from the reviewer's report that exposed the
+    apostrophe escaping bug. With the fix, this must produce valid output.
+    """
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=2,
+        watermark_text="Foo's Bar: 100% \\Cool\\",
+        watermark_font_path="/System/Library/Fonts/Helvetica.ttc",
+        freeze_duration=0  # Disable freeze for faster test
+    )
+    output = tmp_path / "out.mp4"
+    result = gen.generate(single_image, cfg, output)
+    assert result == output
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_watermark_with_font_path_containing_special_chars(tmp_path, gen, single_image):
+    """Font path with : and space works correctly (BLOCKING FIX #2)."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+
+    # Create a font directory with problematic characters
+    font_dir = tmp_path / "test: fonts"
+    font_dir.mkdir()
+    # Copy the system font to our test location
+    import shutil
+    system_font = Path("/System/Library/Fonts/Helvetica.ttc")
+    if not system_font.exists():
+        pytest.skip("System font not available")
+    test_font = font_dir / "Test Font.ttc"
+    shutil.copy(system_font, test_font)
+
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=1,
+        watermark_text="Demo",
+        watermark_font_path=str(test_font),
+        freeze_duration=0
+    )
+    output = tmp_path / "out.mp4"
+    result = gen.generate(single_image, cfg, output)
+    assert result == output
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_watermark_empty_font_path_skips_gracefully(tmp_path, gen, single_image, caplog):
+    """Empty font path skips watermark gracefully (BLOCKING FIX #3)."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=1,
+        watermark_text="Demo",
+        watermark_font_path="",
+        freeze_duration=0
+    )
+    output = tmp_path / "out.mp4"
+    # Should succeed (no watermark, but video is generated)
+    result = gen.generate(single_image, cfg, output)
+    assert result == output
+    assert output.exists()
+    assert "Watermark font path is empty" in caplog.text

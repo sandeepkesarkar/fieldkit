@@ -497,3 +497,162 @@ def test_generate_raises_on_empty_output(tmp_path, gen, mock_ffmpeg_ok):
     )
     with pytest.raises(VideoGenerationError, match="missing or empty"):
         gen.generate(make_photos(tmp_path, 2), VideoConfig(), tmp_path / "out.mp4")
+
+
+# ---------------------------------------------------------------------------
+# Watermark (CLIENT_DISPLAY_NAME)
+# ---------------------------------------------------------------------------
+
+def test_watermark_absent_when_watermark_text_is_none(tmp_path, gen, mock_ffmpeg_ok):
+    """When watermark_text is None, no drawtext filter appears in the command."""
+    cfg = VideoConfig(watermark_text=None)
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+
+
+def test_watermark_present_when_watermark_text_is_set_single_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=1 with watermark_text set, drawtext filter is present between [v0] and freeze."""
+    cfg = VideoConfig(watermark_text="Demo Client", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    # Round 2 fix: Text is now wrapped in SINGLE QUOTES with spaces protected
+    assert "text='Demo Client'" in fc
+    assert "[v0]drawtext=" in fc
+    # Map should target [vout] (freeze output), not [vwm] directly
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+
+
+def test_watermark_present_when_watermark_text_is_set_multi_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2 with watermark_text set, drawtext filter is present after xfade."""
+    cfg = VideoConfig(watermark_text="Construction Co", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    # Round 2 fix: Text is now wrapped in SINGLE QUOTES with spaces protected
+    assert "text='Construction Co'" in fc
+    assert "[xout]drawtext=" in fc
+    # Map should target [vout] (freeze output), not [vwm] directly
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+
+
+def test_watermark_escapes_special_characters(tmp_path, gen, mock_ffmpeg_ok):
+    """Watermark text with drawtext metacharacters is escaped correctly (ROUNDS 2 & 3 FIX)."""
+    # Test string contains: colon, single quote, backslash, percent, spaces
+    # This is the exact string that failed in rounds 1 and 2 of reviewer reports
+    cfg = VideoConfig(watermark_text="Foo's Bar: 100% \\Cool\\", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    # Expected escaping (wrapped in single quotes with TWO-LAYER aware escaping):
+    # Value wrapped in quotes: text='...'
+    # Inside quotes: \ → \\, : → \:, ' → '\''
+    # Spaces and % are protected by quotes (no escaping needed)
+    # "Foo's Bar: 100% \Cool\" → text='Foo'\''s Bar\: 100% \\Cool\\'
+    # Check each component separately for clarity
+    assert "text='Foo" in fc  # Opening quote
+    assert "\\''" in fc  # Escaped apostrophe (close quote, escaped quote, reopen)
+    assert "s Bar\\:" in fc  # Colon escaped even inside quotes
+    assert "100% " in fc  # Percent and space protected by quotes
+    assert "\\\\Cool\\\\" in fc  # Backslashes doubled
+    # ROUND 3/4: expansion=none disables %{...} expansion in drawtext
+    assert "expansion=none" in fc
+
+
+def test_watermark_includes_expansion_none(tmp_path, gen, mock_ffmpeg_ok):
+    """expansion=none is present to disable %{...} expansion (ROUND 3/4 FIX)."""
+    cfg = VideoConfig(watermark_text="100%", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    # Must include expansion=none (NOT text_expansion) to prevent drawtext
+    # from interpreting % as the start of a %{...} metadata expansion sequence
+    assert "expansion=none" in fc
+    # The literal % character should be present in the text value
+    assert "100%" in fc
+
+
+def test_watermark_skipped_when_font_file_missing(tmp_path, gen, mock_ffmpeg_ok, caplog):
+    """When watermark_font_path does not exist, the watermark is skipped with a warning."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/nonexistent/font.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+    assert "Watermark font file not found" in caplog.text
+    assert "skipping watermark" in caplog.text
+
+
+def test_watermark_single_photo_no_freeze(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=1 with watermark but no freeze, map targets [vwm] directly."""
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc", freeze_duration=0)
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    assert "[v0]drawtext=" in fc
+    assert cmd[cmd.index("-map") + 1] == "[vwm]"
+
+
+def test_watermark_multi_photo_no_freeze(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2 with watermark but no freeze, map targets [vwm] directly."""
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc", freeze_duration=0)
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    assert "[xout]drawtext=" in fc
+    assert cmd[cmd.index("-map") + 1] == "[vwm]"
+
+
+def test_watermark_skipped_when_font_path_empty(tmp_path, gen, mock_ffmpeg_ok, caplog):
+    """Empty watermark_font_path is skipped gracefully (BLOCKING FIX #3)."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+    assert "Watermark font path is empty" in caplog.text
+    assert "skipping watermark" in caplog.text
+
+
+def test_watermark_skipped_when_font_path_is_directory(tmp_path, gen, mock_ffmpeg_ok, caplog):
+    """Directory watermark_font_path is skipped gracefully (BLOCKING FIX #3)."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    # tmp_path is a directory, not a file
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path=str(tmp_path))
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+    assert "Watermark font file not found or is not a file" in caplog.text
+    assert "skipping watermark" in caplog.text
+
+
+def test_watermark_escapes_font_path_with_colon_and_space(tmp_path, gen, mock_ffmpeg_ok):
+    """Font path containing : and space is escaped correctly (ROUND 2 FIX)."""
+    # Create a font file with problematic characters in the path
+    font_dir = tmp_path / "fonts with: colons"
+    font_dir.mkdir()
+    font_file = font_dir / "Test Font.ttc"
+    font_file.write_bytes(b"fake-font")  # Create a fake font file
+
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path=str(font_file))
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    # Font path wrapped in single quotes with colon escaped (spaces protected by quotes)
+    assert "fontfile='" in fc  # value is quoted
+    assert "\\:" in fc  # colon is escaped even inside quotes (empirically required)
+    # Spaces are protected by quotes, NOT escaped to \
+    assert "with: colons" in fc or "with\\: colons" in fc  # path contains the dir name

@@ -124,6 +124,30 @@ def _safe_filename(raw_name: str) -> str:
     return name
 
 
+def _resolve_client_display_name() -> str:
+    """Resolve the client display name for video watermarking.
+
+    Returns CLIENT_DISPLAY_NAME env var if set, otherwise derives a display name
+    from CLIENT_NAME by stripping leading underscores, replacing remaining underscores
+    with spaces, and title-casing.
+
+    Examples:
+        _demo → Demo
+        _construction_co → Construction Co
+    """
+    display_name = os.environ.get("CLIENT_DISPLAY_NAME", "").strip()
+    if display_name:
+        return display_name
+
+    # Derive from CLIENT_NAME
+    client_name = os.environ.get("CLIENT_NAME", "")
+    # Strip leading underscores
+    while client_name.startswith("_"):
+        client_name = client_name[1:]
+    # Replace remaining underscores with spaces and title-case
+    return client_name.replace("_", " ").title()
+
+
 def _approval_text(project_name: str, photo_count: int, duration_sec: float, folder_link: str) -> str:
     # Plain text, deliberately no Markdown syntax — project_name may contain
     # underscores (see _PROJECT_NAME_RE) and Telegram's legacy "Markdown"
@@ -250,8 +274,17 @@ def main(argv=None) -> None:
         local_photos = scrub(local_photos)
         n = len(local_photos)
 
-        # Generate video
-        cfg = VideoConfig(seconds_per_photo=spp)
+        # Generate video with client watermark
+        watermark_text = _resolve_client_display_name()
+        watermark_font_path = os.environ.get(
+            "FIELDKIT_WATERMARK_FONT_PATH",
+            "/System/Library/Fonts/Helvetica.ttc"
+        )
+        cfg = VideoConfig(
+            seconds_per_photo=spp,
+            watermark_text=watermark_text,
+            watermark_font_path=watermark_font_path
+        )
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_path = project_tmp / f"{project_name}_{ts}.mp4"
         try:
