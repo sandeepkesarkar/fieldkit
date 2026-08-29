@@ -78,6 +78,7 @@ def test_videoconfig_defaults():
     assert cfg.seconds_per_photo == 4
     assert cfg.crossfade_duration == 0.5
     assert cfg.bitrate == "3M"
+    assert cfg.freeze_duration == 1.5
 
 
 def test_videoconfig_rejects_negative_crossfade():
@@ -92,6 +93,12 @@ def test_videoconfig_rejects_crossfade_gte_spp():
         VideoConfig(seconds_per_photo=4, crossfade_duration=4.0)
     with pytest.raises(ValueError, match="crossfade_duration"):
         VideoConfig(seconds_per_photo=4, crossfade_duration=5.0)
+
+
+def test_videoconfig_rejects_negative_freeze_duration():
+    """VideoConfig raises ValueError when freeze_duration is negative."""
+    with pytest.raises(ValueError, match="freeze_duration"):
+        VideoConfig(freeze_duration=-0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +135,8 @@ def test_n1_no_xfade(tmp_path, gen, mock_ffmpeg_ok):
 
 
 def test_n1_maps_v0_not_xout(tmp_path, gen, mock_ffmpeg_ok):
-    """For N=1, the -map flag uses [v0], not [xout] (there is no xfade output)."""
-    gen.generate(make_photos(tmp_path, 1), VideoConfig(), tmp_path / "out.mp4")
+    """For N=1 with freeze disabled, the -map flag uses [v0], not [xout] (there is no xfade output)."""
+    gen.generate(make_photos(tmp_path, 1), VideoConfig(freeze_duration=0), tmp_path / "out.mp4")
     cmd = get_cmd(mock_ffmpeg_ok)
     assert cmd[cmd.index("-map") + 1] == "[v0]"
     assert "[xout]" not in cmd
@@ -217,6 +224,40 @@ def test_n11_unique_filter_labels(tmp_path, gen, mock_ffmpeg_ok):
 
 
 # ---------------------------------------------------------------------------
+# Freeze-frame hold (freeze_duration)
+# ---------------------------------------------------------------------------
+
+def test_freeze_single_photo_adds_tpad_and_remaps(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=1 with freeze_duration > 0, a tpad filter is appended and -map targets [vout]."""
+    cfg = VideoConfig(freeze_duration=1.5)
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "[v0]tpad=stop_mode=clone:stop_duration=1.5[vout]" in fc
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+
+
+def test_freeze_multi_photo_adds_tpad_after_xfade_and_remaps(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2 with freeze_duration > 0, tpad is chained after [xout] and -map targets [vout]."""
+    cfg = VideoConfig(freeze_duration=2.0)
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "[xout]tpad=stop_mode=clone:stop_duration=2[vout]" in fc
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+
+
+def test_freeze_zero_disables_tpad(tmp_path, gen, mock_ffmpeg_ok):
+    """freeze_duration=0 omits the tpad filter entirely and keeps the original map label."""
+    cfg = VideoConfig(freeze_duration=0)
+    gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "tpad" not in fc
+    assert cmd[cmd.index("-map") + 1] == "[xout]"
+
+
+# ---------------------------------------------------------------------------
 # Scale/crop filter
 # ---------------------------------------------------------------------------
 
@@ -258,7 +299,7 @@ def test_n1_actual_output_duration_matches_seconds_per_photo(tmp_path, real_test
         pytest.skip("ffmpeg/ffprobe not available")
 
     gen = FFmpegVideoGenerator()
-    cfg = VideoConfig(seconds_per_photo=2, fps=30)
+    cfg = VideoConfig(seconds_per_photo=2, fps=30, freeze_duration=0)
     output = tmp_path / "out.mp4"
 
     gen.generate([real_test_image], cfg, output)
@@ -313,7 +354,7 @@ def test_n2_actual_output_duration_matches_xfade_formula(tmp_path, real_test_ima
         pytest.skip("ffmpeg/ffprobe not available")
 
     gen = FFmpegVideoGenerator()
-    cfg = VideoConfig(seconds_per_photo=3, crossfade_duration=0.5, fps=30)
+    cfg = VideoConfig(seconds_per_photo=3, crossfade_duration=0.5, fps=30, freeze_duration=0)
     output = tmp_path / "out.mp4"
 
     # Create second test image

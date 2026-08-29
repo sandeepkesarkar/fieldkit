@@ -260,7 +260,7 @@ def main(argv=None) -> None:
             _telegram_error(f"❌ {project_name}: video generation failed — {exc}")
 
         xfade = cfg.crossfade_duration
-        duration_sec = n * spp - (n - 1) * xfade
+        duration_sec = n * spp - (n - 1) * xfade + cfg.freeze_duration
         activity_log.log_generated(project_name, duration_sec, output_path.stat().st_size)
 
         # Upload video to Drive; retain local file on failure for manual recovery

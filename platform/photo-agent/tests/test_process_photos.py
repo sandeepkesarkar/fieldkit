@@ -598,7 +598,7 @@ def test_happy_path_message_includes_project_name_count_and_duration(happy, env)
     _, text = proc.telegram_api.send_message.call_args.args
     assert _PROJECT in text
     assert "2" in text          # photo count
-    assert "7.5" in text        # duration: 2 × 4s − 1 × 0.5s = 7.5s
+    assert "9" in text          # duration: 2 × 4s − 1 × 0.5s + 1.5s freeze = 9s
 
 
 def test_happy_path_scrub_is_called(happy, env):
