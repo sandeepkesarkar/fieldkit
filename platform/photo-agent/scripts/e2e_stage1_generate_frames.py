@@ -93,6 +93,7 @@ def _generate_clock_frames(n_frames: int, start_unix: int, frames_dir: Path) -> 
     ]
 
     W, H = 1080, 1920
+    PROGRESS_BAR_HEIGHT = 6
     for i in range(n_frames):
         ts = datetime.fromtimestamp(start_unix + i)
         bg_color = _PALETTE[i % len(_PALETTE)]
@@ -109,6 +110,12 @@ def _generate_clock_frames(n_frames: int, start_unix: int, frames_dir: Path) -> 
                   ts.strftime("%m/%d/%Y"), font=font_date, fill="white")
         draw.text((cx(ts.strftime("%H:%M:%S"), font_time), int(H * 0.62)),
                   ts.strftime("%H:%M:%S"), font=font_time, fill="white")
+
+        # Progress indicator: thin bar at bottom showing (i+1)/n_frames progress
+        progress = (i + 1) / n_frames
+        bar_width = int(W * progress)
+        bar_y = H - PROGRESS_BAR_HEIGHT
+        draw.rectangle([(0, bar_y), (bar_width, H)], fill=(255, 255, 255, 230))
 
         img.save(frames_dir / f"frame_{i + 1:03d}.jpg", "JPEG", quality=90)
 
