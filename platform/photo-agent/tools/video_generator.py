@@ -124,19 +124,31 @@ def _scale_crop_filter(i: int, config: VideoConfig, output_duration: float | Non
     )
 
 
-def _escape_drawtext(text: str) -> str:
-    """Escape special characters in text for ffmpeg's drawtext filter.
+def _escape_drawtext_value(text: str) -> str:
+    r"""Escape text for ffmpeg's drawtext filter (used without surrounding quotes).
 
-    drawtext uses ':' as a parameter separator and has other metacharacters.
-    This function escapes them so arbitrary client display names don't break
-    the filter graph or allow injection.
+    FFmpeg's filtergraph parser requires backslash-escaping for special characters.
+    Since we use text=value (NOT text='value'), we must escape spaces along with
+    other metacharacters. Order matters: backslash must be escaped first.
+
+    Args:
+        text: Raw text value (e.g. "Foo's Bar: 100%")
+
+    Returns:
+        Escaped text suitable for text=... in drawtext filter
+        (e.g. r"Foo\'s\ Bar\:\ 100\%")
     """
-    # Order matters: escape backslash first, then other chars that need backslash escaping
-    text = text.replace("\\", "\\\\")
-    text = text.replace(":", "\\:")
-    text = text.replace("'", "\\'")
-    # Escape % as well (drawtext can interpret %{...} as metadata)
-    text = text.replace("%", "\\%")
+    # Order is critical: escape backslash first, then other chars that need backslash escaping
+    text = text.replace("\\", "\\\\")  # \ → \\
+    text = text.replace(" ", "\\ ")    # space → \ (required when not using quotes)
+    text = text.replace(":", "\\:")    # : → \: (option separator)
+    text = text.replace("'", "\\'")    # ' → \' (quote character)
+    text = text.replace("%", "\\%")    # % → \% (metadata expansion)
+    # Additional filtergraph metacharacters that could appear in display names
+    text = text.replace("[", "\\[")
+    text = text.replace("]", "\\]")
+    text = text.replace(";", "\\;")
+    text = text.replace(",", "\\,")
     return text
 
 
@@ -153,29 +165,49 @@ def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str]
     if not config.watermark_text:
         return None
 
-    font_path = Path(config.watermark_font_path)
-    if not font_path.exists():
+    # BLOCKING FIX #3: Check for non-empty string AND is_file() (not just exists()).
+    # Path("").exists() resolves to "." (current dir) which exists, and any directory
+    # also exists but is not a valid font file — both must skip gracefully.
+    if not config.watermark_font_path or not config.watermark_font_path.strip():
         logger.warning(
-            "Watermark font file not found at %s — skipping watermark. "
+            "Watermark font path is empty — skipping watermark. "
+            "Set FIELDKIT_WATERMARK_FONT_PATH to a valid .ttf/.ttc file."
+        )
+        return None
+
+    font_path = Path(config.watermark_font_path)
+    if not font_path.is_file():
+        logger.warning(
+            "Watermark font file not found or is not a file at %s — skipping watermark. "
             "Set FIELDKIT_WATERMARK_FONT_PATH to a valid .ttf/.ttc file.",
             font_path
         )
         return None
 
-    escaped_text = _escape_drawtext(config.watermark_text)
+    # BLOCKING FIX #1: Use _escape_drawtext_value and do NOT wrap text in quotes.
+    # text='Foo\'s Bar' fails because the \' does not escape the quote inside '...',
+    # it terminates the quoted section early. Correct syntax is text=Foo\'s\ Bar
+    # (no quotes, escape spaces and special chars).
+    escaped_text = _escape_drawtext_value(config.watermark_text)
+
+    # BLOCKING FIX #2: Escape the font path as well. Paths containing : (option
+    # separator) or other metacharacters will corrupt the filter graph.
+    escaped_font_path = _escape_drawtext_value(str(font_path))
+
     # Semi-opaque background box for legibility against arbitrary photo backgrounds.
     # Position at bottom-right with padding. Font size 28 for 1080px width.
-    # box=1 enables background box, boxcolor with @alpha for opacity
+    # box=1 enables background box, boxcolor with @alpha for opacity.
+    # x position clamped to avoid negative/clipped rendering for long names on narrow output.
     filter_segment = (
         f"{source_label}drawtext="
-        f"text='{escaped_text}':"
-        f"fontfile={font_path}:"
+        f"text={escaped_text}:"
+        f"fontfile={escaped_font_path}:"
         f"fontsize=28:"
         f"fontcolor=white:"
         f"box=1:"
         f"boxcolor=black@0.6:"
         f"boxborderw=8:"
-        f"x=w-text_w-20:"
+        f"x=max(20\\,w-text_w-20):"
         f"y=h-text_h-20"
         f"[vwm]"
     )

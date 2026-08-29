@@ -519,7 +519,8 @@ def test_watermark_present_when_watermark_text_is_set_single_photo(tmp_path, gen
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    assert "text='Demo Client'" in fc
+    # Text is no longer wrapped in quotes; spaces are escaped
+    assert "text=Demo\\ Client" in fc
     assert "[v0]drawtext=" in fc
     # Map should target [vout] (freeze output), not [vwm] directly
     assert cmd[cmd.index("-map") + 1] == "[vout]"
@@ -532,21 +533,25 @@ def test_watermark_present_when_watermark_text_is_set_multi_photo(tmp_path, gen,
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    assert "text='Construction Co'" in fc
+    # Text is no longer wrapped in quotes; spaces are escaped
+    assert "text=Construction\\ Co" in fc
     assert "[xout]drawtext=" in fc
     # Map should target [vout] (freeze output), not [vwm] directly
     assert cmd[cmd.index("-map") + 1] == "[vout]"
 
 
 def test_watermark_escapes_special_characters(tmp_path, gen, mock_ffmpeg_ok):
-    """Watermark text with drawtext metacharacters is escaped correctly."""
-    # Test string contains: colon, single quote, backslash, percent
+    """Watermark text with drawtext metacharacters is escaped correctly (BLOCKING FIX #1)."""
+    # Test string contains: colon, single quote, backslash, percent, spaces
+    # This is the exact string that failed in the reviewer's report
     cfg = VideoConfig(watermark_text="Foo's Bar: 100% \\Cool\\", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
-    # Expected escaping: \ → \\, : → \:, ' → \', % → \%
-    assert "text='Foo\\'s Bar\\: 100\\% \\\\Cool\\\\'" in fc
+    # Expected escaping (no quotes around value):
+    # \ → \\, space → \ , : → \:, ' → \', % → \%
+    # "Foo's Bar: 100% \Cool\" → "Foo\'s\ Bar\:\ 100\%\ \\Cool\\"
+    assert "text=Foo\\'s\\ Bar\\:\\ 100\\%\\ \\\\Cool\\\\" in fc
 
 
 def test_watermark_skipped_when_font_file_missing(tmp_path, gen, mock_ffmpeg_ok, caplog):
@@ -582,3 +587,48 @@ def test_watermark_multi_photo_no_freeze(tmp_path, gen, mock_ffmpeg_ok):
     assert "drawtext" in fc
     assert "[xout]drawtext=" in fc
     assert cmd[cmd.index("-map") + 1] == "[vwm]"
+
+
+def test_watermark_skipped_when_font_path_empty(tmp_path, gen, mock_ffmpeg_ok, caplog):
+    """Empty watermark_font_path is skipped gracefully (BLOCKING FIX #3)."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+    assert "Watermark font path is empty" in caplog.text
+    assert "skipping watermark" in caplog.text
+
+
+def test_watermark_skipped_when_font_path_is_directory(tmp_path, gen, mock_ffmpeg_ok, caplog):
+    """Directory watermark_font_path is skipped gracefully (BLOCKING FIX #3)."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    # tmp_path is a directory, not a file
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path=str(tmp_path))
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" not in fc
+    assert "Watermark font file not found or is not a file" in caplog.text
+    assert "skipping watermark" in caplog.text
+
+
+def test_watermark_escapes_font_path_with_colon_and_space(tmp_path, gen, mock_ffmpeg_ok):
+    """Font path containing : and space is escaped correctly (BLOCKING FIX #2)."""
+    # Create a font file with problematic characters in the path
+    font_dir = tmp_path / "fonts with: colons"
+    font_dir.mkdir()
+    font_file = font_dir / "Test Font.ttc"
+    font_file.write_bytes(b"fake-font")  # Create a fake font file
+
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path=str(font_file))
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    cmd = get_cmd(mock_ffmpeg_ok)
+    fc = get_filter_complex(cmd)
+    assert "drawtext" in fc
+    # Font path should have spaces and colons escaped
+    assert "\\ " in fc  # escaped space
+    assert "\\:" in fc  # escaped colon
