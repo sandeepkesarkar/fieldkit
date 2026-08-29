@@ -66,6 +66,7 @@ def _generate_clock_frames(n_frames: int, start_unix: int, frames_dir: Path) -> 
     """Generate n_frames JPEG clock frames (1080×1920) in frames_dir.
 
     Each frame shows MM/DD/YYYY and HH:MM:SS advancing one second per frame.
+    Each frame uses a distinct background color from a deterministic palette.
     Raises RuntimeError if the font file cannot be loaded.
     """
     font_path = os.environ.get("FIELDKIT_E2E_FONT_PATH", "/System/Library/Fonts/Helvetica.ttc")
@@ -79,10 +80,23 @@ def _generate_clock_frames(n_frames: int, start_unix: int, frames_dir: Path) -> 
             "Set FIELDKIT_E2E_FONT_PATH to a valid .ttf/.ttc file."
         ) from exc
 
+    # Deterministic color palette — 8 visibly distinct colors chosen for readability with white text
+    _PALETTE = [
+        (29, 78, 216),    # blue
+        (220, 38, 38),    # red
+        (34, 197, 94),    # green
+        (168, 85, 247),   # purple
+        (234, 88, 12),    # orange
+        (14, 165, 233),   # sky
+        (236, 72, 153),   # pink
+        (132, 204, 22),   # lime
+    ]
+
     W, H = 1080, 1920
     for i in range(n_frames):
         ts = datetime.fromtimestamp(start_unix + i)
-        img = Image.new("RGB", (W, H), color=(29, 78, 216))
+        bg_color = _PALETTE[i % len(_PALETTE)]
+        img = Image.new("RGB", (W, H), color=bg_color)
         draw = ImageDraw.Draw(img)
 
         def cx(text, font):

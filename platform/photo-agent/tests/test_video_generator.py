@@ -223,6 +223,41 @@ def test_scale_crop_filter_default_resolution(tmp_path, gen, mock_ffmpeg_ok):
 
 
 # ---------------------------------------------------------------------------
+# Ken Burns zoompan animation
+# ---------------------------------------------------------------------------
+
+def test_n1_includes_zoompan_animation(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=1, the filter_complex includes zoompan animation for the photo."""
+    gen.generate(make_photos(tmp_path, 1), VideoConfig(), tmp_path / "out.mp4")
+    fc = get_filter_complex(get_cmd(mock_ffmpeg_ok))
+    assert "zoompan=" in fc, "Expected zoompan filter for Ken Burns animation"
+
+
+def test_n2_includes_zoompan_per_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=2, each photo gets a zoompan animation in its filter segment."""
+    gen.generate(make_photos(tmp_path, 2), VideoConfig(), tmp_path / "out.mp4")
+    fc = get_filter_complex(get_cmd(mock_ffmpeg_ok))
+    # Each of the 2 photos should have a zoompan filter in its scale/crop segment
+    assert fc.count("zoompan=") == 2, "Expected zoompan filter for each of the 2 photos"
+
+
+def test_n5_includes_zoompan_per_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """For N=5, each photo gets a zoompan animation in its filter segment."""
+    gen.generate(make_photos(tmp_path, 5), VideoConfig(), tmp_path / "out.mp4")
+    fc = get_filter_complex(get_cmd(mock_ffmpeg_ok))
+    assert fc.count("zoompan=") == 5, "Expected zoompan filter for each of the 5 photos"
+
+
+def test_zoompan_duration_matches_seconds_per_photo(tmp_path, gen, mock_ffmpeg_ok):
+    """The zoompan filter's duration parameter matches seconds_per_photo × fps."""
+    cfg = VideoConfig(seconds_per_photo=6, fps=30)
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    fc = get_filter_complex(get_cmd(mock_ffmpeg_ok))
+    expected_frames = 6 * 30  # 180 frames
+    assert f"d={expected_frames}" in fc, f"Expected zoompan duration of {expected_frames} frames"
+
+
+# ---------------------------------------------------------------------------
 # Output flags
 # ---------------------------------------------------------------------------
 

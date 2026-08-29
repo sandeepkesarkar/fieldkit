@@ -82,11 +82,17 @@ class FFmpegVideoGenerator:
 
 
 def _scale_crop_filter(i: int, config: VideoConfig) -> str:
-    """Build the scale/crop/setsar/fps filter segment for photo index i."""
+    """Build the scale/crop/setsar/fps/zoompan filter segment for photo index i."""
     W, H, fps = config.width, config.height, config.fps
+    spp = config.seconds_per_photo
+    # zoompan: slow Ken Burns zoom from 1.0 to 1.1 over the photo's duration
+    # d = duration in frames; z = zoom expression (linear interpolation)
+    # s = output size; the 'on' counter tracks frame number within this filter
+    zoom_frames = int(spp * fps)
     return (
         f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-        f"crop={W}:{H},setsar=1,fps={fps}[v{i}]"
+        f"crop={W}:{H},setsar=1,fps={fps},"
+        f"zoompan=z='1+0.1*on/{zoom_frames}':d={zoom_frames}:s={W}x{H}[v{i}]"
     )
 
 

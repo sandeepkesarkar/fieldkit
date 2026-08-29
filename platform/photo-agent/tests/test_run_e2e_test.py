@@ -201,6 +201,32 @@ def test_generate_clock_frames_raises_on_bad_font(tmp_path):
             _generate_clock_frames(2, 1700000000, tmp_path)
 
 
+def test_generate_clock_frames_distinct_background_colors(tmp_path):
+    """Each generated frame has a different background color from its neighbors."""
+    from PIL import Image
+    n_frames = 10
+    _generate_clock_frames(n_frames, 1700000000, tmp_path)
+    frames = sorted(tmp_path.glob("frame_*.jpg"))
+
+    # Extract the background color from the top-left corner of each frame
+    bg_colors = []
+    for frame_path in frames:
+        img = Image.open(frame_path)
+        # Sample the top-left pixel (background, not text)
+        bg_color = img.getpixel((10, 10))
+        bg_colors.append(bg_color)
+
+    # Verify that consecutive frames have different colors
+    for i in range(len(bg_colors) - 1):
+        assert bg_colors[i] != bg_colors[i + 1], \
+            f"Frames {i} and {i+1} have the same background color: {bg_colors[i]}"
+
+    # Also verify that at least 8 distinct colors are used (the palette size)
+    unique_colors = set(bg_colors)
+    assert len(unique_colors) >= min(8, n_frames), \
+        f"Expected at least 8 distinct colors, got {len(unique_colors)}"
+
+
 # ---------------------------------------------------------------------------
 # T014: Stage 2 — _upload_frames_to_drive
 # ---------------------------------------------------------------------------
