@@ -51,6 +51,11 @@ def env(monkeypatch):
     monkeypatch.setenv("FB_PAGE_ID", _PAGE_ID)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_bot_token")
     monkeypatch.setenv("ADMIN_TELEGRAM_CHAT_ID", _CHAT_ID)
+    # Defense in depth against a live IG_BUSINESS_ACCOUNT_ID leaking in from the
+    # ambient environment: with Instagram enabled, cleanup coordination would make
+    # this script wait on an Instagram job, changing deletion behaviour under these
+    # tests. The tests that exercise coordination set it explicitly.
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
 
 
 @pytest.fixture
@@ -789,3 +794,77 @@ def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tm
     assert uf.facebook_api.upload_video.call_count == 1
     assert real_state.get_pending_upload() is None  # thread1 published successfully
     assert real_state.is_published(_IDEM_KEY) is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform cleanup coordination (Feature 005)
+# ---------------------------------------------------------------------------
+#
+# Before Feature 005 this script was the video file's only consumer and deleted it on
+# its own success. upload_instagram.py is now a second, independently-scheduled
+# consumer of the SAME file, so deleting unilaterally would strand a pending Instagram
+# job with a missing file — a silent, permanent failure. Deletion is now gated on
+# every enabled platform having resolved the approval.
+
+def test_does_not_delete_while_instagram_job_is_outstanding(with_pending, mocker, monkeypatch):
+    """The reported bug: Facebook must not delete a file Instagram still needs."""
+    import scripts.upload_facebook as uf
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(Path(with_pending["video_local_path"]).parent))
+    mocker.patch.object(
+        uf.upload_cleanup, "other_platforms_pending", return_value=["instagram"]
+    )
+    main([])
+    assert Path(with_pending["video_local_path"]).exists()
+    uf.facebook_state.mark_published.assert_called_once()
+
+
+def test_deletes_once_instagram_has_resolved(with_pending, mocker, monkeypatch):
+    """When Instagram is already done, Facebook is the last one out and cleans up."""
+    import scripts.upload_facebook as uf
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(Path(with_pending["video_local_path"]).parent))
+    mocker.patch.object(uf.upload_cleanup, "other_platforms_pending", return_value=[])
+    main([])
+    assert not Path(with_pending["video_local_path"]).exists()
+
+
+def test_coordination_check_happens_after_mark_published(with_pending, mocker, monkeypatch):
+    """Ordering matters: our own terminal state must be durable before we read theirs.
+
+    Reading first would let two simultaneously-finishing scripts each see the other as
+    outstanding and leak the file forever.
+    """
+    import scripts.upload_facebook as uf
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(Path(with_pending["video_local_path"]).parent))
+    calls = []
+    uf.facebook_state.mark_published.side_effect = lambda *a, **k: calls.append("mark")
+    mocker.patch.object(
+        uf.upload_cleanup, "other_platforms_pending",
+        side_effect=lambda *a, **k: calls.append("check") or [],
+    )
+    main([])
+    assert calls == ["mark", "check"]
+
+
+def test_terminal_failure_also_releases_the_file(with_pending, mocker, monkeypatch):
+    """A job that exhausts its retries is terminal too, so it must not strand the file."""
+    import scripts.upload_facebook as uf
+    from tools.facebook_api import FacebookUploadError
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(Path(with_pending["video_local_path"]).parent))
+    uf.facebook_state.get_pending_upload.return_value = dict(with_pending, attempt_count=2)
+    uf.facebook_api.upload_video.side_effect = FacebookUploadError("API 500")
+    mocker.patch.object(uf.upload_cleanup, "other_platforms_pending", return_value=[])
+    main([])
+    uf.facebook_state.mark_failed.assert_called_once()
+    assert not Path(with_pending["video_local_path"]).exists()
+
+
+def test_retryable_failure_keeps_the_file(with_pending, mocker, monkeypatch):
+    """A non-terminal failure must keep the file — the next attempt still needs it."""
+    import scripts.upload_facebook as uf
+    from tools.facebook_api import FacebookUploadError
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(Path(with_pending["video_local_path"]).parent))
+    uf.facebook_api.upload_video.side_effect = FacebookUploadError("API 500")
+    mocker.patch.object(uf.upload_cleanup, "other_platforms_pending", return_value=[])
+    main([])
+    uf.facebook_state.release_claim.assert_called_once()
+    assert Path(with_pending["video_local_path"]).exists()

@@ -38,6 +38,7 @@ _CHAT_ID = "telegram_chat_id"
 _FB_POST_ID = "fb_post_1"
 _IG_POST_ID = "ig_post_1"
 _CONTAINER_ID = "container_1"
+_PERMALINK = "https://www.instagram.com/reel/AbCdEfGhIjK/"
 _SHARE_LINK = "https://drive.google.com/uc?export=download&id=drive_file_1"
 
 
@@ -60,8 +61,17 @@ def real_state(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def video(tmp_path):
-    p = tmp_path / "video.mp4"
+def video(real_state, tmp_path):
+    """A real video file under the resolved VIDEO_TMP_DIR root.
+
+    Placed there deliberately: _delete_local_file refuses to unlink anything outside
+    that root, so a video written anywhere else would make these tests pass for the
+    wrong reason — the file would survive because deletion was refused, not because
+    the cross-platform coordination held it back.
+    """
+    tmp_root = tmp_path / "data" / "photo-agent" / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    p = tmp_root / "video.mp4"
     p.write_bytes(b"\x00" * 64)
     return p
 
@@ -118,7 +128,9 @@ def cron(approved, mocker, video):
         mocker.patch.object(mod, "telegram_api")
 
     mocker.patch.object(uf.facebook_api, "upload_video", return_value=_FB_POST_ID)
-    mocker.patch.object(uf, "_delete_local_file")
+    # _delete_local_file is deliberately NOT mocked in either script: these tests exist to
+    # verify the REAL cross-platform deletion behaviour, and mocking it out is exactly what
+    # let the deletion race hide here in the first place.
     for name in ("log_upload_started", "log_upload_published",
                  "log_upload_attempt_failed", "log_upload_exhausted", "log_token_expired"):
         mocker.patch.object(uf.facebook_logger, name)
@@ -128,6 +140,7 @@ def cron(approved, mocker, video):
     mocker.patch.object(ui.instagram_api, "create_media_container", return_value=_CONTAINER_ID)
     mocker.patch.object(ui.instagram_api, "get_container_status", return_value="FINISHED")
     mocker.patch.object(ui.instagram_api, "publish_container", return_value=_IG_POST_ID)
+    mocker.patch.object(ui.instagram_api, "get_media_permalink", return_value=_PERMALINK)
     mocker.patch.object(ui.instagram_api.time, "sleep")
     for name in ("log_upload_started", "log_container_created", "log_container_ready",
                  "log_upload_published", "log_upload_attempt_failed",
@@ -272,7 +285,7 @@ def test_both_platforms_publish_from_one_approval(cron):
     assert fb_state.is_published(_IDEM_KEY) is True
     assert ig_state.is_published(_IDEM_KEY) is True
     assert f"https://www.facebook.com/{_FB_POST_ID}" in uf.telegram_api.send_message.call_args.args[1]
-    assert f"https://www.instagram.com/p/{_IG_POST_ID}" in ui.telegram_api.send_message.call_args.args[1]
+    assert _PERMALINK in ui.telegram_api.send_message.call_args.args[1]
 
 
 def test_published_instagram_job_is_not_republished(cron):
@@ -312,3 +325,150 @@ def test_the_two_cron_scripts_use_different_lock_files(env, real_state, monkeypa
             ig_lock.close()
     finally:
         fb_lock.close()
+
+
+# ---------------------------------------------------------------------------
+# Shared video file lifetime — the cross-platform deletion race
+# ---------------------------------------------------------------------------
+#
+# One approval, one file on disk, two independently-scheduled consumers. Whichever
+# cron happens to run first must NOT delete the file, or the other platform finds it
+# missing and terminally discards its job with nothing published and nobody alerted.
+#
+# These tests run the REAL _delete_local_file in both scripts (nothing mocked out) in
+# BOTH orderings, so neither the bug nor a one-sided fix can pass.
+
+def test_facebook_first_leaves_the_file_for_instagram(cron, video):
+    """Facebook publishing first must leave the video for Instagram's pending job."""
+    fb_main([])
+    assert fb_state.is_published(_IDEM_KEY) is True
+    assert video.exists(), "Facebook deleted the video while Instagram still needed it"
+
+
+def test_facebook_first_then_instagram_publishes_successfully(cron, video):
+    """The exact reported failure: Instagram running after Facebook must still publish."""
+    import scripts.upload_instagram as ui
+    fb_main([])
+    ig_main([])
+    assert ig_state.is_published(_IDEM_KEY) is True
+    ui.instagram_api.create_media_container.assert_called_once()
+    assert _PERMALINK in ui.telegram_api.send_message.call_args.args[1]
+
+
+def test_facebook_first_then_instagram_deletes_the_file(cron, video):
+    """Instagram, finishing last, is the one that cleans up."""
+    fb_main([])
+    assert video.exists()
+    ig_main([])
+    assert not video.exists()
+
+
+def test_instagram_first_leaves_the_file_for_facebook(cron, video):
+    """Symmetric ordering: Instagram first must leave the video for Facebook."""
+    ig_main([])
+    assert ig_state.is_published(_IDEM_KEY) is True
+    assert video.exists(), "Instagram deleted the video while Facebook still needed it"
+
+
+def test_instagram_first_then_facebook_publishes_successfully(cron, video):
+    """Facebook running after Instagram must still find its video and publish."""
+    import scripts.upload_facebook as uf
+    ig_main([])
+    fb_main([])
+    assert fb_state.is_published(_IDEM_KEY) is True
+    uf.facebook_api.upload_video.assert_called_once()
+
+
+def test_instagram_first_then_facebook_deletes_the_file(cron, video):
+    """Facebook, finishing last, is the one that cleans up."""
+    ig_main([])
+    assert video.exists()
+    fb_main([])
+    assert not video.exists()
+
+
+def test_file_is_deleted_exactly_once_and_no_run_errors(cron, video):
+    """A third tick after both are done is a harmless no-op, not a crash."""
+    fb_main([])
+    ig_main([])
+    assert not video.exists()
+    fb_main([])
+    ig_main([])
+    assert not video.exists()
+
+
+def test_instagram_failure_still_releases_the_file_for_cleanup(cron, video):
+    """FB succeeds, IG exhausts: the last platform to resolve cleans up either way.
+
+    Without this, gating deletion on the other platform would trade a data-loss bug for
+    a disk leak — the file would survive forever once either side failed.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramUploadError("API 500")
+    fb_main([])
+    assert video.exists()
+    _run_instagram_until_resolved()
+    assert ig_state.get_pending_upload() is None
+    assert not video.exists()
+
+
+def test_facebook_failure_still_releases_the_file_for_cleanup(cron, video):
+    """Mirror case: IG succeeds, FB exhausts, and the file is still cleaned up."""
+    import scripts.upload_facebook as uf
+    from tools.facebook_api import FacebookUploadError
+    uf.facebook_api.upload_video.side_effect = FacebookUploadError("API 500")
+    ig_main([])
+    assert video.exists()
+    for _ in range(3):
+        fb_main([])
+        record = fb_state.get_pending_upload()
+        if record is None:
+            break
+        record["last_attempt_at"] = "2020-01-01T00:00:00+00:00"
+        fb_state.set_pending_upload(record)
+    assert fb_state.get_pending_upload() is None
+    assert not video.exists()
+
+
+def test_instagram_disabled_lets_facebook_delete_immediately(cron, video, monkeypatch):
+    """FR-016: a client without Instagram must not wait on a job that will never exist."""
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    ig_state.clear_pending_upload(_IDEM_KEY)
+    fb_main([])
+    assert not video.exists()
+
+
+# ---------------------------------------------------------------------------
+# Dangling Drive share links survive across ticks
+# ---------------------------------------------------------------------------
+
+def test_failed_revoke_is_recorded_and_retried_next_tick(cron, video):
+    """A revoke failure is durable state plus a retry, never a silent success."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+
+    ig_main([])
+    assert ig_state.is_published(_IDEM_KEY) is True
+    pending = ig_state.list_share_cleanups()
+    assert [e["file_id"] for e in pending] == ["drive_file_1"]
+
+    # Drive recovers; the next tick drains the backlog even with no new job.
+    ui.drive.revoke_share_link.side_effect = None
+    ig_main([])
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_failed_revoke_alerts_the_admin_once(cron, video):
+    """The admin is told which Drive file may still be public — exactly once."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+
+    ig_main([])
+    ig_main([])
+
+    alerts = [
+        c.args[1] for c in ui.telegram_api.send_message.call_args_list
+        if "could not remove the temporary public link" in c.args[1]
+    ]
+    assert len(alerts) == 1
+    assert "drive_file_1" in alerts[0]

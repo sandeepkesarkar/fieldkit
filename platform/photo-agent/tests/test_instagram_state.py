@@ -437,3 +437,128 @@ def test_import_without_fieldkit_data_dir_raises(monkeypatch):
         importlib.reload(ig_state)
     monkeypatch.undo()
     importlib.reload(ig_state)
+
+
+# --- has_outstanding_job (cross-platform cleanup coordination) ---
+
+def test_has_outstanding_job_true_while_pending(valid_record):
+    """A freshly enqueued job is outstanding."""
+    ig_state.set_pending_upload(valid_record)
+    assert ig_state.has_outstanding_job("42") is True
+
+
+def test_has_outstanding_job_true_while_claimed(valid_record):
+    """A job mid-upload is still outstanding — the other platform must wait."""
+    ig_state.set_pending_upload(valid_record)
+    _claim("42")
+    assert ig_state.has_outstanding_job("42") is True
+
+
+def test_has_outstanding_job_false_when_nothing_enqueued():
+    """A key that was never enqueued is not outstanding."""
+    assert ig_state.has_outstanding_job("42") is False
+
+
+def test_has_outstanding_job_false_after_published(valid_record):
+    """Publishing resolves the job."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.mark_published("42", "post_1")
+    assert ig_state.has_outstanding_job("42") is False
+
+
+def test_has_outstanding_job_false_after_failed(valid_record):
+    """A terminal failure resolves the job just as much as a publish does."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.mark_failed("42")
+    assert ig_state.has_outstanding_job("42") is False
+
+
+def test_has_outstanding_job_false_for_a_different_key(valid_record):
+    """A pending job under another key says nothing about this one."""
+    ig_state.set_pending_upload(valid_record)
+    assert ig_state.has_outstanding_job("999") is False
+
+
+# --- mark_published permalink ---
+
+def test_mark_published_stores_the_permalink(valid_record):
+    """The permalink is persisted alongside the media id."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.mark_published("42", "post_1", permalink="https://www.instagram.com/reel/Abc/")
+    entry = ig_state.find_published("kitchen_remodel")
+    assert entry["ig_post_id"] == "post_1"
+    assert entry["ig_permalink"] == "https://www.instagram.com/reel/Abc/"
+
+
+def test_mark_published_permalink_defaults_to_none(valid_record):
+    """A publish whose permalink lookup failed is still recorded."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.mark_published("42", "post_1")
+    assert ig_state.find_published("kitchen_remodel")["ig_permalink"] is None
+
+
+# --- pending share-link cleanups ---
+
+def test_record_share_cleanup_adds_entry():
+    """A failed revoke is recorded durably with its file id and project."""
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is True
+    entries = ig_state.list_share_cleanups()
+    assert len(entries) == 1
+    assert entries[0]["file_id"] == "file_1"
+    assert entries[0]["project_name"] == "kitchen_remodel"
+    assert entries[0]["attempts"] == 1
+
+
+def test_record_share_cleanup_is_idempotent_per_file():
+    """Re-recording the same file bumps its attempt count instead of duplicating it."""
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is True
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is False
+    entries = ig_state.list_share_cleanups()
+    assert len(entries) == 1
+    assert entries[0]["attempts"] == 2
+
+
+def test_record_share_cleanup_returns_false_for_known_file():
+    """The False return is what lets the caller alert exactly once per dangling link."""
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is False
+
+
+def test_record_share_cleanup_tracks_multiple_files():
+    """Two different dangling links are tracked independently."""
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    ig_state.record_share_cleanup("file_2", "bathroom_remodel")
+    assert {e["file_id"] for e in ig_state.list_share_cleanups()} == {"file_1", "file_2"}
+
+
+def test_clear_share_cleanup_removes_entry():
+    """A successful retry clears the record."""
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    assert ig_state.clear_share_cleanup("file_1") is True
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_clear_share_cleanup_leaves_other_entries(valid_record):
+    """Clearing one dangling link does not forget the others."""
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    ig_state.record_share_cleanup("file_2", "bathroom_remodel")
+    ig_state.clear_share_cleanup("file_1")
+    assert [e["file_id"] for e in ig_state.list_share_cleanups()] == ["file_2"]
+
+
+def test_clear_share_cleanup_unknown_file_returns_false():
+    """Clearing something never recorded is a no-op, not an error."""
+    assert ig_state.clear_share_cleanup("never_seen") is False
+
+
+def test_list_share_cleanups_empty_when_file_missing():
+    """No state file means nothing pending."""
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_share_cleanups_survive_job_resolution(valid_record):
+    """The cleanup list is independent of the upload job's lifecycle."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    ig_state.mark_published("42", "post_1")
+    assert len(ig_state.list_share_cleanups()) == 1

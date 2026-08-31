@@ -142,10 +142,20 @@ POST /{ig_user_id}/media            (create container, media_type=REELS)
         ↓
 GET  /{container_id}?fields=status_code   ← poll every 5s, cap 300s
         ↓  FINISHED
-POST /{ig_user_id}/media_publish    (publish)
+POST /{ig_user_id}/media_publish    (publish)  → returns a MEDIA ID
+        ↓
+GET  /{media_id}?fields=permalink   (fetch the real post URL)
         ↓
 revoke the Drive share link         (drive.revoke_share_link)
 ```
+
+**On the permalink.** `media_publish` returns a Graph API *media ID*, which is not a
+URL and cannot be turned into one by string formatting — Instagram's public links use
+an unrelated shortcode (`instagram.com/reel/<shortcode>/`). The permalink is therefore
+read back with a separate call and is what appears in the Telegram confirmation. If
+that lookup fails, the Reel is still live and still recorded as published; the
+confirmation just says the link could not be fetched rather than offering a URL that
+would not resolve.
 
 **About the share link.** The Mac Mini has no public web server, so the approved
 video is briefly published through Drive — the framework's already-sanctioned
@@ -157,13 +167,31 @@ host for client-approved media. The exposure is deliberately bounded:
 - the link is created immediately before the container call and revoked on
   **every** exit path: success, transient failure, and token expiry
 
-If a revoke ever fails, it is logged as an error (`failed to revoke temporary
-share link — video may remain publicly reachable`). Grep for that string when
-auditing; it is the one condition that leaves a video shared.
+**If a revoke fails**, it is never written off as success. The Drive file ID is
+recorded durably in `instagram_state.json` under `pending_share_cleanups`, the
+admin gets a Telegram alert naming that specific file, and **every subsequent cron
+tick retries the revocation** — including ticks with no new video to publish —
+until it succeeds, at which point the entry is cleared. A public link can never be
+left dangling with nothing recording it.
 
-**The local video file is not deleted here.** `upload_facebook.py` owns that
-cleanup after its own successful post. Deleting it from the Instagram script
-would break the Facebook upload for the same approval.
+To audit: `pending_share_cleanups` in `instagram_state.json` is the authoritative
+list of links that may still be public. An empty list means nothing is outstanding.
+
+### Who deletes the local video
+
+**Neither script owns this.** One approval produces one file on disk with two
+independently-scheduled consumers, so **whichever enabled platform resolves last
+deletes it** — see `tools/upload_cleanup.py`. "Resolves" means reaches a terminal
+state: published *or* terminally failed. A platform that isn't enabled for the
+client is never waited on.
+
+This matters: `upload_facebook.py` used to delete the file on its own successful
+publish, which was correct while it was the only consumer. Left unchanged, it would
+delete the video out from under a still-pending Instagram job, which would then find
+the file missing and terminally fail — publishing nothing and alerting nobody.
+
+Each script records its own terminal state *before* checking the other's, which is
+what makes the check race-free.
 
 ---
 
@@ -198,6 +226,10 @@ as every other pipeline event, in the same pipe-delimited format:
 | `IG_FAILED` | One attempt failed (retryable, with error detail) |
 | `IG_EXHAUSTED` | All 3 attempts consumed — terminal |
 | `IG_TOKEN_EXP` | Page token invalid/expired — reconnect needed |
+
+Two conditions are alerted to the admin over Telegram but not given their own log
+event: a share link that could not be revoked (see above), and a publish whose
+permalink lookup failed (the Reel is live; only the link is missing).
 
 No token value or PII is ever written to the log: none of the logging functions
 even accepts a token argument.
@@ -235,4 +267,7 @@ script here would expose an operator tool as an owner-facing command.
 | Nothing happens on approval; no `IG_ENQUEUED` in the log | `IG_BUSINESS_ACCOUNT_ID` not set for this client — run step 1 |
 | `IG_FAILED` with "did not finish processing" | Container stuck past 300s; retried automatically, often a large or oddly-encoded video |
 | `IG_TOKEN_EXP` | Page token expired — the Facebook upload will be failing too; reconnect once, fixes both |
+| Alert naming a Drive file that "may still be publicly reachable" | A revoke failed; FieldKit keeps retrying each tick. Check `pending_share_cleanups` in `instagram_state.json`, and unshare the file manually if it persists |
+| Confirmation says "could not fetch the post link" | The Reel published, but the permalink lookup failed. Check the account directly; no retry is attempted since the post is already live |
+| Local video still on disk after a publish | Expected while the other platform's job for that approval is still pending — the last one to resolve deletes it |
 | Facebook posted but Instagram didn't (or vice versa) | Expected and by design — the two are independent (FR-013). Check the log for that platform's own events |

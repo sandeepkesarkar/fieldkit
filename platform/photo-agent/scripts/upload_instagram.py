@@ -27,14 +27,19 @@ Instagram-specific differences from upload_facebook.py:
     Instagram's own servers fetch — it does not accept uploaded bytes — so the
     approved video is briefly shared through Drive and unshared again. The link
     is revoked on EVERY exit path: success, transient failure, and token expiry.
-    The video shared is the same already-approved, already-metadata-stripped
-    asset the Facebook upload posts, never a re-processed copy (FR-014).
+    A revoke that FAILS is recorded durably in instagram_state and retried on every
+    later tick until it succeeds (see _drain_share_cleanups) — never written off as
+    an acceptable success, because that would leave a client's video publicly
+    reachable indefinitely with nothing recording it. The video shared is the same
+    already-approved, already-metadata-stripped asset the Facebook upload posts,
+    never a re-processed copy (FR-014).
 
-  - The local video file is NOT deleted here. upload_facebook.py deletes it after
-    its own successful post; deleting it from this script would break the Facebook
-    upload for the same approved video, which is exactly the cross-platform
-    coupling FR-013 forbids. Instagram publishing leaves cleanup to the Facebook
-    path that already owns it.
+  - Deleting the local video file is COORDINATED, not owned by either script. One
+    approval produces one file with two independent consumers, so whichever enabled
+    platform resolves LAST deletes it — see tools/upload_cleanup.py. Deleting on
+    one's own success (which is what upload_facebook.py did when it was the only
+    consumer) would pull the file out from under the other platform's still-pending
+    job, which then fails terminally with nothing published and no alert.
 
   - Per-client enable switch. IG_BUSINESS_ACCOUNT_ID absent (or empty) means
     Instagram publishing is not configured for this client, and the script exits 0
@@ -93,7 +98,15 @@ os.environ["CLIENT_NAME"] = _CLIENT
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from tools import drive, instagram_api, instagram_logger, instagram_state, telegram_api
+from tools import (
+    drive,
+    instagram_api,
+    instagram_logger,
+    instagram_state,
+    paths,
+    telegram_api,
+    upload_cleanup,
+)
 from tools.instagram_api import InstagramTokenError, InstagramUploadError
 
 _log = logging.getLogger(__name__)
@@ -167,6 +180,11 @@ def main(argv=None) -> None:
         _log.debug("another upload_instagram instance is running — exiting")
         return
     try:
+        # Runs before (and independently of) any upload work: a dangling public share
+        # link from an earlier tick has to keep getting retried whether or not there
+        # is a new job to publish today.
+        _drain_share_cleanups()
+
         record = instagram_state.get_pending_upload()
         if record is None:
             _log.debug("no pending instagram upload — exiting")
@@ -218,8 +236,20 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
     assert claim == "claimed", f"unexpected claim outcome: {claim!r}"
 
     if not Path(video_path).exists():
+        # Under the coordinated-deletion rule this should no longer be reachable via the
+        # other platform having deleted the file out from under us; it now means the file
+        # genuinely vanished (manual cleanup, disk loss). Still terminal — there is
+        # nothing to upload — but alert rather than failing silently.
         _log.error("video file missing: project=%s path=%s", project_name, video_path)
         instagram_state.mark_failed(idem_key)
+        instagram_logger.log_upload_attempt_failed(
+            project_name, attempt_count + 1, "video file missing on disk"
+        )
+        _send_alert(
+            chat_id,
+            f"⚠️ Instagram upload failed for {project_name} — the approved video file "
+            "is missing on disk",
+        )
         return
 
     attempt_number = attempt_count + 1
@@ -239,14 +269,16 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         instagram_logger.log_container_ready(project_name, container_id)
 
         post_id = instagram_api.publish_container(page_token, ig_account_id, container_id)
+        permalink = _fetch_permalink(page_token, post_id, project_name)
     except InstagramTokenError as exc:
         # Token expiry is terminal after ONE attempt (FR-008): retrying cannot fix it, and
         # burning the remaining attempt budget would only delay the alert the owner needs.
         # Checked before InstagramUploadError below — it is deliberately NOT a subclass.
-        _revoke_share_link(share_link, project_name)
+        _revoke_share_link(share_link, project_name, chat_id)
         _log.error("Instagram token error: project=%s: %s", project_name, exc)
         instagram_state.mark_failed(idem_key)
         instagram_logger.log_token_expired(project_name)
+        _delete_local_file_if_last(video_path, project_name, idem_key)
         _send_alert(
             chat_id,
             f"⚠️ Instagram token expired — reconnect {project_name}'s account "
@@ -258,12 +290,13 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         # never finished within the poll cap, or a Drive failure creating the share link.
         # RuntimeError/OSError are caught alongside InstagramUploadError because the Drive
         # helpers raise those — a Drive failure is just as retryable as an Instagram one.
-        _revoke_share_link(share_link, project_name)
+        _revoke_share_link(share_link, project_name, chat_id)
         _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, exc)
         instagram_logger.log_upload_attempt_failed(project_name, attempt_number, str(exc))
         if attempt_number >= _MAX_ATTEMPTS:
             instagram_state.mark_failed(idem_key)
             instagram_logger.log_upload_exhausted(project_name)
+            _delete_local_file_if_last(video_path, project_name, idem_key)
             _send_alert(
                 chat_id,
                 f"⚠️ Instagram upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
@@ -278,31 +311,149 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
 
     # Success path. The share link is revoked first: Instagram has already ingested the
     # video by the time a container publishes, so nothing needs it to stay public.
-    _revoke_share_link(share_link, project_name)
-    instagram_state.mark_published(idem_key, post_id)
+    _revoke_share_link(share_link, project_name, chat_id)
+    instagram_state.mark_published(idem_key, post_id, permalink=permalink)
     instagram_logger.log_upload_published(project_name, post_id)
-    post_url = f"https://www.instagram.com/p/{post_id}"
-    _send_confirmation(chat_id, f"✅ Reel live on Instagram! {post_url}")
+    # mark_published() above is what makes this job terminal in the state file, and it has
+    # to happen BEFORE the coordination check — see tools/upload_cleanup.py's docstring.
+    _delete_local_file_if_last(video_path, project_name, idem_key)
+    if permalink:
+        _send_confirmation(chat_id, f"✅ Reel live on Instagram! {permalink}")
+    else:
+        # Never fabricate a link from the media ID: it would not resolve. Say what is
+        # true instead — the Reel is live, the link just could not be read back.
+        _send_confirmation(
+            chat_id,
+            f"✅ Reel live on Instagram! (media {post_id} — could not fetch the "
+            "post link; check the account)",
+        )
 
 
-def _revoke_share_link(share_link: str | None, project_name: str) -> None:
+def _revoke_share_link(share_link: str | None, project_name: str, chat_id: str) -> None:
     """Revoke the temporary public Drive link, if one was created this attempt.
 
-    Best-effort at the call site — a revoke failure must not undo a live post or mask the
-    real upload error — but loudly logged, because the failure mode it leaves behind is a
-    client's video still publicly reachable. drive.revoke_share_link() raises rather than
-    swallowing, precisely so this is a decision made here rather than hidden there.
+    A revoke failure must not undo a live post or mask the real upload error, so it does
+    not raise here. But it is emphatically NOT treated as success: the file id is written
+    to instagram_state's pending-cleanup list, retried on every later tick by
+    _drain_share_cleanups(), and the admin is alerted once, naming the specific file, so a
+    public link can never be left dangling with no record of it.
     """
     if not share_link:
         return
     try:
-        drive.revoke_share_link(drive.extract_file_id(share_link))
-    except (RuntimeError, ValueError) as exc:
+        file_id = drive.extract_file_id(share_link)
+    except ValueError as exc:
+        # Nothing to record against — we cannot name the file to retry or clean up.
+        _log.error("cannot parse share link to revoke it: project=%s error=%s", project_name, exc)
+        return
+
+    try:
+        drive.revoke_share_link(file_id)
+    except RuntimeError as exc:
         _log.error(
-            "failed to revoke temporary share link — video may remain publicly "
-            "reachable: project=%s error=%s",
-            project_name, exc,
+            "failed to revoke temporary share link — video remains publicly reachable: "
+            "project=%s file_id=%s error=%s",
+            project_name, file_id, exc,
         )
+        newly_recorded = instagram_state.record_share_cleanup(file_id, project_name)
+        if newly_recorded:
+            _send_alert(
+                chat_id,
+                f"⚠️ Instagram: could not remove the temporary public link for "
+                f"{project_name} (Drive file {file_id}). The video may still be publicly "
+                "reachable. FieldKit will keep retrying; remove the link manually if this "
+                "persists.",
+            )
+
+
+def _drain_share_cleanups() -> None:
+    """Retry every previously-failed share-link revocation, clearing the ones that succeed.
+
+    Runs on every tick, independently of whether there is an upload job, because a dangling
+    public link is a standing privacy problem that outlives the job that created it. Still
+    failing entries stay recorded (with their attempt count bumped) for the next tick.
+    """
+    for entry in instagram_state.list_share_cleanups():
+        file_id = entry.get("file_id")
+        project_name = entry.get("project_name", "unknown")
+        if not file_id:
+            continue
+        try:
+            drive.revoke_share_link(file_id)
+        except RuntimeError as exc:
+            _log.error(
+                "retry of share-link revocation still failing: project=%s file_id=%s error=%s",
+                project_name, file_id, exc,
+            )
+            instagram_state.record_share_cleanup(file_id, project_name)
+            continue
+        instagram_state.clear_share_cleanup(file_id)
+        _log.info(
+            "share-link revocation succeeded on retry: project=%s file_id=%s",
+            project_name, file_id,
+        )
+
+
+def _fetch_permalink(page_token: str, post_id: str, project_name: str) -> str | None:
+    """Return the published Reel's real permalink, or None if it can't be read back.
+
+    Deliberately non-fatal: by the time this runs the Reel is already live, so a failed
+    permalink lookup must not fail the job, consume a retry, or re-publish anything. The
+    caller degrades the confirmation message instead of inventing a link — a URL built
+    from the media ID would not resolve.
+    """
+    try:
+        return instagram_api.get_media_permalink(page_token, post_id)
+    except (InstagramTokenError, InstagramUploadError) as exc:
+        _log.error(
+            "published but could not fetch permalink: project=%s post_id=%s error=%s",
+            project_name, post_id, exc,
+        )
+        return None
+
+
+def _delete_local_file_if_last(video_local_path: str, project_name: str, idem_key: str) -> None:
+    """Delete the approved video, but only once every OTHER enabled platform is done with it.
+
+    MUST be called after this job's own terminal state is recorded — see
+    tools/upload_cleanup.py for why that ordering is what makes the check race-free.
+    """
+    waiting = upload_cleanup.other_platforms_pending(
+        idem_key, platform=upload_cleanup.INSTAGRAM
+    )
+    if waiting:
+        _log.info(
+            "leaving local video in place — still needed by %s: project=%s",
+            ", ".join(waiting), project_name,
+        )
+        return
+    _delete_local_file(video_local_path, project_name)
+
+
+def _delete_local_file(video_local_path: str, project_name: str) -> None:
+    """Delete the local temp video file. Best-effort: logs on failure, never raises.
+
+    Same guard as upload_facebook.py's copy: refuses to unlink anything outside the
+    resolved VIDEO_TMP_DIR root.
+    """
+    try:
+        p = Path(video_local_path).resolve()
+        allowed = paths.get_video_tmp_root()
+        try:
+            p.relative_to(allowed)
+        except ValueError:
+            _log.error(
+                "refused to delete file outside tmp directory: project=%s",
+                project_name,
+            )
+            return
+        if p.exists():
+            p.unlink()
+            _log.info("deleted local video file: project=%s", project_name)
+        else:
+            _log.debug("local video file already absent: project=%s", project_name)
+    except OSError as exc:
+        _log.warning("failed to delete local video file: project=%s error=%s", project_name, exc)
 
 
 def _send_confirmation(chat_id: str, text: str) -> None:

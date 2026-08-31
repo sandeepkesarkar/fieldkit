@@ -618,3 +618,62 @@ def test_step_functions_never_log_access_token(mocker, caplog):
         get_container_status(_ACCESS_TOKEN, "container_1")
         publish_container(_ACCESS_TOKEN, _IG_USER_ID, "container_1")
     assert _ACCESS_TOKEN not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# get_media_permalink — the Graph API media ID is not a shareable URL
+# ---------------------------------------------------------------------------
+
+def test_get_media_permalink_returns_the_permalink(mocker):
+    """The real, clickable post URL is read back from the API."""
+    permalink = "https://www.instagram.com/reel/AbCdEfGhIjK/"
+    get = mocker.patch("requests.get", return_value=_mock_response({"permalink": permalink}))
+    assert ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1") == permalink
+    args, kwargs = get.call_args
+    assert args[0].endswith("/media_1")
+    assert kwargs["params"]["fields"] == "permalink"
+    assert kwargs["params"]["access_token"] == _ACCESS_TOKEN
+
+
+def test_get_media_permalink_differs_from_the_media_id(mocker):
+    """Guards the actual bug: the permalink is NOT the media ID in a URL template."""
+    permalink = "https://www.instagram.com/reel/AbCdEfGhIjK/"
+    mocker.patch("requests.get", return_value=_mock_response({"permalink": permalink}))
+    result = ig_api.get_media_permalink(_ACCESS_TOKEN, "17999999999999999")
+    assert "17999999999999999" not in result
+
+
+def test_get_media_permalink_raises_when_field_missing(mocker):
+    """A response with no permalink is an error, not an empty string."""
+    mocker.patch("requests.get", return_value=_mock_response({"id": "media_1"}))
+    with pytest.raises(InstagramUploadError, match="missing 'permalink'"):
+        ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
+
+
+def test_get_media_permalink_raises_token_error_on_190(mocker):
+    """Error code 190 during the permalink lookup raises InstagramTokenError."""
+    mocker.patch("requests.get", return_value=_error_response(190))
+    with pytest.raises(InstagramTokenError):
+        ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
+
+
+def test_get_media_permalink_raises_on_http_error(mocker):
+    """A non-OK HTTP response raises InstagramUploadError."""
+    mocker.patch("requests.get", return_value=_mock_response({}, ok=False, status_code=500))
+    with pytest.raises(InstagramUploadError, match="HTTP 500"):
+        ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
+
+
+def test_get_media_permalink_raises_on_network_error(mocker):
+    """A network failure raises InstagramUploadError."""
+    mocker.patch("requests.get", side_effect=requests.exceptions.ConnectionError("down"))
+    with pytest.raises(InstagramUploadError, match="Permalink lookup request failed"):
+        ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
+
+
+def test_get_media_permalink_never_logs_access_token(mocker, caplog):
+    """The token never appears in permalink-lookup log output."""
+    mocker.patch("requests.get", return_value=_mock_response({"permalink": "https://x/"}))
+    with caplog.at_level("DEBUG"):
+        ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
+    assert _ACCESS_TOKEN not in caplog.text

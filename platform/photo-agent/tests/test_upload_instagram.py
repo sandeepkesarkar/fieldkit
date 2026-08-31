@@ -33,7 +33,9 @@ _CHAT_ID = "telegram_chat_id"
 _IDEM_KEY = "42"
 _CONTAINER_ID = "container_99"
 _POST_ID = "ig_post_123"
+_PERMALINK = "https://www.instagram.com/reel/AbCdEfGhIjK/"
 _SHARE_LINK = "https://drive.google.com/uc?export=download&id=drive_file_1"
+_SHARE_FILE_ID = "drive_file_1"
 
 _PENDING_RECORD = {
     "project_name": _PROJECT,
@@ -78,11 +80,21 @@ def base(mocker, env):
     mocker.patch.object(ui.instagram_state, "set_container_id")
     mocker.patch.object(ui.instagram_state, "mark_published")
     mocker.patch.object(ui.instagram_state, "mark_failed")
+    mocker.patch.object(ui.instagram_state, "record_share_cleanup", return_value=True)
+    mocker.patch.object(ui.instagram_state, "list_share_cleanups", return_value=[])
+    mocker.patch.object(ui.instagram_state, "clear_share_cleanup", return_value=True)
+    # Cross-platform deletion coordination: default to "no other platform is waiting",
+    # so the tests that don't care about coordination behave as before. The tests that
+    # DO care override this, and test_dual_platform_integration.py exercises the real
+    # thing end to end.
+    mocker.patch.object(ui.upload_cleanup, "other_platforms_pending", return_value=[])
+    mocker.patch.object(ui, "_delete_local_file")
     mocker.patch.object(ui.drive, "create_temporary_share_link", return_value=_SHARE_LINK)
     mocker.patch.object(ui.drive, "revoke_share_link")
     mocker.patch.object(ui.instagram_api, "create_media_container", return_value=_CONTAINER_ID)
     mocker.patch.object(ui.instagram_api, "get_container_status", return_value="FINISHED")
     mocker.patch.object(ui.instagram_api, "publish_container", return_value=_POST_ID)
+    mocker.patch.object(ui.instagram_api, "get_media_permalink", return_value=_PERMALINK)
     mocker.patch.object(ui.instagram_api.time, "sleep")
     mocker.patch.object(ui.instagram_logger, "log_upload_started")
     mocker.patch.object(ui.instagram_logger, "log_container_created")
@@ -271,7 +283,9 @@ def test_happy_path_marks_published(with_pending):
     """A successful publish is recorded terminally in state."""
     import scripts.upload_instagram as ui
     main([])
-    ui.instagram_state.mark_published.assert_called_once_with(_IDEM_KEY, _POST_ID)
+    ui.instagram_state.mark_published.assert_called_once_with(
+        _IDEM_KEY, _POST_ID, permalink=_PERMALINK
+    )
     ui.instagram_state.mark_failed.assert_not_called()
     ui.instagram_state.release_claim.assert_not_called()
 
@@ -283,14 +297,63 @@ def test_happy_path_revokes_the_share_link(with_pending):
     ui.drive.revoke_share_link.assert_called_once_with("drive_file_1")
 
 
-def test_happy_path_sends_telegram_confirmation_with_post_url(with_pending):
-    """FR-003: the owner gets a Telegram confirmation with a direct link."""
+def test_happy_path_sends_telegram_confirmation_with_real_permalink(with_pending):
+    """FR-003: the confirmation carries the permalink fetched from the API.
+
+    The Graph API media ID is NOT a shareable URL — a link interpolating it into
+    /p/{id} does not resolve — so the message must contain the fetched permalink and
+    must never contain a URL built from the media ID.
+    """
     import scripts.upload_instagram as ui
     main([])
     chat_id, text = ui.telegram_api.send_message.call_args.args
     assert chat_id == _CHAT_ID
-    assert f"https://www.instagram.com/p/{_POST_ID}" in text
+    assert _PERMALINK in text
+    assert f"instagram.com/p/{_POST_ID}" not in text
     assert "Instagram" in text
+
+
+def test_happy_path_fetches_the_permalink_for_the_published_media(with_pending):
+    """The permalink is looked up against the media ID publish_container returned."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.instagram_api.get_media_permalink.assert_called_once_with(_PAGE_TOKEN, _POST_ID)
+
+
+def test_permalink_lookup_failure_still_marks_published(with_pending):
+    """The Reel is already live — a failed permalink lookup must not fail the job."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_media_permalink.side_effect = InstagramUploadError("HTTP 500")
+    main([])
+    ui.instagram_state.mark_published.assert_called_once_with(
+        _IDEM_KEY, _POST_ID, permalink=None
+    )
+    ui.instagram_state.release_claim.assert_not_called()
+    ui.instagram_state.mark_failed.assert_not_called()
+
+
+def test_permalink_lookup_failure_does_not_fabricate_a_link(with_pending):
+    """Rather than invent a URL that would 404, say the link could not be fetched."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_media_permalink.side_effect = InstagramUploadError("HTTP 500")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "instagram.com/p/" not in text
+    assert "instagram.com/reel/" not in text
+    assert _POST_ID in text
+    assert "Reel live on Instagram" in text
+
+
+def test_permalink_token_error_is_not_fatal(with_pending):
+    """A 190 on the permalink lookup alone must not undo an already-published Reel."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_media_permalink.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_state.mark_published.assert_called_once_with(
+        _IDEM_KEY, _POST_ID, permalink=None
+    )
+    ui.instagram_state.mark_failed.assert_not_called()
+    ui.instagram_logger.log_token_expired.assert_not_called()
 
 
 def test_happy_path_logs_the_lifecycle(with_pending):
@@ -331,11 +394,90 @@ def test_happy_path_reuses_the_already_stripped_video(with_pending):
 
 
 def test_revoke_failure_does_not_lose_a_successful_publish(with_pending):
-    """A failed revoke is logged but must not undo or hide a live post."""
+    """A failed revoke must not undo or hide a live post — the two are separate concerns."""
     import scripts.upload_instagram as ui
     ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke share link failed")
     main([])
-    ui.instagram_state.mark_published.assert_called_once_with(_IDEM_KEY, _POST_ID)
+    ui.instagram_state.mark_published.assert_called_once_with(
+        _IDEM_KEY, _POST_ID, permalink=_PERMALINK
+    )
+
+
+def test_revoke_failure_is_recorded_durably(with_pending):
+    """A dangling public link is written down, not swallowed as an acceptable success."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke share link failed")
+    main([])
+    ui.instagram_state.record_share_cleanup.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+
+
+def test_revoke_failure_alerts_the_admin_with_the_file_id(with_pending):
+    """The alert names the specific Drive file, so manual cleanup is actionable."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke share link failed")
+    main([])
+    texts = [c.args[1] for c in ui.telegram_api.send_message.call_args_list]
+    alert = [x for x in texts if "could not remove the temporary public link" in x]
+    assert len(alert) == 1
+    assert _SHARE_FILE_ID in alert[0]
+    assert _PROJECT in alert[0]
+
+
+def test_repeated_revoke_failure_alerts_only_once(with_pending):
+    """record_share_cleanup() reporting "already known" suppresses a duplicate alert."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke share link failed")
+    ui.instagram_state.record_share_cleanup.return_value = False
+    main([])
+    texts = [c.args[1] for c in ui.telegram_api.send_message.call_args_list]
+    assert not any("could not remove the temporary public link" in x for x in texts)
+
+
+def test_pending_cleanups_are_retried_every_tick(base):
+    """A previously-failed revoke is retried on the next tick and cleared when it works."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("stale_file_1")
+    ui.instagram_state.clear_share_cleanup.assert_called_once_with("stale_file_1")
+
+
+def test_pending_cleanups_are_retried_even_with_no_job(base):
+    """A dangling link outlives the job that made it — cleanup can't wait for new work."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.get_pending_upload.return_value = None
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 3},
+    ]
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("stale_file_1")
+
+
+def test_failed_cleanup_retry_stays_recorded(base):
+    """A retry that fails again keeps the entry for the following tick."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.get_pending_upload.return_value = None
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    ui.drive.revoke_share_link.side_effect = RuntimeError("still down")
+    main([])
+    ui.instagram_state.clear_share_cleanup.assert_not_called()
+    ui.instagram_state.record_share_cleanup.assert_called_once_with("stale_file_1", _PROJECT)
+
+
+def test_cleanup_drain_runs_before_the_upload(with_pending):
+    """Cleanup is attempted even on a tick that also publishes."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    main([])
+    revoked = [c.args[0] for c in ui.drive.revoke_share_link.call_args_list]
+    assert "stale_file_1" in revoked
+    assert _SHARE_FILE_ID in revoked
 
 
 def test_no_telegram_chat_id_still_publishes(with_pending, monkeypatch):
@@ -614,10 +756,12 @@ def test_retry_success_after_failure_sends_no_alert(base, tmp_path):
     ui.instagram_state.get_pending_upload.return_value = dict(record, attempt_count=1)
     main([])
 
-    ui.instagram_state.mark_published.assert_called_once_with(_IDEM_KEY, _POST_ID)
+    ui.instagram_state.mark_published.assert_called_once_with(
+        _IDEM_KEY, _POST_ID, permalink=_PERMALINK
+    )
     ui.instagram_logger.log_upload_exhausted.assert_not_called()
     assert ui.telegram_api.send_message.call_count == 1
-    assert "Reel live on Instagram" in ui.telegram_api.send_message.call_args.args[1]
+    assert _PERMALINK in ui.telegram_api.send_message.call_args.args[1]
 
 
 # --- token expiry ---
@@ -751,3 +895,72 @@ def test_instagram_failure_leaves_the_shared_video_for_facebook(failing):
     assert Path(failing["video_local_path"]).exists()
     main([])
     assert Path(failing["video_local_path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform cleanup coordination (Feature 005 fix)
+# ---------------------------------------------------------------------------
+
+def test_does_not_delete_while_facebook_job_is_outstanding(with_pending, mocker):
+    """Instagram must not delete a file Facebook's pending job still needs."""
+    import scripts.upload_instagram as ui
+    ui.upload_cleanup.other_platforms_pending.return_value = ["facebook"]
+    main([])
+    ui._delete_local_file.assert_not_called()
+    ui.instagram_state.mark_published.assert_called_once()
+
+
+def test_deletes_once_facebook_has_resolved(with_pending):
+    """When Facebook is already done, Instagram is last out and cleans up."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui._delete_local_file.assert_called_once_with(with_pending["video_local_path"], _PROJECT)
+
+
+def test_coordination_check_happens_after_mark_published(with_pending):
+    """Our own terminal state must be durable before we read the other platform's."""
+    import scripts.upload_instagram as ui
+    calls = []
+    ui.instagram_state.mark_published.side_effect = lambda *a, **k: calls.append("mark")
+    ui.upload_cleanup.other_platforms_pending.side_effect = (
+        lambda *a, **k: calls.append("check") or []
+    )
+    main([])
+    assert calls == ["mark", "check"]
+
+
+def test_exhausted_job_also_releases_the_file(failing, with_pending):
+    """A terminally failed Instagram job must not strand the file for Facebook either."""
+    import scripts.upload_instagram as ui
+    _set_attempt(with_pending, 2)
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once()
+    ui._delete_local_file.assert_called_once()
+
+
+def test_retryable_failure_keeps_the_file(failing):
+    """A retry still needs the video — only a terminal outcome may release it."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.instagram_state.release_claim.assert_called_once()
+    ui._delete_local_file.assert_not_called()
+
+
+def test_token_failure_releases_the_file(with_pending):
+    """Token expiry is terminal after one attempt, so it releases the file too."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once()
+    ui._delete_local_file.assert_called_once()
+
+
+def test_missing_video_alerts_instead_of_failing_silently(base):
+    """The bug's symptom, made loud: a missing file must not fail silently."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.get_pending_upload.return_value = dict(_PENDING_RECORD)
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "Instagram upload failed" in text
+    assert "missing on disk" in text

@@ -15,6 +15,11 @@ only behind upload_reel(): upload_instagram.py drives them one at a time so it
 can persist the container id, log each transition, and revoke the temporary
 Drive share link at exactly the right moment.
 
+Note that publish_container() returns the Graph API MEDIA ID, which is not a
+shareable URL and cannot be turned into one by string formatting — Instagram's
+public URLs use an unrelated permalink shortcode. get_media_permalink() fetches
+the real, working link; anything shown to a human must come from there.
+
 Exception hierarchy (mirrors facebook_api.py's):
   InstagramTokenError(RuntimeError)          — token invalid/expired (Graph API
     error code 190); skip retries, the token must be renewed via generate_auth_link.py
@@ -196,8 +201,49 @@ def wait_for_container(access_token: str, container_id: str) -> None:
     )
 
 
+def get_media_permalink(access_token: str, media_id: str) -> str:
+    """Return the public permalink URL for a published media object.
+
+    The Graph API media ID that publish_container() returns is an internal identifier.
+    Instagram's public URLs (https://www.instagram.com/reel/<shortcode>/) are keyed by an
+    unrelated shortcode, so a link built by interpolating the media ID into a /p/ or /reel/
+    URL does NOT resolve to the post. The permalink has to be read back from the API, which
+    is what this does.
+
+    Raises:
+        InstagramTokenError — Graph API error code 190 (token invalid/expired).
+        InstagramUploadError — on any other API error, HTTP error, network failure, or a
+            response with no permalink field.
+    """
+    try:
+        resp = requests.get(
+            f"{_GRAPH_BASE}/{media_id}",
+            params={"fields": "permalink", "access_token": access_token},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise InstagramUploadError(f"Permalink lookup request failed: {exc}") from exc
+
+    data = _json_or_empty(resp)
+    _raise_for_api_error(data, "fetching permalink")
+
+    if not resp.ok:
+        raise InstagramUploadError(f"Permalink lookup failed: HTTP {resp.status_code}")
+
+    permalink = data.get("permalink")
+    if not permalink:
+        raise InstagramUploadError(
+            f"Permalink lookup response missing 'permalink' field — response: {data!r}"
+        )
+    logger.info("get_media_permalink: media_id=%s", media_id)
+    return permalink
+
+
 def publish_container(access_token: str, ig_user_id: str, container_id: str) -> str:
-    """Publish a finished container. Returns the published post id.
+    """Publish a finished container. Returns the published MEDIA ID.
+
+    The return value is a Graph API identifier, NOT a shareable link. Use
+    get_media_permalink() for anything a human will click.
 
     Raises:
         InstagramTokenError — Graph API error code 190 (token invalid/expired).

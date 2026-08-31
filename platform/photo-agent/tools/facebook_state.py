@@ -29,6 +29,7 @@ before reading and release it after writing, mirroring the pattern in state.py.
 FB_APP_SECRET is never stored here. Sensitive token values are never logged.
 """
 
+import copy
 import fcntl
 import json
 import logging
@@ -54,6 +55,7 @@ __all__ = [
     "mark_failed",
     "is_published",
     "find_published",
+    "has_outstanding_job",
 ]
 
 _REQUIRED_UPLOAD_KEYS = frozenset({
@@ -84,7 +86,10 @@ def _read(file_obj) -> dict:
     file_obj.seek(0)
     content = file_obj.read()
     if not content:
-        return dict(_DEFAULTS)
+        # deepcopy, NOT dict(): a shallow copy would alias _DEFAULTS' list values, so any
+        # caller appending to e.g. published_idempotency_keys on an empty/absent state file
+        # would mutate the module-level defaults for the rest of the process.
+        return copy.deepcopy(_DEFAULTS)
     try:
         return json.loads(content)
     except json.JSONDecodeError as exc:
@@ -372,6 +377,24 @@ def find_published(project_name: str) -> dict | None:
         if entry.get("project_name") == project_name:
             return entry
     return None
+
+
+def has_outstanding_job(idempotency_key: str) -> bool:
+    """Return True if a job for idempotency_key is still awaiting resolution.
+
+    "Outstanding" means a pending record with this key is still sitting in the file —
+    enqueued, mid-retry, or claimed and in flight. Everything else is terminal: a
+    published job, a terminally-failed job, and a job that was never enqueued all clear
+    (or never create) the pending record, and all read as False here.
+
+    Added for Feature 005's cross-platform cleanup coordination: the approved video file
+    on disk is shared by the Facebook and Instagram upload jobs, so neither may delete it
+    while the other still has work to do for the same approval. See tools/upload_cleanup.py
+    — callers should go through that rather than calling this directly, so the "is that
+    platform even enabled for this client" half of the question isn't forgotten.
+    """
+    record = get_pending_upload()
+    return record is not None and record.get("idempotency_key") == idempotency_key
 
 
 def is_published(idempotency_key: str) -> bool:

@@ -43,6 +43,7 @@ mark_failed() clear the whole record, so they discard it implicitly.
 FB_PAGE_ACCESS_TOKEN is never stored here. Sensitive token values are never logged.
 """
 
+import copy
 import fcntl
 import json
 import logging
@@ -69,6 +70,10 @@ __all__ = [
     "mark_failed",
     "is_published",
     "find_published",
+    "has_outstanding_job",
+    "record_share_cleanup",
+    "list_share_cleanups",
+    "clear_share_cleanup",
 ]
 
 _REQUIRED_UPLOAD_KEYS = frozenset({
@@ -88,6 +93,7 @@ _DEFAULTS = {
     "pending_instagram_upload": None,
     "published_idempotency_keys": [],
     "published_history": [],
+    "pending_share_cleanups": [],
 }
 
 # Cap on published_history so instagram_state.json doesn't grow without bound over a client's
@@ -100,7 +106,10 @@ def _read(file_obj) -> dict:
     file_obj.seek(0)
     content = file_obj.read()
     if not content:
-        return dict(_DEFAULTS)
+        # deepcopy, NOT dict(): a shallow copy would alias _DEFAULTS' list values, so any
+        # caller appending to e.g. published_idempotency_keys on an empty/absent state file
+        # would mutate the module-level defaults for the rest of the process.
+        return copy.deepcopy(_DEFAULTS)
     try:
         return json.loads(content)
     except json.JSONDecodeError as exc:
@@ -329,7 +338,7 @@ def release_claim(idempotency_key: str) -> None:
     logger.info("release_claim: key=%s", idempotency_key)
 
 
-def mark_published(idempotency_key: str, post_id: str) -> None:
+def mark_published(idempotency_key: str, post_id: str, permalink: str | None = None) -> None:
     """Record the publish (published_idempotency_keys, published_history), then clear
     pending_instagram_upload.
 
@@ -337,6 +346,12 @@ def mark_published(idempotency_key: str, post_id: str) -> None:
     ever calling get_pending_upload() and finding this job again — and, with
     published_idempotency_keys, is what makes a re-approval of the same video a no-op rather
     than a duplicate Reel (FR-011).
+
+    post_id is the Graph API media ID. permalink is the human-usable
+    https://www.instagram.com/reel/<shortcode>/ URL, which is a DIFFERENT value fetched
+    separately (see instagram_api.get_media_permalink) — the media ID cannot be turned into a
+    working URL by string formatting. It is optional because the permalink lookup can fail on a
+    Reel that genuinely published; the publish is still recorded, with permalink left None.
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -349,6 +364,7 @@ def mark_published(idempotency_key: str, post_id: str) -> None:
             "project_name": record.get("project_name"),
             "idempotency_key": idempotency_key,
             "ig_post_id": post_id,
+            "ig_permalink": permalink,
             "published_at": now,
         })
         del history[:-_PUBLISH_HISTORY_LIMIT]
@@ -392,6 +408,20 @@ def find_published(project_name: str) -> dict | None:
     return None
 
 
+def has_outstanding_job(idempotency_key: str) -> bool:
+    """Return True if a job for idempotency_key is still awaiting resolution.
+
+    Mirrors facebook_state.has_outstanding_job() exactly — see its docstring. "Outstanding"
+    means a pending record with this key is still in the file; published, terminally
+    failed, and never-enqueued all read as False.
+
+    Used by tools/upload_cleanup.py to decide whether the shared approved video file on
+    disk may be deleted yet. Go through that module rather than calling this directly.
+    """
+    record = get_pending_upload()
+    return record is not None and record.get("idempotency_key") == idempotency_key
+
+
 def is_published(idempotency_key: str) -> bool:
     """Return True if idempotency_key is in published_idempotency_keys."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -405,3 +435,102 @@ def is_published(idempotency_key: str) -> bool:
                 fcntl.flock(f, fcntl.LOCK_UN)
     except FileNotFoundError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Pending Drive share-link cleanups
+# ---------------------------------------------------------------------------
+#
+# Publishing a Reel requires briefly making the approved video publicly readable on
+# Drive (Instagram fetches it by URL; see tools/drive.py). Revoking that link is a
+# SEPARATE concern from the publish itself: the Reel can be genuinely live while the
+# revoke call fails on a transient Drive error.
+#
+# Treating that as an acceptable success would leave a client's video publicly
+# reachable forever with nothing recording the fact — the failure mode the privacy
+# gate exists to prevent. So a failed revoke is written down here instead, durably,
+# and retried on every subsequent cron tick until it succeeds. This list is keyed by
+# Drive file id and is deliberately independent of the upload job's lifecycle: the
+# job is terminal, the cleanup is not.
+
+
+def record_share_cleanup(file_id: str, project_name: str) -> bool:
+    """Record that file_id's public Drive permission still needs revoking.
+
+    Returns True if this is a NEW entry, False if that file_id was already recorded —
+    which lets the caller alert the admin exactly once per dangling link rather than on
+    every retry tick.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            cleanups = data.setdefault("pending_share_cleanups", [])
+            for entry in cleanups:
+                if entry.get("file_id") == file_id:
+                    entry["attempts"] = entry.get("attempts", 1) + 1
+                    entry["last_attempt_at"] = now
+                    _write(f, data)
+                    logger.warning(
+                        "record_share_cleanup: file_id=%s still pending after %d attempts",
+                        file_id, entry["attempts"],
+                    )
+                    return False
+            cleanups.append({
+                "file_id": file_id,
+                "project_name": project_name,
+                "recorded_at": now,
+                "last_attempt_at": now,
+                "attempts": 1,
+            })
+            _write(f, data)
+            logger.error(
+                "record_share_cleanup: file_id=%s project=%s — share link NOT revoked",
+                file_id, project_name,
+            )
+            return True
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def list_share_cleanups() -> list[dict]:
+    """Return the Drive share links still awaiting revocation (oldest first)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_FILE, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return list(_read(f).get("pending_share_cleanups", []))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return []
+
+
+def clear_share_cleanup(file_id: str) -> bool:
+    """Drop file_id from the pending-cleanup list once its permission is really gone.
+
+    Returns True if an entry was removed, False if there was nothing recorded for it.
+    """
+    def _remove(data):
+        cleanups = data.get("pending_share_cleanups", [])
+        remaining = [e for e in cleanups if e.get("file_id") != file_id]
+        if len(remaining) == len(cleanups):
+            return False
+        data["pending_share_cleanups"] = remaining
+        return True
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            removed = _remove(data)
+            if removed:
+                _write(f, data)
+                logger.info("clear_share_cleanup: file_id=%s revoked", file_id)
+            return removed
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
