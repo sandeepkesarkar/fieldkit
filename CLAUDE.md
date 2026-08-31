@@ -52,9 +52,12 @@ Permanent clients:
 - `_demo` — full pipeline (video → Telegram approval → Facebook)
 - `_construction_co` — scoped pipeline (video → Telegram approval only, no Facebook)
 
-**_demo Feature 005 — Instagram Video Upload: PLANNING (spec.md, plan.md, sequence-diagram.md, research.md, data-model.md, contracts/ complete).**
+**_demo Feature 005 — Instagram Video Upload: IMPLEMENTATION COMPLETE (T000–T021).**
 Spec: [`clients/_demo/.specify/005-instagram-video-upload/spec.md`](clients/_demo/.specify/005-instagram-video-upload/spec.md)
 Plan: [`clients/_demo/.specify/005-instagram-video-upload/plan.md`](clients/_demo/.specify/005-instagram-video-upload/plan.md)
 Branch: `002-instagram-video-upload`
-Status: Started ahead of the original "next after Platform 002 adversarial review passes" ordering, per explicit human decision on 2026-08-31. Platform 002 closeout (T040–T042 live two-client isolation run, T050 adversarial review) remains outstanding and is tracked separately — not a blocker for Feature 005's own implementation.
+Tasks: [`clients/_demo/.specify/005-instagram-video-upload/tasks.md`](clients/_demo/.specify/005-instagram-video-upload/tasks.md)
+Status: All 22 tasks complete; 840 tests collected, 821 passing (up from 580/561). Started ahead of the original "next after Platform 002 adversarial review passes" ordering, per explicit human decision on 2026-08-31. Platform 002 closeout (T040–T042 live two-client isolation run, T050 adversarial review) remains outstanding and is tracked separately — not a blocker for Feature 005's own implementation.
+
+Remaining for Feature 005: live run against a real linked Instagram account (`check_instagram_connection.py` + one real approval), and cron installation for `upload_instagram.py` — both deployment-time steps, not repo changes.
 <!-- SPECKIT END -->
