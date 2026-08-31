@@ -411,3 +411,343 @@ def test_source_argument_is_accepted(with_pending):
     import scripts.upload_instagram as ui
     main(["--source", "cron"])
     ui.instagram_state.mark_published.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# US3 (T016) — retry, exhaustion, token expiry, container timeout
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def failing(with_pending):
+    """A pending job whose container creation always fails transiently."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramUploadError("API 500")
+    return with_pending
+
+
+def _set_attempt(record, n):
+    """Set the record's PRE-claim attempt_count, i.e. n attempts already made."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.get_pending_upload.return_value = dict(record, attempt_count=n)
+
+
+# --- transient failure, retries remaining ---
+
+def test_transient_failure_releases_the_claim(failing):
+    """FR-007: a retryable failure releases the claim so the next tick can retry."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_state.mark_failed.assert_not_called()
+
+
+def test_transient_failure_revokes_the_share_link(failing):
+    """The public link is revoked even when the attempt fails."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("drive_file_1")
+
+
+def test_transient_failure_sends_no_alert(failing):
+    """SC-003: the owner is not alerted while automatic recovery is still possible."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.telegram_api.send_message.assert_not_called()
+
+
+def test_transient_failure_is_logged(failing):
+    """FR-012: each failed attempt is recorded with its attempt number."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.instagram_logger.log_upload_attempt_failed.assert_called_once()
+    args = ui.instagram_logger.log_upload_attempt_failed.call_args.args
+    assert args[0] == _PROJECT
+    assert args[1] == 1
+    ui.instagram_logger.log_upload_exhausted.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_step,exc", [
+    ("create_media_container", InstagramUploadError("create failed")),
+    ("publish_container", InstagramUploadError("publish failed")),
+])
+def test_failure_at_any_step_releases_the_claim(with_pending, failing_step, exc):
+    """A failure at container creation or publish is handled identically."""
+    import scripts.upload_instagram as ui
+    getattr(ui.instagram_api, failing_step).side_effect = exc
+    main([])
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+
+
+def test_poll_error_status_releases_the_claim(with_pending):
+    """A container reporting ERROR is an ordinary retryable failure."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "ERROR"
+    main([])
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_api.publish_container.assert_not_called()
+
+
+def test_drive_share_failure_is_treated_as_transient(with_pending):
+    """A Drive failure is as retryable as an Instagram one — and calls no Instagram API."""
+    import scripts.upload_instagram as ui
+    ui.drive.create_temporary_share_link.side_effect = RuntimeError("Drive upload failed: HTTP 500")
+    main([])
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_api.create_media_container.assert_not_called()
+
+
+def test_drive_share_failure_revokes_nothing(with_pending):
+    """No link was created, so there is nothing to revoke."""
+    import scripts.upload_instagram as ui
+    ui.drive.create_temporary_share_link.side_effect = RuntimeError("Drive upload failed")
+    main([])
+    ui.drive.revoke_share_link.assert_not_called()
+
+
+# --- cooldown ---
+
+def test_cooldown_makes_no_api_calls(with_pending):
+    """FR-007: a retry inside the 60s cooldown does nothing and exits silently."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.claim_pending_upload.return_value = "cooldown"
+    main([])
+    ui.drive.create_temporary_share_link.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
+    ui.telegram_api.send_message.assert_not_called()
+
+
+def test_cooldown_does_not_consume_an_attempt(with_pending):
+    """A declined claim leaves the attempt budget untouched."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.claim_pending_upload.return_value = "cooldown"
+    main([])
+    ui.instagram_logger.log_upload_started.assert_not_called()
+
+
+# --- exhaustion ---
+
+def test_third_failed_attempt_marks_failed(failing, with_pending):
+    """FR-007: after the 3rd attempt fails, the job is terminal."""
+    import scripts.upload_instagram as ui
+    _set_attempt(with_pending, 2)  # this attempt is the 3rd
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_state.release_claim.assert_not_called()
+
+
+def test_third_failed_attempt_logs_exhausted(failing, with_pending):
+    """FR-012: exhaustion is its own log event."""
+    import scripts.upload_instagram as ui
+    _set_attempt(with_pending, 2)
+    main([])
+    ui.instagram_logger.log_upload_exhausted.assert_called_once_with(_PROJECT)
+
+
+def test_third_failed_attempt_alerts_the_owner(failing, with_pending):
+    """FR-009: the owner is told the Instagram upload failed for good."""
+    import scripts.upload_instagram as ui
+    _set_attempt(with_pending, 2)
+    main([])
+    chat_id, text = ui.telegram_api.send_message.call_args.args
+    assert chat_id == _CHAT_ID
+    assert "Instagram upload failed" in text
+
+
+def test_exhausted_claim_alerts_and_makes_no_api_calls(with_pending):
+    """A claim already past the budget alerts without another upload attempt."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.claim_pending_upload.return_value = "exhausted"
+    main([])
+    ui.instagram_api.create_media_container.assert_not_called()
+    ui.instagram_logger.log_upload_exhausted.assert_called_once_with(_PROJECT)
+    assert "Instagram upload failed" in ui.telegram_api.send_message.call_args.args[1]
+
+
+def test_second_failed_attempt_still_retries(failing, with_pending):
+    """Only the 3rd failure is terminal — the 2nd still releases for retry."""
+    import scripts.upload_instagram as ui
+    _set_attempt(with_pending, 1)
+    main([])
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_state.mark_failed.assert_not_called()
+    ui.telegram_api.send_message.assert_not_called()
+
+
+def test_three_successive_failures_end_in_failed_with_alert(base, tmp_path):
+    """SC-003/FR-009: three cron ticks, three failures, then one alert.
+
+    Drives three separate claim -> attempt -> release cycles the way the cron would,
+    advancing attempt_count between them exactly as claim_pending_upload() does.
+    """
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+    ui.instagram_api.create_media_container.side_effect = InstagramUploadError("API 500")
+
+    for already_attempted in (0, 1, 2):
+        ui.instagram_state.get_pending_upload.return_value = dict(
+            record, attempt_count=already_attempted
+        )
+        main([])
+
+    assert ui.instagram_state.release_claim.call_count == 2  # attempts 1 and 2
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_logger.log_upload_exhausted.assert_called_once_with(_PROJECT)
+    assert ui.telegram_api.send_message.call_count == 1
+    assert "Instagram upload failed" in ui.telegram_api.send_message.call_args.args[1]
+
+
+def test_retry_success_after_failure_sends_no_alert(base, tmp_path):
+    """SC-003: a retry that succeeds gets the normal confirmation and no alert."""
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(_PENDING_RECORD, video_local_path=str(video))
+
+    ui.instagram_state.get_pending_upload.return_value = dict(record, attempt_count=0)
+    ui.instagram_api.create_media_container.side_effect = InstagramUploadError("API 500")
+    main([])
+
+    ui.instagram_api.create_media_container.side_effect = None
+    ui.instagram_api.create_media_container.return_value = _CONTAINER_ID
+    ui.instagram_state.get_pending_upload.return_value = dict(record, attempt_count=1)
+    main([])
+
+    ui.instagram_state.mark_published.assert_called_once_with(_IDEM_KEY, _POST_ID)
+    ui.instagram_logger.log_upload_exhausted.assert_not_called()
+    assert ui.telegram_api.send_message.call_count == 1
+    assert "Reel live on Instagram" in ui.telegram_api.send_message.call_args.args[1]
+
+
+# --- token expiry ---
+
+def test_token_error_marks_failed_immediately(with_pending):
+    """FR-008: token expiry is terminal after one attempt — retrying cannot help."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_state.release_claim.assert_not_called()
+
+
+def test_token_error_does_not_consume_the_retry_budget(with_pending):
+    """A token failure is not logged as a retryable attempt failure."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_logger.log_upload_attempt_failed.assert_not_called()
+    ui.instagram_logger.log_upload_exhausted.assert_not_called()
+
+
+def test_token_error_logs_token_expired(with_pending):
+    """FR-012: token expiry has its own log event."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_logger.log_token_expired.assert_called_once_with(_PROJECT)
+
+
+def test_token_error_alerts_the_owner_to_reconnect(with_pending):
+    """FR-008: the alert tells the owner to reconnect, not just that it failed."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "Instagram token expired" in text
+    assert _PROJECT in text
+
+
+def test_token_error_revokes_the_share_link(with_pending):
+    """Even on the terminal token path, nothing is left publicly reachable."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("drive_file_1")
+
+
+def test_token_error_during_poll_is_terminal(with_pending):
+    """A 190 surfacing mid-poll takes the token path, not the retry path."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_logger.log_token_expired.assert_called_once_with(_PROJECT)
+
+
+def test_token_error_during_publish_is_terminal(with_pending):
+    """A 190 surfacing at publish takes the token path too."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.publish_container.side_effect = InstagramTokenError("expired")
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_logger.log_token_expired.assert_called_once_with(_PROJECT)
+
+
+# --- container poll timeout ---
+
+def test_stuck_container_times_out_and_retries(with_pending):
+    """A container that never finishes is handled like any other transient failure."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "IN_PROGRESS"
+    main([])
+    ui.instagram_api.publish_container.assert_not_called()
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+    ui.drive.revoke_share_link.assert_called_once_with("drive_file_1")
+
+
+def test_stuck_container_polls_the_full_300_second_cap(with_pending):
+    """spec.md's stuck-container edge case is bounded at 60 attempts x 5s."""
+    import scripts.upload_instagram as ui
+    import tools.instagram_api as api
+    ui.instagram_api.get_container_status.return_value = "IN_PROGRESS"
+    main([])
+    assert ui.instagram_api.get_container_status.call_count == api._MAX_POLL_ATTEMPTS
+    assert api._MAX_POLL_ATTEMPTS * api._POLL_INTERVAL_SECONDS == 300
+
+
+def test_stuck_container_on_final_attempt_exhausts(with_pending):
+    """A timeout on the 3rd attempt ends the job and alerts, like any other failure."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "IN_PROGRESS"
+    _set_attempt(with_pending, 2)
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    assert "Instagram upload failed" in ui.telegram_api.send_message.call_args.args[1]
+
+
+def test_stuck_container_logs_the_timeout_reason(with_pending):
+    """The logged error names the timeout, so the log explains the failure."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "IN_PROGRESS"
+    main([])
+    error_text = ui.instagram_logger.log_upload_attempt_failed.call_args.args[2]
+    assert "did not finish processing" in error_text
+
+
+# --- platform independence (FR-013) ---
+
+def test_instagram_failure_never_touches_facebook_state(failing, mocker):
+    """FR-013: the Instagram failure path imports and mutates no Facebook state."""
+    import scripts.upload_instagram as ui
+    import tools.facebook_state as fb_state
+    for name in ("claim_pending_upload", "mark_failed", "mark_published", "release_claim"):
+        mocker.patch.object(fb_state, name)
+    main([])
+    for name in ("claim_pending_upload", "mark_failed", "mark_published", "release_claim"):
+        getattr(fb_state, name).assert_not_called()
+
+
+def test_upload_instagram_does_not_import_facebook_modules():
+    """FR-013 structurally: this script has no Facebook dependency to couple through."""
+    import scripts.upload_instagram as ui
+    assert not hasattr(ui, "facebook_state")
+    assert not hasattr(ui, "facebook_api")
+    assert not hasattr(ui, "facebook_logger")
+
+
+def test_instagram_failure_leaves_the_shared_video_for_facebook(failing):
+    """FR-013/FR-014: a failed Instagram attempt must not delete the shared asset."""
+    assert Path(failing["video_local_path"]).exists()
+    main([])
+    assert Path(failing["video_local_path"]).exists()
