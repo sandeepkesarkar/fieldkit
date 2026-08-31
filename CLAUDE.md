@@ -52,5 +52,9 @@ Permanent clients:
 - `_demo` — full pipeline (video → Telegram approval → Facebook)
 - `_construction_co` — scoped pipeline (video → Telegram approval only, no Facebook)
 
-**_demo Feature 005 — Instagram Video Upload** (next after Platform 002 adversarial review passes)
+**_demo Feature 005 — Instagram Video Upload: PLANNING (spec.md, plan.md, sequence-diagram.md, research.md, data-model.md, contracts/ complete).**
+Spec: [`clients/_demo/.specify/005-instagram-video-upload/spec.md`](clients/_demo/.specify/005-instagram-video-upload/spec.md)
+Plan: [`clients/_demo/.specify/005-instagram-video-upload/plan.md`](clients/_demo/.specify/005-instagram-video-upload/plan.md)
+Branch: `002-instagram-video-upload`
+Status: Started ahead of the original "next after Platform 002 adversarial review passes" ordering, per explicit human decision on 2026-08-31. Platform 002 closeout (T040–T042 live two-client isolation run, T050 adversarial review) remains outstanding and is tracked separately — not a blocker for Feature 005's own implementation.
 <!-- SPECKIT END -->
