@@ -256,8 +256,12 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         )
         return
     if claim == "exhausted":
+        # claim_pending_upload() has already cleared the record, so this job is terminal:
+        # release the shared video too, or a crash during the final attempt would leave it
+        # on disk with nothing left to clean it up.
         _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
         facebook_logger.log_upload_exhausted(project_name)
+        _delete_local_file_if_last(video_path, project_name, idem_key)
         _send_alert(
             chat_id,
             f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
@@ -271,6 +275,13 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
     if not Path(video_path).exists():
         _log.error("video file missing: project=%s path=%s", project_name, video_path)
         facebook_state.mark_failed(idem_key)
+        # Alert rather than failing silently — matches upload_instagram.py's equivalent
+        # path. A vanished video is a real, terminal failure the owner needs to know about.
+        _send_alert(
+            chat_id,
+            f"⚠️ Facebook upload failed for {project_name} — the approved video file "
+            "is missing on disk",
+        )
         return
 
     attempt_number = attempt_count + 1

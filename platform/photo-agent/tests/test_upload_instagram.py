@@ -80,7 +80,14 @@ def base(mocker, env):
     mocker.patch.object(ui.instagram_state, "set_container_id")
     mocker.patch.object(ui.instagram_state, "mark_published")
     mocker.patch.object(ui.instagram_state, "mark_failed")
-    mocker.patch.object(ui.instagram_state, "record_share_cleanup", return_value=True)
+    mocker.patch.object(
+        ui.instagram_state,
+        "record_share_cleanup",
+        return_value={
+            "file_id": _SHARE_FILE_ID, "project_name": _PROJECT,
+            "attempts": 1, "recorded_at": "2026-08-31T14:00:00Z",
+        },
+    )
     mocker.patch.object(ui.instagram_state, "list_share_cleanups", return_value=[])
     mocker.patch.object(ui.instagram_state, "clear_share_cleanup", return_value=True)
     # Cross-platform deletion coordination: default to "no other platform is waiting",
@@ -423,14 +430,45 @@ def test_revoke_failure_alerts_the_admin_with_the_file_id(with_pending):
     assert _PROJECT in alert[0]
 
 
-def test_repeated_revoke_failure_alerts_only_once(with_pending):
-    """record_share_cleanup() reporting "already known" suppresses a duplicate alert."""
+def test_revoke_failure_inside_alert_interval_stays_quiet(with_pending):
+    """record_share_cleanup() returning None (too soon to re-alert) suppresses the message."""
     import scripts.upload_instagram as ui
     ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke share link failed")
-    ui.instagram_state.record_share_cleanup.return_value = False
+    ui.instagram_state.record_share_cleanup.return_value = None
     main([])
     texts = [c.args[1] for c in ui.telegram_api.send_message.call_args_list]
     assert not any("could not remove the temporary public link" in x for x in texts)
+
+
+def test_cleanup_retry_reescalates_when_state_says_so(base):
+    """A still-failing cleanup re-alerts whenever the state module says it is due."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.get_pending_upload.return_value = None
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 500},
+    ]
+    ui.drive.revoke_share_link.side_effect = RuntimeError("still down")
+    ui.instagram_state.record_share_cleanup.return_value = {
+        "file_id": "stale_file_1", "project_name": _PROJECT,
+        "attempts": 501, "recorded_at": "2026-08-01T00:00:00Z",
+    }
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "could not remove the temporary public link" in text
+    assert "stale_file_1" in text
+    assert "501" in text
+
+
+def test_alert_wording_promises_only_what_is_delivered(with_pending):
+    """The message must describe the retry + reminder behaviour that actually happens."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke share link failed")
+    main([])
+    text = [c.args[1] for c in ui.telegram_api.send_message.call_args_list
+            if "could not remove the temporary public link" in c.args[1]][0]
+    assert "remind you daily" in text
+    assert "Failed attempts:" in text
+    assert "Anyone with the link" in text
 
 
 def test_pending_cleanups_are_retried_every_tick(base):
@@ -466,6 +504,78 @@ def test_failed_cleanup_retry_stays_recorded(base):
     main([])
     ui.instagram_state.clear_share_cleanup.assert_not_called()
     ui.instagram_state.record_share_cleanup.assert_called_once_with("stale_file_1", _PROJECT)
+
+
+# ---------------------------------------------------------------------------
+# Cleanup must not be gated on Instagram being configured (gap 2a)
+# ---------------------------------------------------------------------------
+
+def test_cleanup_drains_when_instagram_is_disabled(base, monkeypatch):
+    """Clearing IG_BUSINESS_ACCOUNT_ID must not strand an already-dangling public link."""
+    import scripts.upload_instagram as ui
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("stale_file_1")
+    ui.instagram_state.clear_share_cleanup.assert_called_once_with("stale_file_1")
+
+
+def test_cleanup_drains_when_page_token_is_missing(base, monkeypatch):
+    """An expired/removed Meta token must not strand cleanup either — Drive is separate."""
+    import scripts.upload_instagram as ui
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    with pytest.raises(SystemExit) as exc:
+        main([])
+    assert exc.value.code == 1  # still reports the misconfiguration...
+    ui.drive.revoke_share_link.assert_called_once_with("stale_file_1")  # ...but cleans up first
+
+
+def test_cleanup_still_drains_with_instagram_disabled_and_no_token(base, monkeypatch):
+    """Neither Instagram config nor a Meta token is required to revoke a Drive permission."""
+    import scripts.upload_instagram as ui
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 9},
+    ]
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("stale_file_1")
+
+
+def test_disabled_instagram_still_publishes_nothing(base, monkeypatch):
+    """Ungating cleanup must not accidentally ungate publishing (FR-016)."""
+    import scripts.upload_instagram as ui
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    main([])
+    ui.instagram_state.get_pending_upload.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
+
+
+def test_cleanup_is_skipped_when_the_lock_is_held(base, mocker):
+    """A concurrent instance already owns the drain — don't double-revoke."""
+    import scripts.upload_instagram as ui
+    mocker.patch.object(ui, "_try_acquire_upload_lock", return_value=None)
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    main([])
+    ui.drive.revoke_share_link.assert_not_called()
+
+
+@pytest.mark.parametrize("var", ["FIELDKIT_DATA_DIR", "FIELDKIT_LOG_DIR"])
+def test_missing_fieldkit_dirs_still_exit_1_before_cleanup(base, monkeypatch, var):
+    """The data/log dirs gate everything — cleanup reads and writes state too."""
+    import scripts.upload_instagram as ui
+    monkeypatch.delenv(var, raising=False)
+    with pytest.raises(SystemExit) as exc:
+        main([])
+    assert exc.value.code == 1
+    ui.drive.revoke_share_link.assert_not_called()
 
 
 def test_cleanup_drain_runs_before_the_upload(with_pending):

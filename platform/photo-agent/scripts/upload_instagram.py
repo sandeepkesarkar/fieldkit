@@ -156,20 +156,10 @@ def main(argv=None) -> None:
     if args.source:
         _log.debug("invoked from source=%s", args.source)
 
-    # FR-016 is checked FIRST, ahead of any other validation: a client without
-    # Instagram configured is not misconfigured, it is simply not using this feature,
-    # and must exit 0 rather than reporting an environment error.
-    ig_account_id = os.environ.get("IG_BUSINESS_ACCOUNT_ID", "")
-    if not ig_account_id:
-        _log.debug("IG_BUSINESS_ACCOUNT_ID not set — Instagram publishing disabled")
-        return
-
-    page_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
     chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
 
-    if not page_token:
-        _log.error("FB_PAGE_ACCESS_TOKEN is required for Instagram publishing")
-        sys.exit(1)
+    # Only the per-client data/log dirs are validated up front. They gate everything
+    # below — including share-link cleanup, which reads and writes instagram_state.
     for var in ("FIELDKIT_DATA_DIR", "FIELDKIT_LOG_DIR"):
         if not os.environ.get(var):
             _log.error("%s is required — add it to your client .env file", var)
@@ -180,10 +170,28 @@ def main(argv=None) -> None:
         _log.debug("another upload_instagram instance is running — exiting")
         return
     try:
-        # Runs before (and independently of) any upload work: a dangling public share
-        # link from an earlier tick has to keep getting retried whether or not there
-        # is a new job to publish today.
-        _drain_share_cleanups()
+        # Share-link cleanup runs FIRST, before the Instagram/Meta config gates below,
+        # and is deliberately not conditional on either of them. Revoking a Drive
+        # permission needs Drive credentials and nothing else — not an Instagram account
+        # id, not a Meta token. Gating it on those would mean that disabling Instagram
+        # for a client, or letting its Page token expire, permanently stranded any link
+        # that was already dangling: still publicly reachable, with no code path left
+        # that would ever retry it. A link that is already public stays public whether
+        # or not anyone intends to publish another Reel.
+        _drain_share_cleanups(chat_id)
+
+        # FR-016: a client without Instagram configured is not misconfigured, it is
+        # simply not using this feature, so it exits 0 rather than reporting an
+        # environment error — and, per the above, only AFTER cleanup has had its turn.
+        ig_account_id = os.environ.get("IG_BUSINESS_ACCOUNT_ID", "")
+        if not ig_account_id:
+            _log.debug("IG_BUSINESS_ACCOUNT_ID not set — Instagram publishing disabled")
+            return
+
+        page_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
+        if not page_token:
+            _log.error("FB_PAGE_ACCESS_TOKEN is required for Instagram publishing")
+            sys.exit(1)
 
         record = instagram_state.get_pending_upload()
         if record is None:
@@ -226,8 +234,12 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         )
         return
     if claim == "exhausted":
+        # claim_pending_upload() has already cleared the record, so this job is terminal:
+        # release the shared video too, or a crash during the final attempt would leave it
+        # on disk with nothing left to clean it up.
         _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
         instagram_logger.log_upload_exhausted(project_name)
+        _delete_local_file_if_last(video_path, project_name, idem_key)
         _send_alert(
             chat_id,
             f"⚠️ Instagram upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
@@ -355,23 +367,23 @@ def _revoke_share_link(share_link: str | None, project_name: str, chat_id: str) 
             "project=%s file_id=%s error=%s",
             project_name, file_id, exc,
         )
-        newly_recorded = instagram_state.record_share_cleanup(file_id, project_name)
-        if newly_recorded:
-            _send_alert(
-                chat_id,
-                f"⚠️ Instagram: could not remove the temporary public link for "
-                f"{project_name} (Drive file {file_id}). The video may still be publicly "
-                "reachable. FieldKit will keep retrying; remove the link manually if this "
-                "persists.",
-            )
+        entry = instagram_state.record_share_cleanup(file_id, project_name)
+        if entry:
+            _send_alert(chat_id, _share_cleanup_alert(entry))
 
 
-def _drain_share_cleanups() -> None:
+def _drain_share_cleanups(chat_id: str) -> None:
     """Retry every previously-failed share-link revocation, clearing the ones that succeed.
 
-    Runs on every tick, independently of whether there is an upload job, because a dangling
-    public link is a standing privacy problem that outlives the job that created it. Still
-    failing entries stay recorded (with their attempt count bumped) for the next tick.
+    Runs on every tick, whether or not there is an upload job AND whether or not Instagram
+    is still configured for this client, because a dangling public link is a standing
+    privacy problem that outlives both the job that created it and the feature being
+    enabled at all.
+
+    An entry that fails again stays recorded with its attempt count bumped, and the admin
+    is re-alerted on the schedule instagram_state.record_share_cleanup() decides — so a
+    link that never gets revoked keeps surfacing instead of being mentioned once and then
+    silently retried forever.
     """
     for entry in instagram_state.list_share_cleanups():
         file_id = entry.get("file_id")
@@ -385,13 +397,36 @@ def _drain_share_cleanups() -> None:
                 "retry of share-link revocation still failing: project=%s file_id=%s error=%s",
                 project_name, file_id, exc,
             )
-            instagram_state.record_share_cleanup(file_id, project_name)
+            updated = instagram_state.record_share_cleanup(file_id, project_name)
+            if updated:
+                _send_alert(chat_id, _share_cleanup_alert(updated))
             continue
         instagram_state.clear_share_cleanup(file_id)
         _log.info(
             "share-link revocation succeeded on retry: project=%s file_id=%s",
             project_name, file_id,
         )
+
+
+def _share_cleanup_alert(entry: dict) -> str:
+    """Build the admin alert for a Drive share link that could not be revoked.
+
+    The first alert and every re-escalation use this same wording, differing only in the
+    attempt count, so the message never promises follow-up it does not deliver: FieldKit
+    really does keep retrying, and really does keep reminding.
+    """
+    attempts = entry.get("attempts", 1)
+    project_name = entry.get("project_name", "unknown")
+    file_id = entry.get("file_id", "unknown")
+    since = entry.get("recorded_at", "unknown")
+    return (
+        f"⚠️ Instagram: could not remove the temporary public link for {project_name} "
+        f"(Drive file {file_id}). The video may still be publicly reachable.\n"
+        f"Failed attempts: {attempts}, first failed: {since}.\n"
+        "FieldKit keeps retrying every cron tick and will remind you daily until it "
+        "succeeds. To fix it now, remove the file's 'Anyone with the link' permission "
+        "in Drive."
+    )
 
 
 def _fetch_permalink(page_token: str, post_id: str, project_name: str) -> str | None:

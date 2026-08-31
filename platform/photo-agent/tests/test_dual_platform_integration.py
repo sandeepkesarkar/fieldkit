@@ -458,8 +458,8 @@ def test_failed_revoke_is_recorded_and_retried_next_tick(cron, video):
     assert ig_state.list_share_cleanups() == []
 
 
-def test_failed_revoke_alerts_the_admin_once(cron, video):
-    """The admin is told which Drive file may still be public — exactly once."""
+def test_failed_revoke_alerts_once_within_the_reminder_window(cron, video):
+    """The admin is told which Drive file may still be public, without per-tick spam."""
     import scripts.upload_instagram as ui
     ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
 
@@ -472,3 +472,107 @@ def test_failed_revoke_alerts_the_admin_once(cron, video):
     ]
     assert len(alerts) == 1
     assert "drive_file_1" in alerts[0]
+
+
+def test_failed_revoke_reescalates_once_the_window_elapses(cron, video, monkeypatch):
+    """A link that never gets revoked keeps reminding the admin — it never goes quiet.
+
+    Gap 2b: previously the admin got exactly ONE alert ever for a given dangling link,
+    however long cleanup kept failing, while the message implied follow-up would come.
+    """
+    import scripts.upload_instagram as ui
+    monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+
+    for _ in range(4):
+        ig_main([])
+
+    alerts = [
+        c.args[1] for c in ui.telegram_api.send_message.call_args_list
+        if "could not remove the temporary public link" in c.args[1]
+    ]
+    assert len(alerts) == 4
+    # Each reminder reports the growing failure count, so escalation is visible.
+    assert "Failed attempts: 1" in alerts[0]
+    assert "Failed attempts: 4" in alerts[-1]
+
+
+def test_reminder_stops_as_soon_as_the_revoke_succeeds(cron, video, monkeypatch):
+    """Re-escalation must end when the problem does — no reminders about a fixed link."""
+    import scripts.upload_instagram as ui
+    monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ig_main([])
+    ui.drive.revoke_share_link.side_effect = None
+    ig_main([])
+    ui.telegram_api.send_message.reset_mock()
+
+    ig_main([])
+
+    assert ig_state.list_share_cleanups() == []
+    assert not any(
+        "could not remove the temporary public link" in c.args[1]
+        for c in ui.telegram_api.send_message.call_args_list
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cleanup survives Instagram being disabled or its token going away (gap 2a)
+# ---------------------------------------------------------------------------
+
+def test_cleanup_still_drains_after_instagram_is_disabled(cron, video, monkeypatch):
+    """Disabling Instagram mid-flight must not strand an already-public link.
+
+    The exact reported scenario: a revoke fails, the client then clears
+    IG_BUSINESS_ACCOUNT_ID, and the link must still get cleaned up on a later tick
+    rather than staying publicly reachable forever with no code path left to fix it.
+    """
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ig_main([])
+    assert [e["file_id"] for e in ig_state.list_share_cleanups()] == ["drive_file_1"]
+
+    # The client turns Instagram off entirely, and Drive recovers afterwards.
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    ui.drive.revoke_share_link.side_effect = None
+
+    ig_main([])
+
+    ui.drive.revoke_share_link.assert_called_with("drive_file_1")
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_cleanup_still_drains_after_the_meta_token_is_removed(cron, video, monkeypatch):
+    """A revoked/expired Meta token must not strand cleanup either.
+
+    Revoking a Drive permission needs Drive credentials and nothing else.
+    """
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ig_main([])
+    assert len(ig_state.list_share_cleanups()) == 1
+
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    ui.drive.revoke_share_link.side_effect = None
+
+    with pytest.raises(SystemExit):
+        ig_main([])  # still reports the misconfiguration, but only after cleaning up
+
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_disabled_instagram_drains_cleanup_without_publishing(cron, video, monkeypatch):
+    """Ungating cleanup must not ungate publishing — FR-016 still holds."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ig_main([])
+    ig_state.clear_pending_upload(_IDEM_KEY)
+
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    ui.drive.revoke_share_link.side_effect = None
+    ui.instagram_api.create_media_container.reset_mock()
+
+    ig_main([])
+
+    assert ig_state.list_share_cleanups() == []
+    ui.instagram_api.create_media_container.assert_not_called()

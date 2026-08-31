@@ -501,7 +501,7 @@ def test_mark_published_permalink_defaults_to_none(valid_record):
 
 def test_record_share_cleanup_adds_entry():
     """A failed revoke is recorded durably with its file id and project."""
-    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is True
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is not None
     entries = ig_state.list_share_cleanups()
     assert len(entries) == 1
     assert entries[0]["file_id"] == "file_1"
@@ -509,19 +509,65 @@ def test_record_share_cleanup_adds_entry():
     assert entries[0]["attempts"] == 1
 
 
+def test_record_share_cleanup_first_failure_returns_entry_to_alert_on():
+    """The first failure always alerts, and hands back the entry to describe it."""
+    entry = ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    assert entry["file_id"] == "file_1"
+    assert entry["project_name"] == "kitchen_remodel"
+    assert entry["attempts"] == 1
+
+
 def test_record_share_cleanup_is_idempotent_per_file():
     """Re-recording the same file bumps its attempt count instead of duplicating it."""
-    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is True
-    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is False
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is not None
+    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is None
     entries = ig_state.list_share_cleanups()
     assert len(entries) == 1
     assert entries[0]["attempts"] == 2
 
 
-def test_record_share_cleanup_returns_false_for_known_file():
-    """The False return is what lets the caller alert exactly once per dangling link."""
+def test_record_share_cleanup_returns_none_inside_the_alert_interval():
+    """Within the re-alert window, repeated failures are silent (but still counted)."""
     ig_state.record_share_cleanup("file_1", "kitchen_remodel")
-    assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is False
+    for _ in range(5):
+        assert ig_state.record_share_cleanup("file_1", "kitchen_remodel") is None
+    assert ig_state.list_share_cleanups()[0]["attempts"] == 6
+
+
+def test_record_share_cleanup_reescalates_after_the_interval(monkeypatch):
+    """A link that keeps failing must eventually re-alert, not go quiet forever.
+
+    The one-alert-ever behaviour this replaces meant a link that never got revoked was
+    mentioned once and then silently retried indefinitely.
+    """
+    monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    entry = ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    assert entry is not None
+    assert entry["attempts"] == 2
+
+
+def test_reescalation_reports_the_growing_attempt_count(monkeypatch):
+    """Each re-alert carries how many attempts have failed, so escalation is legible."""
+    monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    counts = [ig_state.record_share_cleanup("file_1", "kitchen_remodel")["attempts"]
+              for _ in range(3)]
+    assert counts == [2, 3, 4]
+
+
+def test_reescalation_stamps_last_alerted_at(monkeypatch):
+    """The alert clock is persisted, so the interval survives across cron ticks."""
+    monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    first = ig_state.list_share_cleanups()[0]["last_alerted_at"]
+    ig_state.record_share_cleanup("file_1", "kitchen_remodel")
+    assert ig_state.list_share_cleanups()[0]["last_alerted_at"] >= first
+
+
+def test_default_alert_interval_is_daily():
+    """A dangling public link is worth a daily reminder, not a per-minute one."""
+    assert ig_state._SHARE_CLEANUP_ALERT_INTERVAL_SECONDS == 24 * 60 * 60
 
 
 def test_record_share_cleanup_tracks_multiple_files():

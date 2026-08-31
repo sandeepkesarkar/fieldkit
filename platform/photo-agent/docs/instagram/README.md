@@ -174,8 +174,24 @@ tick retries the revocation** — including ticks with no new video to publish �
 until it succeeds, at which point the entry is cleared. A public link can never be
 left dangling with nothing recording it.
 
+Two properties of that retry loop are load-bearing:
+
+- **It is not gated on Instagram being configured.** The cleanup pass runs before
+  the `IG_BUSINESS_ACCOUNT_ID` and `FB_PAGE_ACCESS_TOKEN` checks, so clearing a
+  client's Instagram config or letting its Meta token expire does *not* strand a
+  link that is already public. Revoking a Drive permission needs Drive credentials
+  and nothing else. (The only thing that gates it is `FIELDKIT_DATA_DIR` /
+  `FIELDKIT_LOG_DIR`, which the state file itself lives under.)
+- **The admin is reminded daily, not once.** The first failure alerts immediately;
+  after that, a still-unrevoked link re-alerts every 24 hours
+  (`_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS` in `instagram_state.py`), reporting the
+  running failure count. A single alert would let a permanently-failing cleanup go
+  quiet while the video stayed public.
+
 To audit: `pending_share_cleanups` in `instagram_state.json` is the authoritative
 list of links that may still be public. An empty list means nothing is outstanding.
+Each entry carries `attempts`, `recorded_at`, `last_attempt_at`, and
+`last_alerted_at`.
 
 ### Who deletes the local video
 
@@ -267,7 +283,8 @@ script here would expose an operator tool as an owner-facing command.
 | Nothing happens on approval; no `IG_ENQUEUED` in the log | `IG_BUSINESS_ACCOUNT_ID` not set for this client — run step 1 |
 | `IG_FAILED` with "did not finish processing" | Container stuck past 300s; retried automatically, often a large or oddly-encoded video |
 | `IG_TOKEN_EXP` | Page token expired — the Facebook upload will be failing too; reconnect once, fixes both |
-| Alert naming a Drive file that "may still be publicly reachable" | A revoke failed; FieldKit keeps retrying each tick. Check `pending_share_cleanups` in `instagram_state.json`, and unshare the file manually if it persists |
+| Alert naming a Drive file that "may still be publicly reachable" | A revoke failed; FieldKit keeps retrying each tick and re-alerts daily. Check `pending_share_cleanups` in `instagram_state.json`; to fix it now, remove the file's "Anyone with the link" permission in Drive |
+| The same share-link alert arriving daily | Cleanup is still failing after many attempts. The `attempts` count in the alert says how many. Resolve it manually in Drive — the reminder stops as soon as the revoke succeeds |
 | Confirmation says "could not fetch the post link" | The Reel published, but the permalink lookup failed. Check the account directly; no retry is attempted since the post is already live |
 | Local video still on disk after a publish | Expected while the other platform's job for that approval is still pending — the last one to resolve deletes it |
 | Facebook posted but Instagram didn't (or vice versa) | Expected and by design — the two are independent (FR-013). Check the log for that platform's own events |

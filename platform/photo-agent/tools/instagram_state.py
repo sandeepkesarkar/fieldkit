@@ -100,6 +100,13 @@ _DEFAULTS = {
 # lifetime. Only the most recent _PUBLISH_HISTORY_LIMIT publishes are kept.
 _PUBLISH_HISTORY_LIMIT = 100
 
+# How long to wait before re-alerting the admin about a share link that STILL hasn't been
+# revoked. A dangling public link is a standing privacy problem, so one alert at creation is
+# not enough — if the retries keep failing, the reminder has to keep coming back or the
+# problem silently becomes permanent. Deliberately a wall-clock interval rather than a retry
+# count: the cron cadence is a deployment detail, "you have been told once a day" is not.
+_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
+
 
 def _read(file_obj) -> dict:
     """Read and parse instagram_state.json from an open, locked file object."""
@@ -451,17 +458,29 @@ def is_published(idempotency_key: str) -> bool:
 # gate exists to prevent. So a failed revoke is written down here instead, durably,
 # and retried on every subsequent cron tick until it succeeds. This list is keyed by
 # Drive file id and is deliberately independent of the upload job's lifecycle: the
-# job is terminal, the cleanup is not.
+# job is terminal, the cleanup is not — and it is deliberately not gated on Instagram
+# still being configured for the client, since a link that is already public stays public
+# whether or not anyone intends to publish another Reel.
 
 
-def record_share_cleanup(file_id: str, project_name: str) -> bool:
+def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
     """Record that file_id's public Drive permission still needs revoking.
 
-    Returns True if this is a NEW entry, False if that file_id was already recorded —
-    which lets the caller alert the admin exactly once per dangling link rather than on
-    every retry tick.
+    Returns the entry dict when the admin SHOULD BE ALERTED right now, or None when they
+    should not. That decision is made here rather than by the caller because it needs the
+    entry's alert history, and deciding-and-stamping has to happen inside the same
+    exclusive-lock transaction that bumps the attempt count — otherwise two overlapping
+    ticks could both decide to alert about the same link.
+
+    The admin is alerted on the FIRST failure, and then again every
+    _SHARE_CLEANUP_ALERT_INTERVAL_SECONDS for as long as the link stays unrevoked. A single
+    alert at creation would be worse than useless: a link that keeps failing to revoke stays
+    publicly reachable indefinitely, and after one message nothing would ever mention it
+    again. The returned entry carries `attempts` and `recorded_at` so the caller can say how
+    long this has been going on.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with _open_for_write() as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -469,28 +488,40 @@ def record_share_cleanup(file_id: str, project_name: str) -> bool:
             data = _read(f)
             cleanups = data.setdefault("pending_share_cleanups", [])
             for entry in cleanups:
-                if entry.get("file_id") == file_id:
-                    entry["attempts"] = entry.get("attempts", 1) + 1
-                    entry["last_attempt_at"] = now
-                    _write(f, data)
-                    logger.warning(
-                        "record_share_cleanup: file_id=%s still pending after %d attempts",
-                        file_id, entry["attempts"],
-                    )
-                    return False
-            cleanups.append({
+                if entry.get("file_id") != file_id:
+                    continue
+                entry["attempts"] = entry.get("attempts", 1) + 1
+                entry["last_attempt_at"] = now
+                should_alert = _has_elapsed(
+                    entry.get("last_alerted_at"),
+                    _SHARE_CLEANUP_ALERT_INTERVAL_SECONDS,
+                    now_dt,
+                )
+                if should_alert:
+                    entry["last_alerted_at"] = now
+                _write(f, data)
+                logger.warning(
+                    "record_share_cleanup: file_id=%s still pending after %d attempts "
+                    "(re-alerting=%s)",
+                    file_id, entry["attempts"], should_alert,
+                )
+                return dict(entry) if should_alert else None
+
+            entry = {
                 "file_id": file_id,
                 "project_name": project_name,
                 "recorded_at": now,
                 "last_attempt_at": now,
+                "last_alerted_at": now,
                 "attempts": 1,
-            })
+            }
+            cleanups.append(entry)
             _write(f, data)
             logger.error(
                 "record_share_cleanup: file_id=%s project=%s — share link NOT revoked",
                 file_id, project_name,
             )
-            return True
+            return dict(entry)
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
