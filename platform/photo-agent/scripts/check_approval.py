@@ -111,6 +111,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from tools import drive, paths, state
 from tools import facebook_state
+from tools import instagram_logger, instagram_state
 from tools import logger as activity_log
 from tools import telegram_api
 
@@ -245,6 +246,50 @@ def _enqueue_facebook_upload(
         _log.error("Failed to enqueue FB upload for project=%s: %s", project_name, exc)
 
 
+def _enqueue_instagram_upload(
+    project_name: str, video_local_path: str, telegram_message_id: int
+) -> None:
+    """Enqueue an Instagram upload job after approval (Feature 005).
+
+    Runs ALONGSIDE _enqueue_facebook_upload(), never instead of it: FR-002 says the
+    single Telegram approval the owner already gave is what authorizes both posts, so
+    there is no second Instagram approval gate anywhere in this flow.
+
+    Skipped silently when IG_BUSINESS_ACCOUNT_ID is not configured — that absence is
+    the whole per-client enable switch (FR-016), which is why _construction_co needs
+    no client-name special-casing here to stay untouched by this feature.
+
+    Failure is logged as an error but does NOT abort the approve flow or the Facebook
+    enqueue (FR-013): the two platforms' outcomes are independent, so an Instagram
+    problem must never cost the owner their approval or their Facebook post. The
+    reverse also holds — this runs even if the Facebook enqueue above raised.
+    """
+    ig_business_account_id = os.environ.get("IG_BUSINESS_ACCOUNT_ID", "")
+    if not ig_business_account_id:
+        return
+    idem_key = str(telegram_message_id)
+    try:
+        if instagram_state.is_published(idem_key):
+            _log.warning("IG upload already published for key=%s — skipping enqueue", idem_key)
+            return
+        instagram_state.set_pending_upload({
+            "project_name": project_name,
+            "video_local_path": video_local_path,
+            "ig_business_account_id": ig_business_account_id,
+            "status": "pending",
+            "attempt_count": 0,
+            "last_attempt_at": None,
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+            "idempotency_key": idem_key,
+            "container_id": None,
+            "ig_post_id": None,
+        })
+        instagram_logger.log_upload_enqueued(project_name)
+        _log.info("IG upload enqueued: project=%s key=%s", project_name, idem_key)
+    except Exception as exc:
+        _log.error("Failed to enqueue IG upload for project=%s: %s", project_name, exc)
+
+
 def main(argv=None) -> None:
     """Parse --callback-data and dispatch the approve/reject decision."""
     parser = argparse.ArgumentParser(
@@ -330,6 +375,10 @@ def _run(callback_data: str) -> None:
             _log.error("activity log failed after approval: %s", exc)
 
         _enqueue_facebook_upload(project_name, video_local_path, telegram_message_id)
+        # Both platform enqueues happen synchronously in this one invocation, from the
+        # one approval. Each swallows its own failures (FR-013), so the order below
+        # carries no priority — neither can prevent the other from being attempted.
+        _enqueue_instagram_upload(project_name, video_local_path, telegram_message_id)
 
         confirmation = f"Approved: {project_name}"
 
