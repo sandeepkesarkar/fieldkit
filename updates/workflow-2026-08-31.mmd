@@ -1,0 +1,37 @@
+%%{init: {'flowchart': {'curve': 'basis'}, 'themeVariables': {'fontFamily': 'Helvetica, Arial, sans-serif', 'fontSize': '16px'}} }%%
+flowchart TD
+    A["Human describes a feature"] --> B["requirements-gather<br/>relentless questions"]
+    B --> C{"Read-back<br/>approved?"}
+    C -->|no| B
+    C -->|yes| D["speckit chain<br/>specify -> clarify -> plan -> tasks"]
+    D --> G["spec.md / plan.md / tasks.md"]
+    G --> H["spec-to-issues<br/>size, order, label"]
+    H --> I{"Breakdown<br/>approved?"}
+    I -->|no| H
+    I -->|yes| J["GitHub issues<br/>agent-ready"]
+    J --> K["fanout<br/>worktree + implementer per task"]
+    K --> L["cross-review gates<br/>tests, lint, diff coverage >=97%,<br/>integration tests"]
+    L -->|red| K
+    L -->|green| M["cross-review: opposite-vendor review<br/>Engineering, Security, Python, Debuggability"]
+    M -->|blocking issue| K
+    M -->|clean| N["PR marked ready"]
+    N -.-> O["pr-test-steps"]
+    N -.-> P["adversarial-review"]
+    N -.-> Q["security-review"]
+    N -.-> R["agentic-skill-review"]
+    N --> S["Human reviews and merges<br/>no automation ever merges"]
+
+    subgraph Legend[" "]
+        direction LR
+        LH["Human"]:::human
+        LG["GenAI agent"]:::genai
+        LA["Artifact / output"]:::artifact
+    end
+
+    classDef human fill:#2563EB,stroke:#1E3A8A,stroke-width:2px,color:#FFFFFF;
+    classDef genai fill:#7C3AED,stroke:#4C1D95,stroke-width:2px,color:#FFFFFF;
+    classDef artifact fill:#6B7280,stroke:#374151,stroke-width:2px,color:#FFFFFF;
+
+    class A,C,I,S human;
+    class B,D,H,K,L,M,O,P,Q,R genai;
+    class G,J,N artifact;
