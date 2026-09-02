@@ -606,3 +606,47 @@ def test_data_dir_env_override_writes_to_alt_path(tmp_path, monkeypatch, valid_r
     fb_state.set_pending_upload(valid_record)
     assert alt_state.exists()
     assert json.loads(alt_state.read_text())["pending_facebook_upload"] == valid_record
+
+
+# ---------------------------------------------------------------------------
+# has_outstanding_job — cross-platform cleanup coordination (Feature 005)
+# ---------------------------------------------------------------------------
+
+def test_has_outstanding_job_true_while_pending(valid_record):
+    """A freshly enqueued job is outstanding."""
+    fb_state.set_pending_upload(valid_record)
+    assert fb_state.has_outstanding_job("42") is True
+
+
+def test_has_outstanding_job_true_while_claimed(valid_record):
+    """A job mid-upload is still outstanding — the other platform must wait."""
+    fb_state.set_pending_upload(valid_record)
+    fb_state.claim_pending_upload(
+        "42", cooldown_seconds=60, max_attempts=3, lease_seconds=900
+    )
+    assert fb_state.has_outstanding_job("42") is True
+
+
+def test_has_outstanding_job_false_when_nothing_enqueued():
+    """A key that was never enqueued is not outstanding."""
+    assert fb_state.has_outstanding_job("42") is False
+
+
+def test_has_outstanding_job_false_after_published(valid_record):
+    """Publishing resolves the job."""
+    fb_state.set_pending_upload(valid_record)
+    fb_state.mark_published("42", "post_1")
+    assert fb_state.has_outstanding_job("42") is False
+
+
+def test_has_outstanding_job_false_after_failed(valid_record):
+    """A terminal failure resolves the job just as much as a publish does."""
+    fb_state.set_pending_upload(valid_record)
+    fb_state.mark_failed("42")
+    assert fb_state.has_outstanding_job("42") is False
+
+
+def test_has_outstanding_job_false_for_a_different_key(valid_record):
+    """A pending job under another key says nothing about this one."""
+    fb_state.set_pending_upload(valid_record)
+    assert fb_state.has_outstanding_job("999") is False

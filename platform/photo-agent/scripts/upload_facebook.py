@@ -44,6 +44,15 @@ additionally self-heals a stale or pre-fix state file (an already-published
 idempotency_key, or a status already 'failed', found still sitting in
 pending_facebook_upload) by clearing it instead of reprocessing (issue #34).
 
+Local video cleanup is COORDINATED, not owned by this script (Feature 005). This
+script used to delete the approved video on its own successful publish, which was
+correct while it was the file's only consumer. Feature 005 added a second,
+independently-scheduled consumer (upload_instagram.py) of the SAME file, so deleting
+on one's own success would pull the file out from under the other platform's
+still-pending job — which then fails terminally, publishing nothing and alerting
+nobody. Deletion now happens only when every enabled platform has resolved this
+approval; see tools/upload_cleanup.py.
+
 FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
 
@@ -90,7 +99,14 @@ os.environ["CLIENT_NAME"] = _CLIENT
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from tools import facebook_api, facebook_logger, facebook_state, paths, telegram_api
+from tools import (
+    facebook_api,
+    facebook_logger,
+    facebook_state,
+    paths,
+    telegram_api,
+    upload_cleanup,
+)
 from tools.facebook_api import FacebookTokenError, FacebookUploadError
 
 _log = logging.getLogger(__name__)
@@ -127,6 +143,24 @@ def _try_acquire_upload_lock() -> "IO | None":
     except BlockingIOError:
         f.close()
         return None
+
+
+def _delete_local_file_if_last(video_local_path: str, project_name: str, idem_key: str) -> None:
+    """Delete the approved video, but only once every OTHER enabled platform is done with it.
+
+    MUST be called after this job's own terminal state is recorded — see
+    tools/upload_cleanup.py for why that ordering is what makes the check race-free.
+    """
+    waiting = upload_cleanup.other_platforms_pending(
+        idem_key, platform=upload_cleanup.FACEBOOK
+    )
+    if waiting:
+        _log.info(
+            "leaving local video in place — still needed by %s: project=%s",
+            ", ".join(waiting), project_name,
+        )
+        return
+    _delete_local_file(video_local_path, project_name)
 
 
 def _delete_local_file(video_local_path: str, project_name: str) -> None:
@@ -222,8 +256,12 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         )
         return
     if claim == "exhausted":
+        # claim_pending_upload() has already cleared the record, so this job is terminal:
+        # release the shared video too, or a crash during the final attempt would leave it
+        # on disk with nothing left to clean it up.
         _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
         facebook_logger.log_upload_exhausted(project_name)
+        _delete_local_file_if_last(video_path, project_name, idem_key)
         _send_alert(
             chat_id,
             f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
@@ -237,6 +275,13 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
     if not Path(video_path).exists():
         _log.error("video file missing: project=%s path=%s", project_name, video_path)
         facebook_state.mark_failed(idem_key)
+        # Alert rather than failing silently — matches upload_instagram.py's equivalent
+        # path. A vanished video is a real, terminal failure the owner needs to know about.
+        _send_alert(
+            chat_id,
+            f"⚠️ Facebook upload failed for {project_name} — the approved video file "
+            "is missing on disk",
+        )
         return
 
     attempt_number = attempt_count + 1
@@ -248,6 +293,7 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         _log.error("Facebook token error: project=%s: %s", project_name, exc)
         facebook_state.mark_failed(idem_key)
         facebook_logger.log_token_expired(project_name)
+        _delete_local_file_if_last(video_path, project_name, idem_key)
         _send_alert(
             chat_id,
             f"⚠️ Facebook token expired for {project_name} — reconnect your Page via generate_auth_link.py",
@@ -259,6 +305,7 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         if attempt_number >= _MAX_ATTEMPTS:
             facebook_state.mark_failed(idem_key)
             facebook_logger.log_upload_exhausted(project_name)
+            _delete_local_file_if_last(video_path, project_name, idem_key)
             _send_alert(
                 chat_id,
                 f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
@@ -270,9 +317,10 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
             facebook_state.release_claim(idem_key)
         return
 
-    # Success path.
+    # Success path. mark_published() is what makes this job terminal in the state file, and
+    # it has to happen BEFORE the coordination check — see tools/upload_cleanup.py.
     facebook_state.mark_published(idem_key, post_id)
-    _delete_local_file(video_path, project_name)
+    _delete_local_file_if_last(video_path, project_name, idem_key)
     facebook_logger.log_upload_published(project_name, post_id)
     post_url = f"https://www.facebook.com/{post_id}"
     _send_confirmation(chat_id, f"✅ Video live on Facebook! {post_url}")

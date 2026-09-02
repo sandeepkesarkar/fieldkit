@@ -48,6 +48,8 @@ def env(monkeypatch):
     # the FB-enqueue branch off by default for every test using this fixture,
     # regardless of what base_fb below re-enables it to.
     monkeypatch.delenv("FB_PAGE_ID", raising=False)
+    # Same defense for Feature 005's Instagram enqueue branch (see base_ig).
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
 
 
 @pytest.fixture
@@ -84,6 +86,10 @@ def base(mocker, env):
     # regardless of which fixture it uses or what's in the ambient env.
     mocker.patch("scripts.check_approval.facebook_state.set_pending_upload")
     mocker.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    # Same reasoning for Feature 005's Instagram enqueue: never let an unmocked
+    # instagram_state.set_pending_upload() reach the live instagram_state.json.
+    mocker.patch("scripts.check_approval.instagram_state.set_pending_upload")
+    mocker.patch("scripts.check_approval.instagram_state.is_published", return_value=False)
     return mocker
 
 
@@ -676,3 +682,146 @@ def test_lock_contention_prints_distinct_nonempty_stdout(mocker, env, capsys):
     main(_APPROVE_ARGS)
     out = capsys.readouterr().out
     assert out == "Already processing — try again in a moment.\n"
+
+
+# ---------------------------------------------------------------------------
+# Instagram upload enqueueing on approve path (Feature 005)
+# ---------------------------------------------------------------------------
+#
+# The single Telegram approval must enqueue BOTH platform jobs (FR-002): the
+# owner is never asked to approve the same video twice. These tests pin that,
+# plus the per-client gate (FR-016) and the "Instagram failure never touches the
+# Facebook enqueue" independence rule (FR-013).
+
+_IG_ACCOUNT_ID = "17841400000000000"
+
+
+@pytest.fixture
+def base_ig(base, monkeypatch):
+    """Extends base by enabling IG_BUSINESS_ACCOUNT_ID (and FB_PAGE_ID) for enqueue tests."""
+    monkeypatch.setenv("FB_PAGE_ID", _FB_PAGE_ID)
+    monkeypatch.setenv("IG_BUSINESS_ACCOUNT_ID", _IG_ACCOUNT_ID)
+    base.patch("scripts.check_approval.facebook_state.is_published", return_value=False)
+    base.patch("scripts.check_approval.instagram_state.is_published", return_value=False)
+    return base
+
+
+def test_approve_enqueues_instagram_upload(base_ig):
+    """approve path calls instagram_state.set_pending_upload with the correct record."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_called_once()
+    record = ca.instagram_state.set_pending_upload.call_args.args[0]
+    assert record["project_name"] == _PROJECT
+    assert record["video_local_path"] == _PENDING["video_local_path"]
+    assert record["ig_business_account_id"] == _IG_ACCOUNT_ID
+    assert record["idempotency_key"] == str(_PENDING["telegram_message_id"])
+    assert record["status"] == "pending"
+    assert record["attempt_count"] == 0
+    assert record["last_attempt_at"] is None
+    assert record["container_id"] is None
+    assert record["ig_post_id"] is None
+    assert record["triggered_at"]
+
+
+def test_approve_enqueues_both_platforms_from_one_approval(base_ig):
+    """FR-002: one approval, both jobs — no second Instagram-specific approval step."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    ca.facebook_state.set_pending_upload.assert_called_once()
+    ca.instagram_state.set_pending_upload.assert_called_once()
+
+
+def test_both_platform_jobs_share_one_idempotency_key(base_ig):
+    """The two jobs are correlated only by sharing the approval's idempotency key."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    fb_record = ca.facebook_state.set_pending_upload.call_args.args[0]
+    ig_record = ca.instagram_state.set_pending_upload.call_args.args[0]
+    assert fb_record["idempotency_key"] == ig_record["idempotency_key"]
+    assert ig_record["idempotency_key"] == str(_PENDING["telegram_message_id"])
+
+
+def test_approve_instagram_enqueue_idempotency_skip(base_ig):
+    """FR-011: an already-published key is not re-enqueued for Instagram."""
+    import scripts.check_approval as ca
+    ca.instagram_state.is_published.return_value = True
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_instagram_idempotency_skip_does_not_block_facebook(base_ig):
+    """An already-published Instagram job still lets the Facebook job enqueue (FR-013)."""
+    import scripts.check_approval as ca
+    ca.instagram_state.is_published.return_value = True
+    main(_APPROVE_ARGS)
+    ca.facebook_state.set_pending_upload.assert_called_once()
+
+
+def test_approve_instagram_enqueue_skipped_without_account_id(base, mocker, monkeypatch):
+    """FR-016: no IG_BUSINESS_ACCOUNT_ID means no Instagram behaviour at all."""
+    import scripts.check_approval as ca
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.setenv("FB_PAGE_ID", _FB_PAGE_ID)
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+    ca.instagram_state.is_published.assert_not_called()
+
+
+def test_approve_instagram_enqueue_skipped_when_account_id_is_empty(base, mocker, monkeypatch):
+    """An empty IG_BUSINESS_ACCOUNT_ID (as shipped in .env.example) also disables the path."""
+    import scripts.check_approval as ca
+    monkeypatch.setenv("IG_BUSINESS_ACCOUNT_ID", "")
+    monkeypatch.setenv("FB_PAGE_ID", _FB_PAGE_ID)
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_instagram_enqueue_failure_does_not_abort_approve_flow(base_ig):
+    """FR-013: an instagram_state exception is caught — the approve flow still completes."""
+    import scripts.check_approval as ca
+    ca.instagram_state.set_pending_upload.side_effect = Exception("state error")
+    main(_APPROVE_ARGS)
+    ca.state.clear_pending_approval.assert_called_once()
+
+
+def test_instagram_enqueue_failure_does_not_abort_facebook_enqueue(base_ig):
+    """FR-013: a failed Instagram enqueue leaves the Facebook enqueue intact."""
+    import scripts.check_approval as ca
+    ca.instagram_state.set_pending_upload.side_effect = Exception("state error")
+    main(_APPROVE_ARGS)
+    ca.facebook_state.set_pending_upload.assert_called_once()
+
+
+def test_facebook_enqueue_failure_does_not_abort_instagram_enqueue(base_ig):
+    """FR-013 in the other direction: a Facebook failure must not skip Instagram."""
+    import scripts.check_approval as ca
+    ca.facebook_state.set_pending_upload.side_effect = Exception("state error")
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_called_once()
+
+
+def test_reject_does_not_enqueue_instagram(base_ig):
+    """Only an approval enqueues an Instagram job — a rejection never publishes."""
+    import scripts.check_approval as ca
+    main(_REJECT_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_instagram_enqueue_logs_enqueued_event(base_ig, mocker):
+    """FR-012: the enqueue is recorded in the activity log."""
+    import scripts.check_approval as ca
+    mock_log = mocker.patch("scripts.check_approval.instagram_logger.log_upload_enqueued")
+    main(_APPROVE_ARGS)
+    mock_log.assert_called_once_with(_PROJECT)
+
+
+def test_instagram_enqueue_log_failure_does_not_abort_approve_flow(base_ig, mocker):
+    """A logging failure must not cost the owner their approval."""
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.instagram_logger.log_upload_enqueued",
+        side_effect=OSError("disk full"),
+    )
+    main(_APPROVE_ARGS)
+    ca.state.clear_pending_approval.assert_called_once()
