@@ -235,6 +235,10 @@ _INJECTION_CASES = [
     ("backtick", "repo`printf INJECTED`", "repoINJECTED"),
     ("double-quote", 'repo"x', None),
     ("single-quote", "repo'x", None),
+    # A backslash is a shell metacharacter in its own right and the guard
+    # rejects it, but round 5's mapping table cited this test for the whole
+    # expansion class without a case for it. Added rather than reworded.
+    ("backslash", "repo\\x", None),
     # $(touch PWNED) leaves a file behind in the working directory if the
     # substitution is ever evaluated — a direct, positive proof of execution
     # rather than an inference from the resolved path.
@@ -386,8 +390,10 @@ def test_benign_path_shapes_still_resolve(tmp_path, skill_md, dirname):
 # variable (data) instead of pasting it into the skill body (source).
 #
 # What IS in our control, and what these tests pin:
-#   * the delimiter must not be a guessable or obvious string, so realistic
-#     and accidental collisions are nil;
+#   * the delimiter must not be a guessable or obvious string, which makes an
+#     accidental collision extremely unlikely — what the test below actually
+#     establishes is the narrower fact that the former guessable delimiter no
+#     longer collides;
 #   * a newline alone must fail closed;
 #   * delimiter text inside an ordinary path component must resolve normally.
 #
@@ -564,23 +570,30 @@ def test_delimiter_collision_permits_arbitrary_shell_source(
 
 
 # ---------------------------------------------------------------------------
-# One test per guard branch (PR #75 round-5 review, item 1)
+# Guard diagnostics, one case per input
 # ---------------------------------------------------------------------------
-# Rounds 1–4 of this review kept finding claims that outran their tests. Both
-# round-5 reviewers then found the inverse gap: several guard branches were
-# correct but had no dedicated test, while the PR claimed coverage of them. The
-# guards below were verified by hand; these tests make the claim true, so the
-# coverage statement stands on the suite rather than on a manual check.
+# Each block has seven `ERROR:` exits. Six of them are driven below. The
+# seventh, `cannot enter $AGENT_DIR`, is not: the earlier
+# `cd "$SKILL_DIR/../.."` traverses the same directory, so anything that would
+# block the final `cd` blocks that one first (checked by removing the
+# directory's search permission — it reaches the "two levels above" branch).
+# It is reachable only if the directory changes between the two steps, which a
+# test cannot set up deterministically. It stays in the block as a defensive
+# fallback, unexercised and described as such rather than counted as covered.
+#
+# The cases are INPUTS, not branches: "empty" and "whitespace-only" both drive
+# the same first guard. Round 5 miscounted them as separate branches, which is
+# how "six branches, all covered" came to be written when the true figure was
+# five of seven.
 #
 # Each case drives the block's own code — no hand-copied expectation of it.
 
-# Every distinct abort branch, with the text that identifies it. `condition`
-# builds the skill directory that triggers it, given a tmp root and the skill.
-_GUARD_BRANCHES = (
+_GUARD_CASES = (
     ("empty", "empty or blank"),
     ("whitespace-only", "empty or blank"),
     ("unsubstituted-placeholder", "reached the shell unsubstituted"),
     ("metacharacter", "contains a shell metacharacter"),
+    ("unresolvable-parent", "two levels above"),
     ("outside-platform-parent", "not a fieldkit platform agent directory"),
     ("missing-script", "not found under"),
 )
@@ -596,6 +609,10 @@ def _skill_dir_for_branch(branch: str, tmp_path: Path, skill_md: Path) -> str | 
         return None  # leave the token in place
     if branch == "metacharacter":
         return str(_fake_checkout(tmp_path, "repo$USER", skill_md))
+    if branch == "unresolvable-parent":
+        # Passes the earlier guards (non-blank, not the placeholder, no
+        # metacharacters) but does not exist, so resolving two levels up fails.
+        return str(tmp_path / "absent" / "skills" / skill_md.parent.name)
     if branch == "outside-platform-parent":
         # Mirrors a skill copied into Hermes's own skills directory, where two
         # levels up is the Hermes profile rather than an agent directory.
@@ -627,18 +644,16 @@ def _run_branch(skill_md: Path, tmp_path: Path, branch: str):
 @pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
 @pytest.mark.parametrize(
     "branch,expected_text",
-    _GUARD_BRANCHES,
-    ids=[b for b, _ in _GUARD_BRANCHES],
+    _GUARD_CASES,
+    ids=[c for c, _ in _GUARD_CASES],
 )
-def test_each_guard_branch_aborts_with_its_own_diagnostic(
+def test_guard_case_aborts_with_its_own_diagnostic(
     tmp_path, skill_md, branch, expected_text
 ):
-    """Each abort branch must fire, exit 1, and say which condition it was.
+    """An abort case must fire, exit 1, and say which condition it was.
 
-    Covers items (a), (b) and (c) of the round-5 list — empty/whitespace-only,
-    resolution outside a `platform/` parent, and a missing dispatched script —
-    alongside the two branches earlier rounds already exercised, so all six
-    live in one matrix rather than being covered unevenly.
+    A misidentified cause is the real cost here: it sends the operator to
+    change a setting that was never the problem.
     """
     result = _run_branch(skill_md, tmp_path, branch)
     combined = result.stdout + result.stderr
@@ -656,15 +671,14 @@ def test_each_guard_branch_aborts_with_its_own_diagnostic(
 
 @pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
 @pytest.mark.parametrize(
-    "branch", [b for b, _ in _GUARD_BRANCHES], ids=[b for b, _ in _GUARD_BRANCHES]
+    "branch", [c for c, _ in _GUARD_CASES], ids=[c for c, _ in _GUARD_CASES]
 )
-def test_every_guard_branch_reports_one_error_line(tmp_path, skill_md, branch):
-    """Pins doc 12's statement that a guard prints exactly ONE `ERROR:` line.
+def test_guard_case_reports_one_error_line(tmp_path, skill_md, branch):
+    """One `ERROR:` line per abort, so output stays greppable and unambiguous.
 
-    That document previously claimed every failure also "names the Hermes
-    setting involved", which is false — only the two configuration-caused
-    branches do, and the statement has been narrowed to match. This test pins
-    the part that is true of all of them.
+    Doc 12 once claimed a failure also "names the Hermes setting involved".
+    Two of the messages do; the rest name the offending path, because no
+    setting is at fault. That sentence is gone rather than qualified.
     """
     result = _run_branch(skill_md, tmp_path, branch)
     combined = result.stdout + result.stderr
@@ -856,26 +870,6 @@ def test_stale_config_snippets_point_at_the_current_location():
             f"longer points readers at {_CURRENT_LOCATION_DOC} — a reader will "
             f"copy the stale paths."
         )
-
-
-def test_doc12_names_only_tests_that_exist():
-    """Doc 12's "which test pins which statement" table must not rot.
-
-    That table is the durable form of this PR's claim audit: every behavioural
-    statement in the doc names the test demonstrating it. A renamed or deleted
-    test would silently turn an entry into a dangling reference, which is the
-    same failure mode — a claim with nothing behind it — in a new disguise.
-    """
-    doc = _REPO_ROOT / _CURRENT_LOCATION_DOC
-    named = set(re.findall(r"`(test_\w+)`", doc.read_text(encoding="utf-8")))
-    assert named, f"{_CURRENT_LOCATION_DOC} names no tests — did the table move?"
-
-    defined = set(re.findall(r"^def (test_\w+)", Path(__file__).read_text(encoding="utf-8"), re.M))
-    dangling = named - defined
-    assert not dangling, (
-        f"{_CURRENT_LOCATION_DOC} points at tests that no longer exist here: "
-        f"{sorted(dangling)}. Update the table, or restore the tests."
-    )
 
 
 # ---------------------------------------------------------------------------

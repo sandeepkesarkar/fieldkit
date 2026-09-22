@@ -65,7 +65,7 @@ delimiter hole; the pattern is structural, not a sequence of oversights.
 **Everything.** Once the heredoc terminates early, the remainder of the
 pathname is arbitrary shell source, executed with the gateway's privileges. It
 is not confined to the injected fragment and it is not bounded by the guards
-below: it can skip every one of them, suppress all `ERROR` output, and exit 0,
+below: it can skip the guards, suppress the `ERROR` output, and exit 0,
 so a caller sees an ordinary success. A pathname of
 
 ```
@@ -106,7 +106,7 @@ not on any claim about blast radius.
   if anyone shortens the delimiter back to a guessable string, which is the
   part that can be tested.
 - A newline *without* a matching delimiter line truncates the value and fails
-  closed, as does every other malformed shape.
+  closed, as do the other malformed inputs the suite exercises.
 
 **The real fix is upstream.** If Hermes passed the skill directory to the
 block as an environment variable (data) rather than pasting it into the skill
@@ -127,55 +127,37 @@ named error rather than running against an unrelated directory.
 
 ---
 
-## Which test pins which statement
+## Where the record lives
 
-Five review rounds of this work found claims that outran their tests. This
-table exists so that cannot recur quietly: every behavioural statement in this
-document and in the four `SKILL.md` comments names the test that demonstrates
-it. All live in
-`platform/photo-agent/tests/test_skill_no_hardcoded_repo_paths.py`.
+The behaviour described in this document is exercised by
+`platform/photo-agent/tests/test_skill_no_hardcoded_repo_paths.py`. Read that
+file for what is actually demonstrated; it is the record, and it does not go
+stale the way a summary does.
 
-| Statement | Pinned by |
-|---|---|
-| No skill contains a hardcoded repo path | `test_no_hardcoded_repo_path` |
-| Each skill resolves via the `${HERMES_SKILL_DIR}` token | `test_block_resolves_via_the_hermes_skill_dir_token` |
-| Resolution lands on this checkout's agent directory | `test_resolution_lands_on_the_real_agent_dir` |
-| Hermes really substitutes, and its output resolves | `test_real_hermes_builder_substitutes_and_resolves` |
-| An unsubstituted placeholder fails closed | `test_unresolved_skill_dir_fails_closed` |
-| The heredoc removes the expansion class (`$`, `$(...)`, backtick, quotes, backslash) | `test_shell_metacharacter_in_path_fails_closed` |
-| A space in the path still works | `test_benign_path_shapes_still_resolve` |
-| The delimiter is not a guessable string | `test_guessable_heredoc_delimiter_does_not_escape` |
-| A newline alone fails closed | `test_newline_without_delimiter_line_fails_closed` |
-| Delimiter text inside a component is harmless | `test_delimiter_text_inside_a_path_component_resolves` |
-| A delimiter collision permits arbitrary shell source (bypass, no ERROR, exit 0) | `test_delimiter_collision_permits_arbitrary_shell_source` (both `model` and `hermes` mechanisms) |
-| Each guard branch aborts with its own diagnostic, exit 1 | `test_each_guard_branch_aborts_with_its_own_diagnostic` |
-| Every guard prints exactly one `ERROR:` line | `test_every_guard_branch_reports_one_error_line` |
-| The two configuration branches name their Hermes setting | `test_configuration_branches_name_the_hermes_setting` |
-| A path containing the text `HERMES_SKILL_DIR` is not mistaken for the placeholder | `test_path_containing_the_placeholder_name_is_not_mistaken_for_it` |
-| Two-levels-up is enforced, not assumed | `test_each_guard_branch_aborts_with_its_own_diagnostic` (`outside-platform-parent`) |
-| Current operator docs carry no stale repo path | `test_no_stale_repo_path_in_current_docs` |
-| Dated records redirect to this document | `test_stale_config_snippets_point_at_the_current_location` |
+A previous revision carried a table mapping each statement here to the test
+that pinned it. It was removed. In one review round it produced a miscount, a
+pairing whose test did not cover the case it was cited for, an entry implying
+more than its test showed, and an exception list that over-claimed in its own
+right — then needed a second test to police the table itself. The tests are a
+better record than a summary of the tests.
 
-### What is deliberately NOT test-pinned
+Two statements in this document are deliberately not backed by a test, and are
+flagged here rather than left to read as though they were:
 
-Three kinds of statement above cannot be pinned by a unit test, and are marked
-here so nobody mistakes them for tested guarantees:
-
-- **Counterfactual rationale.** "In double quotes a `$(...)` path would
-  execute; in single quotes an apostrophe would break out." These describe
-  constructs the code no longer uses. They were demonstrated when they were
-  live — the round-2 injection matrix ran 24 red against the double-quoted
-  version — but no current test asserts them.
-- **The structural argument.** "No bash construct prevents a delimiter
-  collision, because each has a finite terminator a pathname may contain."
-  This is a universal claim over all of bash, not a property of this code. It
-  was demonstrated by escaping every candidate construct by hand, and
-  independently verified as sound in review.
-- **Threat model and environment.** "Creating such a path requires write
-  access to Hermes's config"; "`$FIELDKIT_ROOT` is absent from the live
-  gateway's process environment". These are facts about provenance and about
-  one machine, established by inspection (`ps eww` on the gateway), not by the
-  suite.
+- **The structural argument** — that a quoting construct needs a terminator a
+  pathname can contain, so pasting text into shell source cannot be made safe
+  in bash. This is reasoning about bash, not a property of this code. It was
+  demonstrated by escaping each candidate construct by hand and was verified
+  as sound in review; it is not pinnable as a property of these files, which
+  is why no test asserts it. The counterfactual examples in the `SKILL.md`
+  comments (what a double-quoted or single-quoted interpolation would do) are
+  in the same position: they *could* be pinned by direct bash demonstrations,
+  and deliberately are not, because they describe constructs this code no
+  longer uses and such tests would guard nothing that can regress here.
+- **Threat model and environment** — that creating a colliding pathname needs
+  write access to Hermes's config, and that `$FIELDKIT_ROOT` is absent from
+  the live gateway's process environment. Facts about provenance and about one
+  machine, established by inspection (`ps eww` on the gateway).
 
 ## Deployment prerequisite — required, not optional
 
@@ -246,13 +228,10 @@ tail -f ~/.hermes/logs/gateway.log
 
 ## Failure modes and what they mean
 
-Every guard prints exactly one line beginning `ERROR:` and exits 1 —
-`test_every_guard_branch_reports_one_error_line` pins that for each branch
-below. Two of them name the Hermes setting at fault (`skills.template_vars`
-and `skills.external_dirs`); the rest name the offending path instead, because
-no setting is to blame for it. These are diagnostics **for the operator** —
-the agent's role is limited to relaying them; it does not change configuration
-or restart the gateway.
+A guard aborts with one `ERROR:` line and exit 1. The table below lists the
+messages as they are written, so there is no summary of them to drift out of
+date. They are diagnostics **for the operator** — the agent's role is limited
+to relaying them; it does not change configuration or restart the gateway.
 
 | `ERROR:` line | Cause | Operator action |
 |---|---|---|
