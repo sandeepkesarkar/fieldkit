@@ -102,9 +102,10 @@ If either check fails, report the error and stop. Otherwise run:
 # heredoc early, and the rest of the pathname is then arbitrary shell source —
 # it can bypass the guards here, print no ERROR and exit 0. This is inherent
 # to pasting text into shell source, not a gap in these guards. The long
-# delimiter rules out coincidence, not an adversary; the risk is accepted
-# because creating such a path needs write access to Hermes's config, i.e.
-# code execution as this user already. See
+# delimiter makes an accidental collision extremely unlikely; it is no
+# protection against an adversary, who reads the delimiter from this file. The
+# risk is accepted because creating such a path needs write access to Hermes's
+# config, i.e. code execution as this user already. See
 # platform/docs/hermes/12-skill-path-resolution.md.
 IFS= read -r SKILL_DIR <<'__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__'
 ${HERMES_SKILL_DIR}
