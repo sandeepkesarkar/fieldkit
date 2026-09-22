@@ -858,6 +858,26 @@ def test_stale_config_snippets_point_at_the_current_location():
         )
 
 
+def test_doc12_names_only_tests_that_exist():
+    """Doc 12's "which test pins which statement" table must not rot.
+
+    That table is the durable form of this PR's claim audit: every behavioural
+    statement in the doc names the test demonstrating it. A renamed or deleted
+    test would silently turn an entry into a dangling reference, which is the
+    same failure mode — a claim with nothing behind it — in a new disguise.
+    """
+    doc = _REPO_ROOT / _CURRENT_LOCATION_DOC
+    named = set(re.findall(r"`(test_\w+)`", doc.read_text(encoding="utf-8")))
+    assert named, f"{_CURRENT_LOCATION_DOC} names no tests — did the table move?"
+
+    defined = set(re.findall(r"^def (test_\w+)", Path(__file__).read_text(encoding="utf-8"), re.M))
+    dangling = named - defined
+    assert not dangling, (
+        f"{_CURRENT_LOCATION_DOC} points at tests that no longer exist here: "
+        f"{sorted(dangling)}. Update the table, or restore the tests."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Integration: Hermes's own message builder (PR #75 round-3 review, suggestion)
 # ---------------------------------------------------------------------------
