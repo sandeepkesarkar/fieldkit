@@ -32,6 +32,14 @@ both call the Instagram Graph API. Every mutator that takes an idempotency_key
 clear_pending_upload) only acts if the CURRENT pending record still has that
 key — compare-and-update, not blind overwrite.
 
+Every write in this module goes through _transaction(), which is the single
+place that takes the lock and the single place that calls _write(). That is not
+tidiness: it is where the unresolved-publish obligation described further down is
+enforced, after four separate mutation sites lost it across successive reviews.
+Read _transaction()'s docstring before adding a mutator — including what "atomic"
+does and does not mean for the state file, which is written in place and is
+therefore not crash-atomic, only fail-closed on read.
+
 container_id is Instagram-specific and has no Facebook counterpart: the Graph
 API's video publish is a two-phase create-container → publish flow, so an
 attempt has an intermediate server-side handle. It SURVIVES across attempts, and
@@ -64,6 +72,7 @@ import fcntl
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -172,6 +181,104 @@ def _open_for_write():
     return os.fdopen(fd_no, "r+")
 
 
+class _Transaction:
+    """One exclusive-lock read-modify-write over instagram_state.json.
+
+    `data` is the parsed state, free to mutate. Nothing is persisted unless commit() is
+    called, which is what lets a transaction inspect the state and decline to change it —
+    a claim declined for cooldown, an update whose key no longer matches — without
+    rewriting and re-fsyncing the file on every cron tick.
+    """
+
+    __slots__ = ("data", "_committed")
+
+    def __init__(self, data: dict):
+        self.data = data
+        self._committed = False
+
+    def commit(self) -> None:
+        """Mark this transaction's changes for persisting when the block exits."""
+        self._committed = True
+
+
+@contextmanager
+def _transaction():
+    """THE single write path for this module. Every mutation goes through here.
+
+    Why a chokepoint rather than a helper each mutator remembers to call: the
+    unresolved-publish obligation (see the pending_publish_reconciliations section below)
+    was lost at four separate mutation sites across successive reviews — the exhausted
+    claim, stale_failed, mark_failed(), and set_pending_upload() overwriting a live
+    record. Every one was found by enumerating mutation sites, and enumeration kept
+    missing one, because a rule that has to be REMEMBERED at each site is exactly the kind
+    a newly-added site silently omits.
+
+    So the rule is enforced on the way out instead. _preserve_unresolved_obligation() runs
+    on every committed write, comparing the pending record this transaction started with
+    against the one it leaves behind. A mutation site cannot opt out, because it cannot
+    persist anything without coming through here — and tests/test_instagram_state.py
+    asserts mechanically, against the module source, that _write() is reachable from
+    nowhere else.
+
+    On the durability of that write, precisely: this transaction is atomic with respect to
+    OTHER PROCESSES, because the exclusive flock is held across the whole read-modify-write
+    and every mutation lands in a single _write() call. It is NOT crash-atomic. _write()
+    overwrites and truncates the live file in place, so a crash mid-write can leave torn or
+    truncated JSON, and an fsync failure leaves durability indeterminate. What makes that
+    survivable is that _read() FAILS CLOSED: malformed JSON raises RuntimeError rather than
+    silently reading as defaults, so a torn file halts the Instagram path loudly instead of
+    quietly presenting an empty quarantine list and letting a duplicate through. Making the
+    write itself crash-atomic needs a write-temp-then-rename protocol, which interacts with
+    the flock coordination here — replacing the inode invalidates locks held on the old one
+    — and applies equally to facebook_state.py and state.py, which share this write
+    pattern. Tracked as its own issue rather than bolted on here.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            incoming = data.get("pending_instagram_upload")
+            incoming = copy.deepcopy(incoming) if incoming is not None else None
+            txn = _Transaction(data)
+            yield txn
+            if not txn._committed:
+                return
+            _preserve_unresolved_obligation(incoming, data)
+            _write(f, data)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _preserve_unresolved_obligation(incoming: dict | None, data: dict) -> None:
+    """Carry a departing record's unresolved publish into the quarantine list.
+
+    Runs on every committed write. `incoming` is the pending record as this transaction
+    found it; data["pending_instagram_upload"] is what the transaction is leaving there.
+    Three cases:
+
+      - The same job is still in the slot. It was updated in place, not removed, so
+        whether its marker is still set is the updater's business and nothing is carried.
+      - The job is gone or REPLACED, and its key has since been recorded as published. The
+        question the marker asked has been answered, so any quarantine for that key is
+        retired rather than created.
+      - The job is gone or replaced and its key is not published. If it carried a marker it
+        is quarantined here. Removal and replacement are the same event as far as the
+        obligation is concerned — which is precisely what set_pending_upload() used to miss,
+        since overwriting a record destroys its marker exactly as clearing it does.
+    """
+    if not incoming:
+        return
+    key = incoming.get("idempotency_key")
+    outgoing = data.get("pending_instagram_upload")
+    if outgoing is not None and outgoing.get("idempotency_key") == key:
+        return
+    if key in data.get("published_idempotency_keys", []):
+        _drop_publish_reconciliations_for_key(data, key)
+        return
+    _quarantine_unresolved_in_txn(incoming, data, datetime.now(timezone.utc).isoformat())
+
+
 def get_pending_upload() -> dict | None:
     """Return the pending InstagramUploadJob record, or None if absent or null."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -196,33 +303,28 @@ def set_pending_upload(record: dict) -> None:
     missing = _REQUIRED_UPLOAD_KEYS - set(record.keys())
     if missing:
         raise ValueError(f"set_pending_upload: missing required keys: {missing}")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            key = record["idempotency_key"]
-            if key in data.get("published_idempotency_keys", []):
-                raise ValueError(
-                    f"set_pending_upload: idempotency_key {key!r} already in published_idempotency_keys"
-                )
-            # An unresolved publish holds this key hostage until Meta is definitive about
-            # it. Accepting a new job here would let a re-approval create and publish a
-            # SECOND container for a Reel that may already be live — the duplicate FR-011
-            # forbids, and the one an idempotency check alone cannot catch, because a
-            # publish whose response was lost never made it into published_idempotency_keys.
-            # check_approval.py checks has_unresolved_publish() first and reports it
-            # properly; this is the backstop that makes the guarantee structural.
-            if _unresolved_publish_entry(data, key) is not None:
-                raise ValueError(
-                    f"set_pending_upload: idempotency_key {key!r} has an unresolved publish "
-                    "awaiting reconciliation with Instagram"
-                )
-            data["pending_instagram_upload"] = record
-            _write(f, data)
-            logger.info("set_pending_upload: project=%s key=%s", record.get("project_name"), key)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with _transaction() as txn:
+        data = txn.data
+        key = record["idempotency_key"]
+        if key in data.get("published_idempotency_keys", []):
+            raise ValueError(
+                f"set_pending_upload: idempotency_key {key!r} already in published_idempotency_keys"
+            )
+        # An unresolved publish holds this key hostage until Meta is definitive about
+        # it. Accepting a new job here would let a re-approval create and publish a
+        # SECOND container for a Reel that may already be live — the duplicate FR-011
+        # forbids, and the one an idempotency check alone cannot catch, because a
+        # publish whose response was lost never made it into published_idempotency_keys.
+        # check_approval.py checks has_unresolved_publish() first and reports it
+        # properly; this is the backstop that makes the guarantee structural.
+        if _unresolved_publish_entry(data, key) is not None:
+            raise ValueError(
+                f"set_pending_upload: idempotency_key {key!r} has an unresolved publish "
+                "awaiting reconciliation with Instagram"
+            )
+        data["pending_instagram_upload"] = record
+        txn.commit()
+        logger.info("set_pending_upload: project=%s key=%s", record.get("project_name"), key)
 
 
 def _update_pending(idempotency_key: str, updater) -> bool:
@@ -235,19 +337,14 @@ def _update_pending(idempotency_key: str, updater) -> bool:
     safe to call from a caller holding an earlier snapshot: they can never mutate or destroy a
     DIFFERENT job that's since taken the pending slot's place.
     """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            record = data.get("pending_instagram_upload")
-            if record is None or record.get("idempotency_key") != idempotency_key:
-                return False
-            updater(record, data)
-            _write(f, data)
-            return True
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with _transaction() as txn:
+        data = txn.data
+        record = data.get("pending_instagram_upload")
+        if record is None or record.get("idempotency_key") != idempotency_key:
+            return False
+        updater(record, data)
+        txn.commit()
+        return True
 
 
 def clear_pending_upload(expected_idempotency_key: str) -> bool:
@@ -255,16 +352,14 @@ def clear_pending_upload(expected_idempotency_key: str) -> bool:
     idempotency_key still matches expected_idempotency_key (compare-and-clear). Leaves
     published_idempotency_keys / published_history intact either way.
 
-    Like mark_failed(), this quarantines an unresolved publish rather than dropping it —
-    see _quarantine_unresolved_in_txn(). Nothing in the pipeline calls this today, which
-    is exactly why the guarantee belongs here rather than at the call site.
+    Like every other transition that drops the record, an unresolved publish is carried
+    into pending_publish_reconciliations rather than destroyed — by _transaction()'s
+    chokepoint, not by anything written here. Nothing in the pipeline calls this function
+    today, which is exactly why the guarantee must not depend on its call site.
 
     Returns True if cleared, False if left untouched.
     """
-    now = datetime.now(timezone.utc).isoformat()
-
     def _update(record, data):
-        _quarantine_unresolved_in_txn(record, data, now)
         data["pending_instagram_upload"] = None
     cleared = _update_pending(expected_idempotency_key, _update)
     logger.info("clear_pending_upload: key=%s cleared=%s", expected_idempotency_key, cleared)
@@ -333,9 +428,14 @@ def _quarantine_unresolved_in_txn(record: dict, data: dict, now: str) -> bool:
     That "same transaction" requirement is not theoretical. The exhausted path used to
     clear and fsync the pending record, return, and only then let the caller quarantine —
     so a process that died in between left neither a job nor a quarantine, and the next
-    re-approval published a duplicate Reel. Callers can still quarantine explicitly (and
-    do, because that is what produces a timely alert); this makes the guarantee hold even
-    when they don't, including for callers that do not exist yet.
+    re-approval published a duplicate Reel.
+
+    Called from ONE place: _preserve_unresolved_obligation(), which _transaction() runs on
+    every committed write. Deliberately not called per-mutation-site any more — four
+    separate sites were missed that way over successive reviews. Call sites may still
+    quarantine explicitly through record_publish_reconciliation() when they want a timely
+    alert; this is what makes the obligation survive when they don't, including at sites
+    that do not exist yet.
     """
     container_id = record.get("container_id")
     if not container_id or not record.get("publish_attempted_at"):
@@ -403,67 +503,59 @@ def claim_pending_upload(
                            already advanced for this attempt.
     """
     now_dt = datetime.now(timezone.utc)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            record = data.get("pending_instagram_upload")
-            if record is None or record.get("idempotency_key") != idempotency_key:
-                return "mismatch"
+    with _transaction() as txn:
+        data = txn.data
+        record = data.get("pending_instagram_upload")
+        if record is None or record.get("idempotency_key") != idempotency_key:
+            return "mismatch"
 
-            if idempotency_key in data.get("published_idempotency_keys", []):
-                # Deliberately NOT quarantined. The key is already in
-                # published_idempotency_keys, so re-approval is permanently refused by
-                # set_pending_upload() — there is no duplicate to prevent, and a
-                # quarantine here would only block a video that is already blocked while
-                # asking Instagram a question whose answer is already recorded.
-                data["pending_instagram_upload"] = None
-                _write(f, data)
-                return "stale_published"
+        # Each branch below that drops the record simply drops it. Carrying any unresolved
+        # publish across that drop is _preserve_unresolved_obligation()'s job, applied to
+        # every committed write on the way out — so the "exhausted" clear is atomic with
+        # its quarantine instead of leaving the caller to follow up, and a branch added
+        # here later inherits the same guarantee without having to know about it.
+        if idempotency_key in data.get("published_idempotency_keys", []):
+            # The chokepoint recognises this case and retires the quarantine rather than
+            # creating one: the key is already in published_idempotency_keys, so
+            # re-approval is permanently refused anyway and there is no duplicate to
+            # prevent.
+            data["pending_instagram_upload"] = None
+            txn.commit()
+            return "stale_published"
 
-            if record.get("status") == "failed":
-                _quarantine_unresolved_in_txn(record, data, now_dt.isoformat())
-                data["pending_instagram_upload"] = None
-                _write(f, data)
-                return "stale_failed"
+        if record.get("status") == "failed":
+            data["pending_instagram_upload"] = None
+            txn.commit()
+            return "stale_failed"
 
-            last_attempt_at = record.get("last_attempt_at")
+        last_attempt_at = record.get("last_attempt_at")
 
-            if record.get("status") == "uploading":
-                if not _has_elapsed(last_attempt_at, lease_seconds, now_dt):
-                    return "in_flight"
-                # Lease expired: treat as an abandoned claim and fall through to the same
-                # cooldown/attempt-budget checks as any other reclaim.
+        if record.get("status") == "uploading":
+            if not _has_elapsed(last_attempt_at, lease_seconds, now_dt):
+                return "in_flight"
+            # Lease expired: treat as an abandoned claim and fall through to the same
+            # cooldown/attempt-budget checks as any other reclaim.
 
-            if not _has_elapsed(last_attempt_at, cooldown_seconds, now_dt):
-                return "cooldown"
+        if not _has_elapsed(last_attempt_at, cooldown_seconds, now_dt):
+            return "cooldown"
 
-            attempt_count = record.get("attempt_count", 0)
-            if attempt_count >= max_attempts:
-                # Quarantine FIRST, in this same transaction, so the entry and the clear
-                # reach disk in one _write()+fsync. Leaving it to the caller meant a
-                # process that died between "exhausted" being returned and the caller
-                # recording the quarantine left neither a pending job nor an obligation —
-                # and the next re-approval could publish a duplicate Reel.
-                _quarantine_unresolved_in_txn(record, data, now_dt.isoformat())
-                data["pending_instagram_upload"] = None
-                _write(f, data)
-                return "exhausted"
+        attempt_count = record.get("attempt_count", 0)
+        if attempt_count >= max_attempts:
+            data["pending_instagram_upload"] = None
+            txn.commit()
+            return "exhausted"
 
-            record["status"] = "uploading"
-            record["attempt_count"] = attempt_count + 1
-            record["last_attempt_at"] = now_dt.isoformat()
-            # container_id is deliberately PRESERVED here. A reclaimed abandoned attempt may
-            # have left one behind, and that container is the only evidence of whether the
-            # abandoned attempt got as far as publishing. Clearing it — which this function
-            # used to do — is what allowed a crash between publish and mark_published to
-            # produce a duplicate Reel. The caller reconciles it before acting; see the
-            # module docstring.
-            _write(f, data)
-            return "claimed"
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+        record["status"] = "uploading"
+        record["attempt_count"] = attempt_count + 1
+        record["last_attempt_at"] = now_dt.isoformat()
+        # container_id is deliberately PRESERVED here. A reclaimed abandoned attempt may
+        # have left one behind, and that container is the only evidence of whether the
+        # abandoned attempt got as far as publishing. Clearing it — which this function
+        # used to do — is what allowed a crash between publish and mark_published to
+        # produce a duplicate Reel. The caller reconciles it before acting; see the
+        # module docstring.
+        txn.commit()
+        return "claimed"
 
 
 def set_container_id(idempotency_key: str, container_id: str) -> None:
@@ -603,35 +695,30 @@ def record_recovered_publish(
     write is what makes the duplicate impossible from here on.
     """
     now = datetime.now(timezone.utc).isoformat()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            keys = data.setdefault("published_idempotency_keys", [])
-            if idempotency_key not in keys:
-                keys.append(idempotency_key)
-            history = data.setdefault("published_history", [])
-            history.append({
-                "project_name": project_name,
-                "idempotency_key": idempotency_key,
-                "ig_post_id": None,
-                "ig_permalink": None,
-                "ig_container_id": container_id,
-                "recovered": True,
-                "published_at": now,
-            })
-            del history[:-_PUBLISH_HISTORY_LIMIT]
-            # This IS the answer the quarantine was waiting for, so retire it in the same
-            # transaction that records the publish. Callers also clear it explicitly; doing
-            # it here is what makes "recorded but still blocked" unrepresentable.
-            _drop_publish_reconciliations_for_key(data, idempotency_key)
-            record = data.get("pending_instagram_upload")
-            if record is not None and record.get("idempotency_key") == idempotency_key:
-                data["pending_instagram_upload"] = None
-            _write(f, data)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with _transaction() as txn:
+        data = txn.data
+        keys = data.setdefault("published_idempotency_keys", [])
+        if idempotency_key not in keys:
+            keys.append(idempotency_key)
+        history = data.setdefault("published_history", [])
+        history.append({
+            "project_name": project_name,
+            "idempotency_key": idempotency_key,
+            "ig_post_id": None,
+            "ig_permalink": None,
+            "ig_container_id": container_id,
+            "recovered": True,
+            "published_at": now,
+        })
+        del history[:-_PUBLISH_HISTORY_LIMIT]
+        # This IS the answer the quarantine was waiting for, so retire it in the same
+        # transaction that records the publish. Callers also clear it explicitly; doing
+        # it here is what makes "recorded but still blocked" unrepresentable.
+        _drop_publish_reconciliations_for_key(data, idempotency_key)
+        record = data.get("pending_instagram_upload")
+        if record is not None and record.get("idempotency_key") == idempotency_key:
+            data["pending_instagram_upload"] = None
+        txn.commit()
     logger.warning(
         "record_recovered_publish: key=%s container_id=%s — Instagram reports this "
         "container as already published; recorded without republishing",
@@ -645,17 +732,13 @@ def mark_failed(idempotency_key: str) -> None:
     forever with no backoff. The record (including any container_id) is discarded, not persisted
     with status='failed' — matching facebook_state.mark_failed().
 
-    Discarding the record does NOT discard an unresolved publish. If the record still
-    carries one, it is moved into pending_publish_reconciliations in this same
-    transaction — see _quarantine_unresolved_in_txn(). Call sites that know the outcome
-    should call mark_publish_settled() first (Instagram said it never published) or
-    quarantine explicitly with an alert (outcome unknown); this makes the guarantee hold
-    regardless of whether they do.
+    Discarding the record does NOT discard an unresolved publish: _transaction()'s
+    chokepoint moves it into pending_publish_reconciliations in this same write. Call
+    sites that know the outcome should call mark_publish_settled() first (Instagram said
+    it never published) or quarantine explicitly with an alert (outcome unknown), but the
+    guarantee does not depend on their doing so.
     """
-    now = datetime.now(timezone.utc).isoformat()
-
     def _update(record, data):
-        _quarantine_unresolved_in_txn(record, data, now)
         data["pending_instagram_upload"] = None
     _update_pending(idempotency_key, _update)
     logger.error("mark_failed: key=%s", idempotency_key)
@@ -752,25 +835,20 @@ def record_share_intent(file_id: str, project_name: str) -> None:
     entry, and its alert history, untouched.
     """
     now = datetime.now(timezone.utc).isoformat()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            cleanups = data.setdefault("pending_share_cleanups", [])
-            if any(entry.get("file_id") == file_id for entry in cleanups):
-                return
-            cleanups.append({
-                "file_id": file_id,
-                "project_name": project_name,
-                "recorded_at": now,
-                "last_attempt_at": None,
-                "last_alerted_at": None,
-                "attempts": 0,
-            })
-            _write(f, data)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with _transaction() as txn:
+        data = txn.data
+        cleanups = data.setdefault("pending_share_cleanups", [])
+        if any(entry.get("file_id") == file_id for entry in cleanups):
+            return
+        cleanups.append({
+            "file_id": file_id,
+            "project_name": project_name,
+            "recorded_at": now,
+            "last_attempt_at": None,
+            "last_alerted_at": None,
+            "attempts": 0,
+        })
+        txn.commit()
     logger.info(
         "record_share_intent: file_id=%s project=%s — cleanup obligation registered "
         "before the file was shared",
@@ -796,49 +874,44 @@ def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
     """
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            cleanups = data.setdefault("pending_share_cleanups", [])
-            for entry in cleanups:
-                if entry.get("file_id") != file_id:
-                    continue
-                entry["attempts"] = entry.get("attempts", 1) + 1
-                entry["last_attempt_at"] = now
-                should_alert = _has_elapsed(
-                    entry.get("last_alerted_at"),
-                    _SHARE_CLEANUP_ALERT_INTERVAL_SECONDS,
-                    now_dt,
-                )
-                if should_alert:
-                    entry["last_alerted_at"] = now
-                _write(f, data)
-                logger.warning(
-                    "record_share_cleanup: file_id=%s still pending after %d attempts "
-                    "(re-alerting=%s)",
-                    file_id, entry["attempts"], should_alert,
-                )
-                return dict(entry) if should_alert else None
-
-            entry = {
-                "file_id": file_id,
-                "project_name": project_name,
-                "recorded_at": now,
-                "last_attempt_at": now,
-                "last_alerted_at": now,
-                "attempts": 1,
-            }
-            cleanups.append(entry)
-            _write(f, data)
-            logger.error(
-                "record_share_cleanup: file_id=%s project=%s — share link NOT revoked",
-                file_id, project_name,
+    with _transaction() as txn:
+        data = txn.data
+        cleanups = data.setdefault("pending_share_cleanups", [])
+        for entry in cleanups:
+            if entry.get("file_id") != file_id:
+                continue
+            entry["attempts"] = entry.get("attempts", 1) + 1
+            entry["last_attempt_at"] = now
+            should_alert = _has_elapsed(
+                entry.get("last_alerted_at"),
+                _SHARE_CLEANUP_ALERT_INTERVAL_SECONDS,
+                now_dt,
             )
-            return dict(entry)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if should_alert:
+                entry["last_alerted_at"] = now
+            txn.commit()
+            logger.warning(
+                "record_share_cleanup: file_id=%s still pending after %d attempts "
+                "(re-alerting=%s)",
+                file_id, entry["attempts"], should_alert,
+            )
+            return dict(entry) if should_alert else None
+
+        entry = {
+            "file_id": file_id,
+            "project_name": project_name,
+            "recorded_at": now,
+            "last_attempt_at": now,
+            "last_alerted_at": now,
+            "attempts": 1,
+        }
+        cleanups.append(entry)
+        txn.commit()
+        logger.error(
+            "record_share_cleanup: file_id=%s project=%s — share link NOT revoked",
+            file_id, project_name,
+        )
+        return dict(entry)
 
 
 def list_share_cleanups() -> list[dict]:
@@ -868,18 +941,13 @@ def clear_share_cleanup(file_id: str) -> bool:
         data["pending_share_cleanups"] = remaining
         return True
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            removed = _remove(data)
-            if removed:
-                _write(f, data)
-                logger.info("clear_share_cleanup: file_id=%s revoked", file_id)
-            return removed
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with _transaction() as txn:
+        data = txn.data
+        removed = _remove(data)
+        if removed:
+            txn.commit()
+            logger.info("clear_share_cleanup: file_id=%s revoked", file_id)
+        return removed
 
 
 # ---------------------------------------------------------------------------
@@ -915,10 +983,15 @@ def clear_share_cleanup(file_id: str) -> bool:
 # Note what this does NOT require: mark_failed() still discards the whole record,
 # mirroring facebook_state.mark_failed() exactly as before. Storing the obligation
 # OUTSIDE the job record is what lets the two state modules stay aligned while
-# Instagram still satisfies FR-011. See upload_instagram.py's module docstring for
-# the Facebook side, which has the same latent exposure and cannot be fixed this
-# way — a Page video upload exposes no handle that could be reconciled after the
-# fact.
+# Instagram still satisfies FR-011.
+#
+# Facebook has the same latent exposure and is not addressed here. It cannot be
+# fixed this way AS facebook_api.py IS CURRENTLY WRITTEN — its one-shot multipart
+# upload knows no identifier until the response arrives, so there is no handle to
+# reconcile against afterwards. That is a limit of this implementation, NOT of
+# Meta's API: the sessionized video upload returns an upload_session_id and a
+# video_id before any bytes move, which is exactly the durable pre-known handle
+# this mechanism needs. Tracked as an urgent fast-follow in issue #78.
 
 
 def _unresolved_publish_entry(data: dict, idempotency_key: str) -> dict | None:
@@ -997,53 +1070,48 @@ def record_publish_reconciliation(
     """
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            pending = data.setdefault("pending_publish_reconciliations", [])
-            for entry in pending:
-                if entry.get("container_id") != container_id:
-                    continue
-                if counts_as_check:
-                    entry["attempts"] = entry.get("attempts", 0) + 1
-                    entry["last_attempt_at"] = now
-                should_alert = _has_elapsed(
-                    entry.get("last_alerted_at"),
-                    _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS,
-                    now_dt,
-                )
-                if should_alert:
-                    entry["last_alerted_at"] = now
-                _write(f, data)
-                logger.warning(
-                    "record_publish_reconciliation: container_id=%s still unresolved after "
-                    "%d checks (re-alerting=%s)",
-                    container_id, entry.get("attempts", 0), should_alert,
-                )
-                return dict(entry) if should_alert else None
-
-            entry = {
-                "container_id": container_id,
-                "project_name": project_name,
-                "idempotency_key": idempotency_key,
-                "recorded_at": now,
-                "last_attempt_at": now,
-                "last_alerted_at": now,
-                "attempts": 1,
-            }
-            pending.append(entry)
-            _write(f, data)
-            logger.error(
-                "record_publish_reconciliation: container_id=%s project=%s key=%s — publish "
-                "outcome UNKNOWN; the Reel may be live. Re-approval of this key is blocked "
-                "until Instagram is definitive.",
-                container_id, project_name, idempotency_key,
+    with _transaction() as txn:
+        data = txn.data
+        pending = data.setdefault("pending_publish_reconciliations", [])
+        for entry in pending:
+            if entry.get("container_id") != container_id:
+                continue
+            if counts_as_check:
+                entry["attempts"] = entry.get("attempts", 0) + 1
+                entry["last_attempt_at"] = now
+            should_alert = _has_elapsed(
+                entry.get("last_alerted_at"),
+                _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS,
+                now_dt,
             )
-            return dict(entry)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if should_alert:
+                entry["last_alerted_at"] = now
+            txn.commit()
+            logger.warning(
+                "record_publish_reconciliation: container_id=%s still unresolved after "
+                "%d checks (re-alerting=%s)",
+                container_id, entry.get("attempts", 0), should_alert,
+            )
+            return dict(entry) if should_alert else None
+
+        entry = {
+            "container_id": container_id,
+            "project_name": project_name,
+            "idempotency_key": idempotency_key,
+            "recorded_at": now,
+            "last_attempt_at": now,
+            "last_alerted_at": now,
+            "attempts": 1,
+        }
+        pending.append(entry)
+        txn.commit()
+        logger.error(
+            "record_publish_reconciliation: container_id=%s project=%s key=%s — publish "
+            "outcome UNKNOWN; the Reel may be live. Re-approval of this key is blocked "
+            "until Instagram is definitive.",
+            container_id, project_name, idempotency_key,
+        )
+        return dict(entry)
 
 
 def list_publish_reconciliations() -> list[dict]:
@@ -1071,18 +1139,13 @@ def clear_publish_reconciliation(container_id: str) -> bool:
 
     Returns True if an entry was removed, False if there was nothing recorded for it.
     """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = _read(f)
-            pending = data.get("pending_publish_reconciliations", [])
-            remaining = [e for e in pending if e.get("container_id") != container_id]
-            if len(remaining) == len(pending):
-                return False
-            data["pending_publish_reconciliations"] = remaining
-            _write(f, data)
-            logger.info("clear_publish_reconciliation: container_id=%s resolved", container_id)
-            return True
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with _transaction() as txn:
+        data = txn.data
+        pending = data.get("pending_publish_reconciliations", [])
+        remaining = [e for e in pending if e.get("container_id") != container_id]
+        if len(remaining) == len(pending):
+            return False
+        data["pending_publish_reconciliations"] = remaining
+        txn.commit()
+        logger.info("clear_publish_reconciliation: container_id=%s resolved", container_id)
+        return True

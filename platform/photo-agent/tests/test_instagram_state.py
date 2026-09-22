@@ -1165,3 +1165,241 @@ def test_a_non_check_record_still_advances_the_alert_schedule(monkeypatch):
         "container_abc", project_name="kitchen_remodel", idempotency_key="42",
         counts_as_check=False,
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# The obligation invariant is enforced at ONE chokepoint, not per mutation site
+# ---------------------------------------------------------------------------
+#
+# Four separate mutation sites have now lost the unresolved-publish obligation
+# across successive reviews: the exhausted claim, stale_failed, mark_failed(), and
+# set_pending_upload() overwriting a live record. Every one was found by
+# enumerating sites, and enumeration kept missing one. So the rule moved into
+# _transaction(), which every write must pass through, and these tests assert that
+# STRUCTURALLY — against the module source and across every mutation entry point —
+# rather than against the sites anyone happened to remember.
+
+def test_overwriting_a_marker_bearing_record_preserves_its_obligation(valid_record):
+    """The round-5 reproduction: job B over unresolved job A must not destroy A's marker.
+
+    Overwriting is as much a removal as clearing is. This was the fourth instance of the
+    class, and the reason the guarantee stopped being per-site.
+    """
+    job_a = dict(
+        valid_record, container_id="container_A", publish_attempted_at="2026-08-31T14:05:00Z"
+    )
+    ig_state.set_pending_upload(job_a)
+    ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
+
+    assert ig_state.get_pending_upload()["idempotency_key"] == "99"
+    assert ig_state.has_unresolved_publish("42") is True
+    assert [e["container_id"] for e in ig_state.list_publish_reconciliations()] == ["container_A"]
+
+
+def test_the_overwriting_job_is_accepted_not_refused(valid_record):
+    """An unrelated video must not be blocked by another video's unresolved publish.
+
+    Refusing the overwrite was the other option here. It punishes the wrong job: job B has
+    no duplicate risk of its own, and quarantining A loses nothing while blocking exactly
+    the key that needs blocking.
+    """
+    ig_state.set_pending_upload(
+        dict(valid_record, container_id="container_A", publish_attempted_at="2026-08-31T14:05:00Z")
+    )
+    ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
+    assert ig_state.has_unresolved_publish("99") is False
+
+
+def test_the_overwritten_job_cannot_be_re_approved(valid_record):
+    """And the block that matters actually holds."""
+    job_a = dict(
+        valid_record, container_id="container_A", publish_attempted_at="2026-08-31T14:05:00Z"
+    )
+    ig_state.set_pending_upload(job_a)
+    ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
+    with pytest.raises(ValueError, match="unresolved publish"):
+        ig_state.set_pending_upload(job_a)
+
+
+def test_overwriting_a_record_with_no_marker_quarantines_nothing(valid_record):
+    """No open question, no obligation — ordinary re-queueing stays ordinary."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
+    assert ig_state.list_publish_reconciliations() == []
+
+
+# --- structural: every write really does go through the one chokepoint ---
+
+def _module_functions_calling(name):
+    """Return the names of module-level functions whose body calls `name`."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(ig_state))
+    out = set()
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == name:
+                out.add(node.name)
+    return out
+
+
+def test_the_state_file_is_written_from_exactly_one_place():
+    """The structural claim, checked against the source rather than asserted in prose.
+
+    If a future mutator calls _write() directly it bypasses
+    _preserve_unresolved_obligation() entirely — silently, and in exactly the way four
+    previous ones did. This is the test that makes that impossible to do by accident.
+    """
+    assert _module_functions_calling("_write") == {"_transaction"}
+
+
+def test_the_state_file_is_opened_for_writing_from_exactly_one_place():
+    """Same reasoning one level down: no mutator may take the exclusive lock on its own."""
+    assert _module_functions_calling("_open_for_write") == {"_transaction"}
+
+
+def test_the_obligation_check_runs_from_exactly_one_place():
+    """_quarantine_unresolved_in_txn() is the chokepoint's implementation, not a helper.
+
+    Per-site calls are what enumeration kept getting wrong, so there are none left.
+    """
+    assert _module_functions_calling("_quarantine_unresolved_in_txn") == {
+        "_preserve_unresolved_obligation"
+    }
+
+
+# --- mechanical: the invariant holds across EVERY mutation entry point ---
+
+def _marker_bearing(valid_record):
+    return dict(
+        valid_record,
+        attempt_count=1,
+        container_id="container_abc",
+        publish_attempted_at="2026-08-31T14:05:00Z",
+    )
+
+
+# Every public function that can change the state file, with a call that exercises it
+# against a marker-bearing record for key "42". test_every_mutating_entry_point_is_covered
+# below fails if this table ever falls behind the module.
+_MUTATORS = {
+    "set_pending_upload": lambda r: ig_state.set_pending_upload(dict(r, idempotency_key="99")),
+    "claim_pending_upload": lambda r: ig_state.claim_pending_upload(
+        "42", cooldown_seconds=0, max_attempts=1, lease_seconds=0
+    ),
+    "release_claim": lambda r: ig_state.release_claim("42"),
+    "clear_pending_upload": lambda r: ig_state.clear_pending_upload("42"),
+    "set_container_id": lambda r: ig_state.set_container_id("42", "container_xyz"),
+    "mark_published": lambda r: ig_state.mark_published("42", "ig_post_1"),
+    "mark_failed": lambda r: ig_state.mark_failed("42"),
+    "record_recovered_publish": lambda r: ig_state.record_recovered_publish(
+        "42", "kitchen_remodel", "container_abc"
+    ),
+    "mark_publish_attempted": lambda r: ig_state.mark_publish_attempted("42"),
+    "mark_publish_settled": lambda r: ig_state.mark_publish_settled("42"),
+    "record_publish_reconciliation": lambda r: ig_state.record_publish_reconciliation(
+        "container_other", project_name="other", idempotency_key="99"
+    ),
+    "clear_publish_reconciliation": lambda r: ig_state.clear_publish_reconciliation("nope"),
+    "record_share_intent": lambda r: ig_state.record_share_intent("file_1", "kitchen_remodel"),
+    "record_share_cleanup": lambda r: ig_state.record_share_cleanup("file_1", "kitchen_remodel"),
+    "clear_share_cleanup": lambda r: ig_state.clear_share_cleanup("file_1"),
+}
+
+
+def test_every_mutating_entry_point_is_covered_by_the_invariant_test():
+    """Derives the list of mutators from the MODULE, so the table cannot fall behind.
+
+    The reviewer's instruction was to stop enumerating from memory. This computes which
+    public functions can reach _transaction() — directly or through _update_pending() —
+    and fails if any of them is missing from _MUTATORS below. A new mutator added without
+    a thought for the obligation fails here rather than in production.
+    """
+    direct = _module_functions_calling("_transaction")
+    indirect = _module_functions_calling("_update_pending")
+    reaches_write = (direct | indirect) - {"_update_pending"}
+    public = {name for name in reaches_write if not name.startswith("_")}
+    assert public == set(_MUTATORS), (
+        f"missing from _MUTATORS: {sorted(public - set(_MUTATORS))}; "
+        f"stale entries: {sorted(set(_MUTATORS) - public)}"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(_MUTATORS))
+def test_no_mutation_entry_point_can_destroy_an_unresolved_obligation(name, valid_record):
+    """THE invariant, asserted against every mutator rather than the ones I remembered.
+
+    If a call removes or replaces a record that carried an unresolved publish, the
+    obligation must survive — either as a quarantine entry, or as a retired idempotency
+    key, which answers the question permanently. Nothing may simply make it disappear.
+    """
+    ig_state.set_pending_upload(_marker_bearing(valid_record))
+    _MUTATORS[name](_marker_bearing(valid_record))
+
+    record = ig_state.get_pending_upload()
+    if record is not None and record.get("idempotency_key") == "42":
+        return          # the job is still there; nothing was removed or replaced
+    assert ig_state.has_unresolved_publish("42") or ig_state.is_published("42"), (
+        f"{name}() removed or replaced a marker-bearing record and lost its obligation"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Torn or truncated state fails CLOSED
+# ---------------------------------------------------------------------------
+#
+# The transaction above is atomic with respect to other processes — one flock held
+# across the whole read-modify-write, one _write() call — but _write() overwrites
+# and truncates in place, so it is NOT crash-atomic: a crash mid-write can leave
+# torn JSON. What makes that survivable rather than catastrophic is that a torn
+# file RAISES on read instead of silently reading as defaults. If it defaulted, a
+# torn write would make the quarantine list vanish and a duplicate publish would
+# follow. These tests pin that property, because the safety argument rests on it.
+
+_TORN = '{"pending_instagram_upload": {"idempotency_key": "42", "contai'
+
+
+def _write_torn_state():
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text(_TORN)
+
+
+@pytest.mark.parametrize("call", [
+    lambda: ig_state.get_pending_upload(),
+    lambda: ig_state.is_published("42"),
+    lambda: ig_state.find_published("kitchen_remodel"),
+    lambda: ig_state.has_outstanding_job("42"),
+    lambda: ig_state.has_unresolved_publish("42"),
+    lambda: ig_state.list_publish_reconciliations(),
+    lambda: ig_state.list_share_cleanups(),
+])
+def test_every_read_path_raises_on_torn_state(call):
+    """No read may silently present an empty quarantine list built from defaults."""
+    _write_torn_state()
+    with pytest.raises(RuntimeError, match="corrupt"):
+        call()
+
+
+def test_a_write_path_raises_on_torn_state(valid_record):
+    """A mutator cannot proceed either — it would overwrite state it could not read."""
+    _write_torn_state()
+    with pytest.raises(RuntimeError, match="corrupt"):
+        ig_state.set_pending_upload(valid_record)
+
+
+def test_a_torn_file_is_not_silently_replaced(valid_record):
+    """Failing closed means leaving the evidence alone for a human, not healing over it."""
+    _write_torn_state()
+    with pytest.raises(RuntimeError):
+        ig_state.mark_failed("42")
+    assert ig_state.STATE_FILE.read_text() == _TORN
+
+
+def test_an_empty_state_file_is_not_treated_as_corrupt():
+    """A genuinely empty file is a fresh client, not damage — it must still work."""
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text("")
+    assert ig_state.get_pending_upload() is None
+    assert ig_state.list_publish_reconciliations() == []

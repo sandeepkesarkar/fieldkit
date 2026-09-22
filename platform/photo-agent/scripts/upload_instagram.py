@@ -657,11 +657,16 @@ def _handle_exhausted(
     """Resolve a job whose attempt budget ran out.
 
     claim_pending_upload() has already cleared the record — and, if that record carried an
-    unresolved publish, has already quarantined it IN THE SAME TRANSACTION as the clear
-    (see instagram_state._quarantine_unresolved_in_txn). So by the time this runs the
-    obligation is durable whatever happens next: this function makes the system faster to
-    resolve, not safer. A process that dies here leaves exactly the state the next tick's
+    unresolved publish, has already quarantined it in the SAME LOCKED TRANSACTION as the
+    clear (see instagram_state._transaction). So by the time this runs the obligation is
+    recorded whatever happens next: this function makes the system faster to resolve, not
+    safer. A process that dies here leaves exactly the state the next tick's
     _drain_publish_reconciliations() expects.
+
+    "Same transaction" means atomic against other PROCESSES, not against a crash mid-write
+    — the state file is rewritten in place. A torn write fails closed on the next read
+    rather than reading as an empty quarantine; see instagram_state._transaction()'s
+    docstring for the full account.
 
     That ordering is the round-4 fix. Previously the clear was fsynced first and the
     quarantine was created afterwards by this function, so a process that died in the gap
@@ -694,7 +699,8 @@ def _handle_exhausted(
 
     if outcome == "unresolved":
         # The activity-log record of the quarantine. claim_pending_upload() created the
-        # ENTRY (atomically, which is the guarantee), but it does not write to the activity
+        # ENTRY — in the same locked transaction as the clear, which is the guarantee —
+        # but the state module does not write to the activity
         # log — the state module deliberately knows nothing about logging. Written here
         # rather than in _reconcile_quarantined_container() so it appears once, when the
         # container becomes unresolved, instead of on every later drain tick that would

@@ -380,22 +380,54 @@ So an unsettled container is **quarantined durably** in
   (`IG_RESOLVED`), owner told it is safe to re-approve.
 
 The entry is created **in the same locked state transaction** as the removal that
-makes it necessary — not afterwards by the caller. Every transition that drops a
-pending record without recording a publish (`mark_failed()`, `clear_pending_upload()`,
-and `claim_pending_upload()`'s `exhausted` and `stale_failed` outcomes) quarantines
-first, in one `write()`+`fsync()`. Leaving it to the caller meant a process that died
-between the clear landing on disk and the caller quarantining left neither a job nor
-an obligation, and the next re-approval could publish a duplicate.
+makes it necessary — not afterwards by the caller. Leaving it to the caller meant a
+process that died between the clear landing on disk and the caller quarantining left
+neither a job nor an obligation, and the next re-approval could publish a duplicate.
 
-The invariant, enforced in `tools/instagram_state.py` rather than by convention at
-call sites: **a pending record carries an unresolved-publish marker
-(`publish_attempted_at`, alongside its `container_id`) if and only if FieldKit asked
-Meta to publish that container and has not since established what happened.**
-`mark_publish_attempted()` sets it before the irreversible call;
+The invariant, enforced in `tools/instagram_state.py`: **a pending record carries an
+unresolved-publish marker (`publish_attempted_at`, alongside its `container_id`) if and
+only if FieldKit asked Meta to publish that container and has not since established what
+happened.** `mark_publish_attempted()` sets it before the irreversible call;
 `mark_publish_settled()` clears it when Instagram reports the container as never
-published; `mark_published()` and `record_recovered_publish()` retire any quarantine
-for the key in the same transaction that records the publish, so a resolved obligation
-cannot outlive its own resolution.
+published; `mark_published()` and `record_recovered_publish()` retire any quarantine for
+the key in the same transaction that records the publish, so a resolved obligation cannot
+outlive its own resolution.
+
+It is enforced at **one chokepoint**, not at each mutation site. Four separate sites lost
+this obligation across successive reviews — the exhausted claim, `stale_failed`,
+`mark_failed()`, and `set_pending_upload()` overwriting a live record — every one found
+by enumerating sites, and enumeration kept missing one. So every write now passes through
+`_transaction()`, which compares the pending record the transaction started with against
+the one it leaves behind and carries any unresolved obligation across. Removal and
+replacement are the same event as far as the obligation is concerned. A mutation site
+cannot opt out, and `tests/test_instagram_state.py` asserts against the module source
+that `_write()` is reachable from nowhere else, plus checks the invariant across every
+mutation entry point it derives from the module rather than from a hand-written list.
+
+### What "atomic" does and does not mean here
+
+Precisely, because the distinction matters: the transaction is atomic **with respect to
+other processes**. The exclusive `flock` is held across the whole read-modify-write, and
+every mutation lands in a single `_write()` call, so no other process can observe or
+interleave a half-applied state.
+
+It is **not crash-atomic**. `_write()` overwrites and truncates the live JSON in place and
+then `fsync`s; a crash mid-write can leave torn or truncated JSON, and an `fsync` failure
+leaves durability indeterminate. So "the entry and the removal reach disk together" is not
+a guarantee this implementation can make, and is not claimed.
+
+What makes that survivable is that **`_read()` fails closed**: malformed JSON raises
+`RuntimeError` rather than silently parsing as defaults. A torn file therefore halts the
+Instagram path loudly — every read and write path raises, and the file is left untouched
+for a human — instead of quietly presenting an empty quarantine list and letting a
+duplicate through. That property is load-bearing for this argument, so it is tested
+directly rather than assumed.
+
+Making the write itself crash-atomic needs a write-temp-then-rename protocol, which
+interacts with the `flock` coordination here (replacing the inode invalidates locks held
+on the old one) and applies equally to `facebook_state.py` and `state.py`, which share
+this write pattern. It is a pre-existing weakness in all three, tracked as its own issue
+rather than bolted onto this feature.
 
 This reuses the shape of `pending_share_cleanups` deliberately rather than inventing
 a third mechanism: both are unresolved external obligations that must outlive the
