@@ -372,9 +372,15 @@ def test_benign_path_shapes_still_resolve(tmp_path, skill_md, dirname):
 #   * the delimiter must not be a guessable or obvious string, so realistic
 #     and accidental collisions are nil;
 #   * a newline alone must fail closed;
-#   * delimiter text inside an ordinary path component must resolve normally;
-#   * in the residual case the damage stays bounded — the block still refuses
-#     to cd or run the real script, and still reports ERROR.
+#   * delimiter text inside an ordinary path component must resolve normally.
+#
+# What is NOT bounded, and must not be described as if it were: once the
+# delimiter collides, the remainder of the pathname is ARBITRARY SHELL SOURCE.
+# It can bypass every guard below, suppress the ERROR output and exit 0 —
+# `test_delimiter_collision_permits_arbitrary_shell_source` demonstrates
+# exactly that. An earlier version of this file claimed the damage stayed
+# bounded to the injected text; that was true only of the one `touch` payload
+# it happened to test, and false for the class.
 #
 # Severity bound, stated rather than implied: the path comes from
 # operator-configured `skills.external_dirs`, so reaching any of this requires
@@ -401,14 +407,14 @@ def _heredoc_delimiter(block: str) -> str:
     return match.group(1)
 
 
-def _payload(delimiter: str) -> str:
-    """A directory name that terminates *delimiter* early and runs a command.
+def _payload(delimiter: str, *injected: str) -> str:
+    """A directory name that terminates *delimiter* early, then runs *injected*.
 
-    The trailing `#` comments out the remainder of the pathname that Hermes
-    pastes after the skill directory, so the injected line stands alone —
-    this is the reviewer's exact shape.
+    The trailing `#` comments out the remainder of the pathname Hermes pastes
+    after the skill directory, so the injected lines stand alone.
     """
-    return f"repo\n{delimiter}\ntouch {_SENTINEL}\n#"
+    lines = "\n".join(injected)
+    return f"repo\n{delimiter}\n{lines}\n#"
 
 
 @pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
@@ -420,7 +426,9 @@ def test_guessable_heredoc_delimiter_does_not_escape(tmp_path, skill_md):
     improbable, which is the practical mitigation — and this test fails if
     anyone shortens it back to something guessable.
     """
-    skill_dir = _fake_checkout(tmp_path, _payload(_GUESSABLE_DELIMITER), skill_md)
+    skill_dir = _fake_checkout(
+        tmp_path, _payload(_GUESSABLE_DELIMITER, f"touch {_SENTINEL}"), skill_md
+    )
     result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
     combined = result.stdout + result.stderr
 
@@ -472,36 +480,52 @@ def test_delimiter_text_inside_a_path_component_resolves(tmp_path, skill_md):
 
 
 @pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
-def test_actual_delimiter_payload_stays_bounded(tmp_path, skill_md):
-    """The documented residual, pinned honestly.
+def test_delimiter_collision_permits_arbitrary_shell_source(tmp_path, skill_md):
+    """Pin the residual as it actually is: a full guard bypass is possible.
 
-    A payload carrying the REAL delimiter still terminates the heredoc — no
-    bash construct can prevent that (see the section comment above). So this
-    test does NOT assert that nothing runs; it asserts the blast radius stays
-    bounded: the block reports ERROR, exits non-zero, and never reaches the
-    script invocation. If a future change closes this properly, tighten this
-    test — do not delete it.
+    This test asserts the LIMITATION, not a guarantee. Once a pathname
+    terminates the heredoc, its remainder is arbitrary shell source, so it can
+    do anything a shell can — including the three things the guards below are
+    otherwise responsible for preventing: skipping every check, producing no
+    ERROR output, and exiting 0.
+
+    The payload is the reviewer's: `cd ..` then `exit 0`. It short-circuits the
+    block before any guard runs, which is why no bound on the blast radius can
+    be claimed. An earlier revision of this test asserted the opposite —
+    non-zero exit, ERROR reported, invocation not reached — which held only
+    because its own payload was a `touch` that did not alter control flow. The
+    claim did not generalise, and the accepted risk is documented in
+    platform/docs/hermes/12-skill-path-resolution.md instead.
+
+    If this test ever FAILS, the limitation may have been closed (for instance
+    Hermes began passing the skill directory as an environment variable). That
+    is good news, and the disclosure in doc 12 and the PR body must then be
+    updated to match — do not simply delete this test.
     """
     delimiter = _heredoc_delimiter(_dispatch_block(skill_md))
-    skill_dir = _fake_checkout(tmp_path, _payload(delimiter), skill_md)
+    skill_dir = _fake_checkout(
+        tmp_path, _payload(delimiter, "cd ..", "exit 0"), skill_md
+    )
 
     result = _run_as_dispatched(
         skill_md, skill_dir, cwd=tmp_path, invocation=f"echo {_REACHED}"
     )
     combined = result.stdout + result.stderr
 
-    assert result.returncode != 0, (
-        f"{skill_md}: exited 0 despite a tampered skill directory.\n"
+    assert result.returncode == 0, (
+        f"{skill_md}: expected the documented bypass (exit 0) but got exit "
+        f"{result.returncode} — if the delimiter collision no longer yields "
+        f"arbitrary shell source, update the disclosure in doc 12 and the PR "
+        f"body.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ERROR" not in combined, (
+        f"{skill_md}: expected the injected source to suppress all guard "
+        f"output; it reported an ERROR instead. Re-check the disclosure.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "ERROR" in combined, (
-        f"{skill_md}: no ERROR line reported.\nstdout: {result.stdout}\n"
-        f"stderr: {result.stderr}"
-    )
     assert _REACHED not in result.stdout, (
-        f"{skill_md}: reached the script invocation despite a tampered skill "
-        f"directory — the damage must stay bounded to the injected text "
-        f"itself.\nstdout: {result.stdout}"
+        f"{skill_md}: the injected `exit 0` should have short-circuited the "
+        f"block before dispatch.\nstdout: {result.stdout}"
     )
 
 

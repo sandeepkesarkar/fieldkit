@@ -63,10 +63,13 @@ logging); the agent's role is limited to invoking it and reporting the result.
 # hardcode an absolute repo path here either — a moved checkout silently
 # broke every command for three weeks that way (issue #74).
 # Residual, documented rather than papered over: a pathname containing a
-# newline followed by a line exactly equal to the delimiter below would still
-# end the heredoc early. No bash construct prevents that — each has a finite
-# terminator a pathname may contain — so the delimiter is long and improbable
-# and the guards below bound the damage. See
+# newline followed by a line exactly equal to the delimiter below ends the
+# heredoc early, and the rest of the pathname is then arbitrary shell source
+# that can bypass every guard here, print no ERROR and exit 0. No bash
+# construct prevents that — each has a finite terminator a pathname may
+# contain. The delimiter is long and improbable to rule out coincidence, not
+# an adversary; the risk is accepted because creating such a path needs write
+# access to Hermes's config, i.e. code execution as this user already. See
 # platform/docs/hermes/12-skill-path-resolution.md.
 IFS= read -r SKILL_DIR <<'__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__'
 ${HERMES_SKILL_DIR}

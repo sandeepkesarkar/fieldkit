@@ -60,23 +60,51 @@ every construct there therefore exists a pathname that escapes it. Round 2 of
 the PR #75 review closed the double-quote hole; round 3 found the heredoc
 delimiter hole; the pattern is structural, not a sequence of oversights.
 
-What is done instead, and what it is worth:
+### What a delimiter collision permits
+
+**Everything.** Once the heredoc terminates early, the remainder of the
+pathname is arbitrary shell source, executed with the gateway's privileges. It
+is not confined to the injected fragment and it is not bounded by the guards
+below: it can skip every one of them, suppress all `ERROR` output, and exit 0,
+so a caller sees an ordinary success. A pathname of
+
+```
+repo
+<the delimiter>
+cd ..
+exit 0
+#
+```
+
+produces exactly that on all four skills — verified through Hermes's real
+`_build_skill_message()`. `test_delimiter_collision_permits_arbitrary_shell_source`
+pins that behaviour so the limitation stays documented rather than drifting
+back into an assurance.
+
+No claim is made that the damage is contained. An earlier revision of this
+document said the block "still refuses to `cd`" and "still reports `ERROR`" in
+the residual case; that was true only of the one payload its test used, and
+false for the class.
+
+### Why the risk is accepted
+
+The path comes from operator-configured `skills.external_dirs`. Creating a
+pathname that collides with the delimiter requires someone who can already
+write the Hermes config — i.e. who already has code execution as this user, and
+therefore already has everything this would grant them. It is not a privilege
+boundary FieldKit can defend, and it is not reachable by a Telegram sender or
+by anything in the photo/email pipelines. The risk is accepted on that basis,
+not on any claim about blast radius.
+
+### What the mitigations actually buy
 
 - The delimiter is long and improbable
   (`__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__`), so accidental or realistic
-  collision is nil. A regression test fails if anyone shortens it back to a
-  guessable string.
+  collision is nil. This is protection against a coincidence, not against an
+  adversary — an adversary reads the delimiter out of this file. A regression
+  test fails if anyone shortens it back to a guessable string.
 - A newline *without* a matching delimiter line truncates the value and fails
   closed, as does every other malformed shape.
-- In the residual case the damage stays bounded: the block still refuses to
-  `cd`, never runs the dispatched script, and still reports `ERROR`. A test
-  pins exactly that, and deliberately does **not** claim nothing executes.
-
-**Severity bound.** The path comes from operator-configured
-`skills.external_dirs`. Reaching this requires someone who can already write
-the Hermes config — i.e. who already has code execution as this user — so it
-is not a privilege boundary FieldKit can defend, and it is not reachable by a
-Telegram sender or by anything in the photo/email pipelines.
 
 **The real fix is upstream.** If Hermes passed the skill directory to the
 block as an environment variable (data) rather than pasting it into the skill
