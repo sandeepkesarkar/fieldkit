@@ -90,6 +90,7 @@ __all__ = [
     "record_recovered_publish",
     "mark_publish_attempted",
     "record_publish_reconciliation",
+    "mark_publish_settled",
     "list_publish_reconciliations",
     "clear_publish_reconciliation",
     "has_unresolved_publish",
@@ -254,9 +255,16 @@ def clear_pending_upload(expected_idempotency_key: str) -> bool:
     idempotency_key still matches expected_idempotency_key (compare-and-clear). Leaves
     published_idempotency_keys / published_history intact either way.
 
+    Like mark_failed(), this quarantines an unresolved publish rather than dropping it —
+    see _quarantine_unresolved_in_txn(). Nothing in the pipeline calls this today, which
+    is exactly why the guarantee belongs here rather than at the call site.
+
     Returns True if cleared, False if left untouched.
     """
+    now = datetime.now(timezone.utc).isoformat()
+
     def _update(record, data):
+        _quarantine_unresolved_in_txn(record, data, now)
         data["pending_instagram_upload"] = None
     cleared = _update_pending(expected_idempotency_key, _update)
     logger.info("clear_pending_upload: key=%s cleared=%s", expected_idempotency_key, cleared)
@@ -276,6 +284,92 @@ def _has_elapsed(iso_timestamp: str | None, seconds: int, now_dt: datetime) -> b
         logger.warning("unparseable timestamp=%r — treating as elapsed", iso_timestamp)
         return True
     return now_dt - last_dt >= timedelta(seconds=seconds)
+
+
+def _add_publish_reconciliation(
+    data: dict, *, container_id: str, project_name: str, idempotency_key: str, now: str
+) -> bool:
+    """Insert a quarantine entry into already-read state. Returns True if it was added.
+
+    Operates on a `data` dict the caller has already read under the exclusive lock, which
+    is the whole point: it lets a quarantine be created in the SAME transaction as the
+    record removal that makes it necessary. Calling record_publish_reconciliation() from
+    inside such a transaction would deadlock — it takes the same file lock again.
+
+    Idempotent and non-counting: an entry that already exists is left exactly as it is.
+    This is a safety net, not a reconciliation attempt, so it must not inflate the check
+    count or disturb the alert schedule.
+
+    New entries start at attempts=0 with last_alerted_at=None, mirroring
+    record_share_intent(): nothing has been checked and nobody has been told yet, so the
+    next drain tick performs the first real check and raises the first alert.
+    """
+    pending = data.setdefault("pending_publish_reconciliations", [])
+    if any(entry.get("container_id") == container_id for entry in pending):
+        return False
+    pending.append({
+        "container_id": container_id,
+        "project_name": project_name,
+        "idempotency_key": idempotency_key,
+        "recorded_at": now,
+        "last_attempt_at": None,
+        "last_alerted_at": None,
+        "attempts": 0,
+    })
+    return True
+
+
+def _quarantine_unresolved_in_txn(record: dict, data: dict, now: str) -> bool:
+    """Quarantine record's container, in-transaction, if its publish outcome is unknown.
+
+    THE invariant this file maintains, and the reason it is enforced here rather than by
+    convention at call sites: a pending record carries an unresolved publish marker
+    (publish_attempted_at set, alongside the container_id it refers to) if and only if
+    FieldKit asked Meta to publish that container and has not since established what
+    happened. Any transaction that DROPS such a record without recording a publish must
+    move the obligation into pending_publish_reconciliations in the same locked
+    read-modify-write, or the obligation is lost at exactly the moment it starts to matter.
+
+    That "same transaction" requirement is not theoretical. The exhausted path used to
+    clear and fsync the pending record, return, and only then let the caller quarantine —
+    so a process that died in between left neither a job nor a quarantine, and the next
+    re-approval published a duplicate Reel. Callers can still quarantine explicitly (and
+    do, because that is what produces a timely alert); this makes the guarantee hold even
+    when they don't, including for callers that do not exist yet.
+    """
+    container_id = record.get("container_id")
+    if not container_id or not record.get("publish_attempted_at"):
+        return False
+    added = _add_publish_reconciliation(
+        data,
+        container_id=container_id,
+        project_name=record.get("project_name", "unknown"),
+        idempotency_key=record.get("idempotency_key", ""),
+        now=now,
+    )
+    if added:
+        logger.error(
+            "quarantined an unresolved publish while discarding its job: container_id=%s "
+            "key=%s — the Reel may be live; re-approval of this key is now blocked",
+            container_id, record.get("idempotency_key"),
+        )
+    return added
+
+
+def _drop_publish_reconciliations_for_key(data: dict, idempotency_key: str) -> int:
+    """Remove any quarantine entries for idempotency_key from already-read state.
+
+    The mirror of _quarantine_unresolved_in_txn(): recording a publish settles the
+    question the quarantine existed to ask, so retiring the two together in one
+    transaction is what stops a resolved obligation from outliving its own resolution.
+    Returns how many entries were removed.
+    """
+    pending = data.get("pending_publish_reconciliations", [])
+    remaining = [e for e in pending if e.get("idempotency_key") != idempotency_key]
+    removed = len(pending) - len(remaining)
+    if removed:
+        data["pending_publish_reconciliations"] = remaining
+    return removed
 
 
 def claim_pending_upload(
@@ -302,6 +396,9 @@ def claim_pending_upload(
       "stale_published" — idempotency_key is already in published_idempotency_keys; cleared.
       "stale_failed"    — status was already 'failed'; cleared.
       "exhausted"       — attempt_count already at max_attempts; cleared (terminal failure).
+                           If the record carried an unresolved publish, it is moved into
+                           pending_publish_reconciliations in the SAME transaction as the
+                           clear — see _quarantine_unresolved_in_txn().
       "claimed"         — success: status is now 'uploading', attempt_count/last_attempt_at
                            already advanced for this attempt.
     """
@@ -316,11 +413,17 @@ def claim_pending_upload(
                 return "mismatch"
 
             if idempotency_key in data.get("published_idempotency_keys", []):
+                # Deliberately NOT quarantined. The key is already in
+                # published_idempotency_keys, so re-approval is permanently refused by
+                # set_pending_upload() — there is no duplicate to prevent, and a
+                # quarantine here would only block a video that is already blocked while
+                # asking Instagram a question whose answer is already recorded.
                 data["pending_instagram_upload"] = None
                 _write(f, data)
                 return "stale_published"
 
             if record.get("status") == "failed":
+                _quarantine_unresolved_in_txn(record, data, now_dt.isoformat())
                 data["pending_instagram_upload"] = None
                 _write(f, data)
                 return "stale_failed"
@@ -338,6 +441,12 @@ def claim_pending_upload(
 
             attempt_count = record.get("attempt_count", 0)
             if attempt_count >= max_attempts:
+                # Quarantine FIRST, in this same transaction, so the entry and the clear
+                # reach disk in one _write()+fsync. Leaving it to the caller meant a
+                # process that died between "exhausted" being returned and the caller
+                # recording the quarantine left neither a pending job nor an obligation —
+                # and the next re-approval could publish a duplicate Reel.
+                _quarantine_unresolved_in_txn(record, data, now_dt.isoformat())
                 data["pending_instagram_upload"] = None
                 _write(f, data)
                 return "exhausted"
@@ -457,6 +566,10 @@ def mark_published(idempotency_key: str, post_id: str, permalink: str | None = N
             "published_at": now,
         })
         del history[:-_PUBLISH_HISTORY_LIMIT]
+        # A confirmed publish answers the question any quarantine for this key was
+        # asking, so the two are retired together rather than leaving a resolved
+        # obligation behind to block the key forever.
+        _drop_publish_reconciliations_for_key(data, idempotency_key)
         data["pending_instagram_upload"] = None
     _update_pending(idempotency_key, _update)
     logger.info("mark_published: key=%s post_id=%s", idempotency_key, post_id)
@@ -509,6 +622,10 @@ def record_recovered_publish(
                 "published_at": now,
             })
             del history[:-_PUBLISH_HISTORY_LIMIT]
+            # This IS the answer the quarantine was waiting for, so retire it in the same
+            # transaction that records the publish. Callers also clear it explicitly; doing
+            # it here is what makes "recorded but still blocked" unrepresentable.
+            _drop_publish_reconciliations_for_key(data, idempotency_key)
             record = data.get("pending_instagram_upload")
             if record is not None and record.get("idempotency_key") == idempotency_key:
                 data["pending_instagram_upload"] = None
@@ -527,8 +644,18 @@ def mark_failed(idempotency_key: str) -> None:
     retries follow it), so clearing here stops the cron entrypoint from reprocessing this job
     forever with no backoff. The record (including any container_id) is discarded, not persisted
     with status='failed' — matching facebook_state.mark_failed().
+
+    Discarding the record does NOT discard an unresolved publish. If the record still
+    carries one, it is moved into pending_publish_reconciliations in this same
+    transaction — see _quarantine_unresolved_in_txn(). Call sites that know the outcome
+    should call mark_publish_settled() first (Instagram said it never published) or
+    quarantine explicitly with an alert (outcome unknown); this makes the guarantee hold
+    regardless of whether they do.
     """
+    now = datetime.now(timezone.utc).isoformat()
+
     def _update(record, data):
+        _quarantine_unresolved_in_txn(record, data, now)
         data["pending_instagram_upload"] = None
     _update_pending(idempotency_key, _update)
     logger.error("mark_failed: key=%s", idempotency_key)
@@ -824,8 +951,30 @@ def has_unresolved_publish(idempotency_key: str) -> bool:
         return False
 
 
+def mark_publish_settled(idempotency_key: str) -> None:
+    """Clear the unresolved-publish marker: Instagram has said this container never published.
+
+    The counterpart to mark_publish_attempted(), and what keeps the invariant in
+    _quarantine_unresolved_in_txn() honest in BOTH directions. A container reported as
+    FINISHED, ERROR or EXPIRED is definitively not live, so the question is answered and
+    the record must stop looking like it has an open one — otherwise the next transaction
+    to drop the record would quarantine it, blocking re-approval of a video Instagram has
+    just confirmed was never posted.
+
+    Only the marker is cleared. container_id stays, because it is still the handle for the
+    container this job used and remains useful for debugging and for a retry's own
+    reconciliation.
+
+    Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
+    """
+    def _update(record, data):
+        record["publish_attempted_at"] = None
+    _update_pending(idempotency_key, _update)
+    logger.info("mark_publish_settled: key=%s", idempotency_key)
+
+
 def record_publish_reconciliation(
-    container_id: str, *, project_name: str, idempotency_key: str
+    container_id: str, *, project_name: str, idempotency_key: str, counts_as_check: bool = True
 ) -> dict | None:
     """Record that container_id's publish outcome is unknown and must keep being checked.
 
@@ -838,6 +987,11 @@ def record_publish_reconciliation(
     The admin is alerted on the FIRST record and then every
     _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS for as long as it stays unresolved, because
     this is a state a human may eventually have to resolve by looking at the account.
+
+    counts_as_check=False records an alert decision WITHOUT bumping the check count, for a
+    caller that has something to say about the entry but did not actually manage to ask
+    Instagram anything — the credential being absent, say. Inflating the count there would
+    make the alert claim checks that never happened.
 
     Idempotent per container: re-recording bumps attempts rather than duplicating.
     """
@@ -852,8 +1006,9 @@ def record_publish_reconciliation(
             for entry in pending:
                 if entry.get("container_id") != container_id:
                     continue
-                entry["attempts"] = entry.get("attempts", 1) + 1
-                entry["last_attempt_at"] = now
+                if counts_as_check:
+                    entry["attempts"] = entry.get("attempts", 0) + 1
+                    entry["last_attempt_at"] = now
                 should_alert = _has_elapsed(
                     entry.get("last_alerted_at"),
                     _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS,
@@ -865,7 +1020,7 @@ def record_publish_reconciliation(
                 logger.warning(
                     "record_publish_reconciliation: container_id=%s still unresolved after "
                     "%d checks (re-alerting=%s)",
-                    container_id, entry["attempts"], should_alert,
+                    container_id, entry.get("attempts", 0), should_alert,
                 )
                 return dict(entry) if should_alert else None
 

@@ -971,3 +971,197 @@ def test_mark_publish_attempted_ignores_a_mismatched_key(valid_record):
     _claim("42")
     ig_state.mark_publish_attempted("999")
     assert ig_state.get_pending_upload().get("publish_attempted_at") is None
+
+
+# ---------------------------------------------------------------------------
+# The quarantine is created ATOMICALLY with the transition that requires it
+# ---------------------------------------------------------------------------
+#
+# Round 3 made the quarantine survive mark_failed(). Round 4 closes the other half:
+# CREATING the entry has to happen in the same locked read-modify-write as the
+# removal that necessitates it. claim_pending_upload() used to clear and fsync the
+# pending record, return "exhausted", and leave the caller to quarantine — so a
+# process that died in between left neither a job nor an obligation, and the next
+# re-approval could publish a duplicate Reel.
+#
+# These tests assert on state AFTER the state call alone, with no caller
+# cooperation whatsoever. That is the point: if the guarantee needed a caller to
+# follow up, it would not be a guarantee.
+
+def _unresolved_record(valid_record, attempts=3):
+    """A record that asked Meta to publish and never found out what happened."""
+    return dict(
+        valid_record,
+        attempt_count=attempts,
+        container_id="container_abc",
+        publish_attempted_at="2026-08-31T14:05:00Z",
+    )
+
+
+def test_the_exhausted_transition_quarantines_in_the_same_transaction(valid_record):
+    """THE round-4 fix: the entry exists the instant "exhausted" is returned."""
+    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    assert _claim("42") == "exhausted"
+    # No caller has run. The obligation is already durable.
+    assert ig_state.get_pending_upload() is None
+    assert ig_state.has_unresolved_publish("42") is True
+    assert [e["container_id"] for e in ig_state.list_publish_reconciliations()] == ["container_abc"]
+
+
+def test_a_crash_right_after_the_exhausted_claim_still_blocks_re_approval(valid_record):
+    """Step 6 of the surviving sequence, made impossible.
+
+    Simulates the process dying between claim_pending_upload() returning and anything
+    else happening — the state file is all that is left, and it must already refuse the
+    re-approval on its own.
+    """
+    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _claim("42")
+    with pytest.raises(ValueError, match="unresolved publish"):
+        ig_state.set_pending_upload(valid_record)
+
+
+def test_the_exhausted_quarantine_starts_unchecked_and_unannounced(valid_record):
+    """attempts=0 / last_alerted_at=None, so the very next drain tick checks AND alerts.
+
+    Stamping it as already-alerted would mean a crash here bought 24 hours of silence
+    about a Reel that may be live.
+    """
+    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _claim("42")
+    entry = ig_state.list_publish_reconciliations()[0]
+    assert entry["attempts"] == 0
+    assert entry["last_alerted_at"] is None
+    # ...and the next real check does alert.
+    assert ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    ) is not None
+
+
+def test_an_exhausted_job_that_never_published_is_not_quarantined(valid_record):
+    """No publish attempt, no obligation — the stuck-container case stays re-approvable."""
+    ig_state.set_pending_upload(dict(valid_record, attempt_count=3, container_id="container_abc"))
+    assert _claim("42") == "exhausted"
+    assert ig_state.list_publish_reconciliations() == []
+    ig_state.set_pending_upload(valid_record)            # must not raise
+
+
+def test_a_stale_failed_record_is_quarantined_too(valid_record):
+    """Same class of transition, same guarantee — found by looking, not by a later review."""
+    ig_state.set_pending_upload(_unresolved_record(valid_record, attempts=0))
+    import json
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    raw["pending_instagram_upload"]["status"] = "failed"
+    ig_state.STATE_FILE.write_text(json.dumps(raw))
+    assert _claim("42") == "stale_failed"
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+def test_mark_failed_quarantines_without_caller_cooperation(valid_record):
+    """The round-3 call-site convention is now a backstop, not the mechanism."""
+    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    ig_state.mark_failed("42")
+    assert ig_state.get_pending_upload() is None
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+def test_clear_pending_upload_quarantines_too(valid_record):
+    """Nothing calls this today — which is exactly why the guarantee belongs in the module."""
+    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    assert ig_state.clear_pending_upload("42") is True
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+def test_a_published_key_is_not_quarantined_on_a_stale_claim(valid_record):
+    """Deliberately exempt: the key is already retired, so there is no duplicate to prevent."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.mark_published("42", "ig_post_1")
+    ig_state.set_pending_upload(dict(_unresolved_record(valid_record), idempotency_key="99"))
+    import json
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    raw["pending_instagram_upload"]["idempotency_key"] = "42"
+    ig_state.STATE_FILE.write_text(json.dumps(raw))
+    assert _claim("42") == "stale_published"
+    assert ig_state.list_publish_reconciliations() == []
+
+
+# --- mark_publish_settled keeps the invariant honest in the other direction ---
+
+def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_record):
+    """Instagram said FINISHED, so blocking the re-approval would be wrong.
+
+    Without clearing the marker, the safety net in mark_failed() would quarantine a video
+    Instagram has just confirmed was never posted — trading one failure mode for another.
+    """
+    ig_state.set_pending_upload(_unresolved_record(valid_record, attempts=0))
+    ig_state.mark_publish_settled("42")
+    ig_state.mark_failed("42")
+    assert ig_state.list_publish_reconciliations() == []
+    ig_state.set_pending_upload(valid_record)            # re-approvable again
+
+
+def test_mark_publish_settled_keeps_the_container_id(valid_record):
+    """Only the open question is closed; the handle stays for debugging and retries."""
+    ig_state.set_pending_upload(_unresolved_record(valid_record, attempts=0))
+    ig_state.mark_publish_settled("42")
+    record = ig_state.get_pending_upload()
+    assert record["publish_attempted_at"] is None
+    assert record["container_id"] == "container_abc"
+
+
+# --- recording a publish retires the obligation in the same transaction ---
+
+def test_recording_a_recovered_publish_drops_its_quarantine(valid_record):
+    """A resolved obligation must not outlive its own resolution."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    assert ig_state.list_publish_reconciliations() == []
+    assert ig_state.has_unresolved_publish("42") is False
+
+
+def test_mark_published_drops_a_quarantine_for_the_same_key(valid_record):
+    """The ordinary success path closes the question too, and must not leave a block behind."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    ig_state.mark_published("42", "ig_post_1")
+    assert ig_state.list_publish_reconciliations() == []
+
+
+def test_a_quarantine_for_a_different_key_survives_an_unrelated_publish(valid_record):
+    """Retiring one key must not release another video's block."""
+    ig_state.record_publish_reconciliation(
+        "container_other", project_name="bathroom", idempotency_key="99"
+    )
+    ig_state.set_pending_upload(valid_record)
+    ig_state.mark_published("42", "ig_post_1")
+    assert ig_state.has_unresolved_publish("99") is True
+
+
+# --- counts_as_check ---
+
+def test_a_non_check_record_does_not_inflate_the_check_count():
+    """An alert about a credential being absent is not evidence FieldKit tried anything."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    before = ig_state.list_publish_reconciliations()[0]["attempts"]
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42",
+        counts_as_check=False,
+    )
+    assert ig_state.list_publish_reconciliations()[0]["attempts"] == before
+
+
+def test_a_non_check_record_still_advances_the_alert_schedule(monkeypatch):
+    """It is still an alert, so it must not re-fire every minute."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    assert ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42",
+        counts_as_check=False,
+    ) is None

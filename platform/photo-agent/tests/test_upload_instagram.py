@@ -160,6 +160,7 @@ def base(mocker, env):
     # The FR-011 quarantine surface. Mocked by default so ordinary tests neither write it
     # nor read a leftover from a previous test; the tests that care override these.
     mocker.patch.object(ui.instagram_state, "mark_publish_attempted")
+    mocker.patch.object(ui.instagram_state, "mark_publish_settled")
     mocker.patch.object(ui.instagram_state, "list_publish_reconciliations", return_value=[])
     mocker.patch.object(
         ui.instagram_state,
@@ -1357,7 +1358,10 @@ def test_an_exhausted_job_that_cannot_be_reconciled_warns_about_a_possible_live_
     ui.instagram_api.get_container_status.side_effect = InstagramUploadError("network down")
 
     main([])
-    # The control is the durable quarantine, not the message.
+    # The control is the durable quarantine, not the message. On this path the ENTRY is
+    # created inside claim_pending_upload()'s transaction (mocked here); what
+    # _handle_exhausted() adds is the check that failed, the activity-log line, and the
+    # alert. test_dual_platform_integration.py exercises the atomic insert for real.
     ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
         _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
     )
@@ -1887,3 +1891,154 @@ def test_the_publish_marker_is_written_before_the_publish_call(with_pending):
     )
     main([])
     assert order == ["marked", "published"]
+
+
+# ---------------------------------------------------------------------------
+# A quarantine that cannot even be CHECKED must not be silent
+# ---------------------------------------------------------------------------
+
+def test_quarantines_are_reported_when_there_is_no_page_token(base, monkeypatch):
+    """The last quiet failure mode: the entry keeps blocking, and nothing says why.
+
+    Every other failure — an invalid token, a Graph outage — retries every tick and
+    re-alerts daily. A token removed entirely used to leave a video permanently
+    un-postable with no reconciliation attempts and no alerts at all.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = [dict(_QUARANTINE_ENTRY)]
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "cannot find out" in text
+    assert "FB_PAGE_ACCESS_TOKEN" in text
+    assert "stays blocked" in text
+
+
+def test_the_credential_absent_report_does_not_claim_a_check_happened(base, monkeypatch):
+    """counts_as_check=False — nothing was asked of Instagram, so nothing is counted."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = [dict(_QUARANTINE_ENTRY)]
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    main([])
+    _args, kwargs = ui.instagram_state.record_publish_reconciliation.call_args
+    assert kwargs["counts_as_check"] is False
+    ui.instagram_api.get_container_status.assert_not_called()
+
+
+def test_nothing_is_reported_when_there_are_no_quarantines(base, monkeypatch):
+    """No obligation, no noise — a client with no Instagram token is not misconfigured."""
+    import scripts.upload_instagram as ui
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    main([])
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
+    ui.telegram_api.send_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A growing quarantine list is visible, and never silently trimmed
+# ---------------------------------------------------------------------------
+
+def _quarantine_entries(n):
+    return [
+        dict(_QUARANTINE_ENTRY, container_id=f"container_{i}", idempotency_key=str(i))
+        for i in range(n)
+    ]
+
+
+def test_a_backlog_is_reported_in_the_alert(base, caplog):
+    """One stuck upload and a month of accumulation read identically otherwise."""
+    import scripts.upload_instagram as ui
+    entries = _quarantine_entries(ui._QUARANTINE_BACKLOG_THRESHOLD)
+    ui.instagram_state.list_publish_reconciliations.return_value = entries
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert f"{len(entries)} Instagram uploads are now in this state" in text
+    assert "never dropped" in text or "Nothing is ever dropped" in text
+
+
+def test_a_backlog_is_logged_every_tick(base, caplog):
+    """Visible without anyone reading the state file."""
+    import logging
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = _quarantine_entries(
+        ui._QUARANTINE_BACKLOG_THRESHOLD
+    )
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    with caplog.at_level(logging.ERROR):
+        main([])
+    assert "quarantine backlog" in caplog.text
+
+
+def test_a_small_number_of_quarantines_does_not_trigger_the_backlog_warning(base, caplog):
+    """The threshold exists so one unlucky upload does not read like a systemic problem."""
+    import logging
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = _quarantine_entries(1)
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    with caplog.at_level(logging.ERROR):
+        main([])
+    assert "quarantine backlog" not in caplog.text
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "are now in this state" not in text
+
+
+def test_the_drain_never_drops_an_entry_to_stay_short(base):
+    """Safety over tidiness: a dropped entry releases a key while the Reel's fate is unknown."""
+    import scripts.upload_instagram as ui
+    entries = _quarantine_entries(ui._QUARANTINE_BACKLOG_THRESHOLD + 3)
+    ui.instagram_state.list_publish_reconciliations.return_value = entries
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    main([])
+    ui.instagram_state.clear_publish_reconciliation.assert_not_called()
+    assert ui.instagram_state.record_publish_reconciliation.call_count == len(entries)
+
+
+# ---------------------------------------------------------------------------
+# The terminal path settles the marker rather than leaving it to be quarantined
+# ---------------------------------------------------------------------------
+
+def test_a_definitively_unpublished_container_clears_its_marker(with_pending):
+    """Otherwise mark_failed()'s safety net would block a video Instagram cleared."""
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    main([])
+    ui.instagram_state.mark_publish_settled.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
+
+
+def test_an_unresolved_container_does_not_clear_its_marker(with_pending):
+    """The question is still open, so the record must keep looking like it has one."""
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    ui.instagram_api.get_container_status.side_effect = [
+        "FINISHED", InstagramUploadError("graph down"),
+    ]
+    main([])
+    ui.instagram_state.mark_publish_settled.assert_not_called()
+    ui.instagram_state.record_publish_reconciliation.assert_called_once()
+
+
+def test_the_exhausted_path_still_writes_the_activity_log_line(base, tmp_path):
+    """claim_pending_upload() creates the entry but knows nothing about logging.
+
+    IG_UNKNOWN is written here instead, once, when the container becomes unresolved —
+    not by the drain, which would repeat it every tick and bury it.
+    """
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    ui.instagram_state.get_pending_upload.return_value = dict(
+        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID,
+        attempt_count=3, publish_attempted_at="2026-08-31T14:05:00Z",
+    )
+    ui.instagram_state.claim_pending_upload.return_value = "exhausted"
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    main([])
+    ui.instagram_logger.log_publish_unresolved.assert_called_once_with(_PROJECT, _CONTAINER_ID)

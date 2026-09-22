@@ -80,12 +80,17 @@ Instagram-specific differences from upload_facebook.py:
     Facebook has the SAME latent exposure and is NOT fixed here. If
     facebook_api.upload_video()'s response is lost the video may be live with no
     record of it, and a re-approval would post it twice. It cannot be fixed this
-    way: a Page video upload is a single call that exposes no handle before it
-    completes, so there is nothing to reconcile against afterwards — no container,
-    no client-supplied idempotency token. Closing it would need a different
-    mechanism (searching the Page's recent videos, or an upload_session handle),
-    which is out of scope for this feature and is tracked separately rather than
-    left implied by an Instagram-only fix.
+    way AS facebook_api.py IS CURRENTLY WRITTEN: its one-shot multipart POST knows
+    no identifier until the response arrives, so there is nothing to reconcile
+    against afterwards and matching the Page's recent videos would be a heuristic
+    rather than an authority. That is a limit of this implementation, not of Meta's
+    API — Meta's sessionized video upload returns an upload_session_id AND a
+    video_id from its start phase, before any bytes move, which is exactly the
+    durable pre-known handle reconciliation needs (see Meta's official Python
+    Business SDK, facebook_business/video_uploader.py). Closing it therefore means
+    moving Facebook onto the sessionized upload: out of scope for this feature, and
+    tracked as an urgent fast-follow in issue #78 rather than left implied by an
+    Instagram-only fix.
 
   - Deleting the local video file is COORDINATED, not owned by either script. One
     approval produces one file with two independent consumers, so whichever enabled
@@ -190,6 +195,14 @@ _COOLDOWN_SECONDS = 60
 # would let the next cron tick create a second container for a job already in flight.
 _UPLOAD_LEASE_SECONDS = 1800
 
+# How many unresolved publishes must pile up before every tick starts shouting about the
+# backlog. Deliberately NOT a cap: the list is never trimmed, because dropping an entry
+# would release an idempotency key while a Reel's fate is still unknown — the exact
+# duplicate this mechanism exists to prevent. Growth is the safe direction; this only
+# makes it visible. Low enough that a real accumulation is noticed early, high enough that
+# one unlucky upload does not trigger it.
+_QUARANTINE_BACKLOG_THRESHOLD = 5
+
 
 def _try_acquire_upload_lock() -> "IO | None":
     """Try to acquire upload_instagram.lock exclusively (non-blocking).
@@ -274,6 +287,11 @@ def main(argv=None) -> None:
         page_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
         if page_token:
             _drain_publish_reconciliations(page_token, chat_id)
+        else:
+            # Without the token nothing can be asked of Instagram — but an entry that
+            # blocks a video from ever being re-approved must not do so silently. This was
+            # the last quiet failure mode left in the mechanism.
+            _warn_quarantines_unreachable(chat_id)
 
         # FR-016: a client without Instagram configured is not misconfigured, it is
         # simply not using this feature, so it exits 0 rather than reporting an
@@ -514,6 +532,7 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
                     project_name, idem_key, active_container_id, video_path, chat_id
                 )
                 return
+
             instagram_state.mark_failed(idem_key)
             instagram_logger.log_upload_exhausted(project_name)
             _delete_local_file_if_last(video_path, project_name, idem_key)
@@ -635,30 +654,52 @@ def _handle_exhausted(
     video_path: str,
     chat_id: str,
 ) -> None:
-    """Resolve a job whose attempt budget ran out, settling a leftover container first.
+    """Resolve a job whose attempt budget ran out.
 
-    claim_pending_upload() has already cleared the record, so this job is terminal either
-    way. But "terminal" must not mean "assumed unpublished": the final attempt is exactly
-    as capable of dying between publish and mark_published as any other, and this is the
-    last moment anything will ever look at its container. If that container is left
-    unsettled here, a re-approval later creates and publishes a second one.
+    claim_pending_upload() has already cleared the record — and, if that record carried an
+    unresolved publish, has already quarantined it IN THE SAME TRANSACTION as the clear
+    (see instagram_state._quarantine_unresolved_in_txn). So by the time this runs the
+    obligation is durable whatever happens next: this function makes the system faster to
+    resolve, not safer. A process that dies here leaves exactly the state the next tick's
+    _drain_publish_reconciliations() expects.
 
-    prior_publish_attempted comes from the record's durable publish_attempted_at marker.
-    Without a publish attempt there is nothing to settle: publish_container() was never
-    called, so Meta cannot have published it, and quarantining would only block a
-    re-approval for no reason.
+    That ordering is the round-4 fix. Previously the clear was fsynced first and the
+    quarantine was created afterwards by this function, so a process that died in the gap
+    left neither a pending job nor an obligation — and the next re-approval could publish a
+    duplicate Reel.
     """
-    outcome = _settle_terminal_container(
-        page_token, prior_container_id if prior_publish_attempted else None,
-        project_name, idem_key, chat_id,
-    )
+    outcome = "unpublished"
+    if prior_publish_attempted and prior_container_id:
+        outcome = _reconcile_quarantined_container(
+            page_token,
+            {
+                "container_id": prior_container_id,
+                "project_name": project_name,
+                "idempotency_key": idem_key,
+            },
+            chat_id,
+            # Silent: this path sends ONE consolidated message below that also reports the
+            # exhaustion, rather than two that each tell half the story.
+            announce=False,
+        )
+
     if outcome == "published":
         _log.warning(
             "attempt budget exhausted, but the last container was already published: "
             "project=%s container_id=%s", project_name, prior_container_id,
         )
-        _record_recovered(project_name, idem_key, prior_container_id, video_path, chat_id)
+        _delete_local_file_if_last(video_path, project_name, idem_key)
+        _send_confirmation(chat_id, _recovered_message(project_name))
         return
+
+    if outcome == "unresolved":
+        # The activity-log record of the quarantine. claim_pending_upload() created the
+        # ENTRY (atomically, which is the guarantee), but it does not write to the activity
+        # log — the state module deliberately knows nothing about logging. Written here
+        # rather than in _reconcile_quarantined_container() so it appears once, when the
+        # container becomes unresolved, instead of on every later drain tick that would
+        # bury it.
+        instagram_logger.log_publish_unresolved(project_name, prior_container_id)
 
     _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
     instagram_logger.log_upload_exhausted(project_name)
@@ -675,14 +716,17 @@ def _settle_terminal_container(
 ) -> str:
     """Establish, at terminal time, whether container_id put a Reel on the account.
 
-    The last line of FR-011's defence. Everywhere else a retry follows, so an unanswered
-    question can simply be asked again next tick; here the job is about to stop existing,
-    and whatever is not settled now is settled by a human or not at all.
+    For the terminal path where the pending record still EXISTS and has not been
+    quarantined — _process_upload()'s attempt-budget branch. (The exhausted-claim path is
+    different: there the record is already gone and already quarantined, so it uses
+    _reconcile_quarantined_container() instead.)
 
     Returns:
       "published"   — Instagram reports PUBLISHED. The Reel is live; the caller records it.
       "unpublished" — Instagram reports FINISHED, ERROR or EXPIRED. All three mean this
-                      container never published. Ordinary terminal failure; nothing held.
+                      container never published. The record's unresolved-publish marker is
+                      cleared here, which is what stops the mark_failed() that follows from
+                      quarantining a video Instagram has just confirmed was never posted.
       "unresolved"  — no definitive answer. The container is QUARANTINED durably, the
                       idempotency key is blocked, and later ticks keep asking until
                       Instagram is definitive (see _drain_publish_reconciliations).
@@ -695,7 +739,6 @@ def _settle_terminal_container(
     try:
         if _classify_prior_container(page_token, container_id) == "published":
             return "published"
-        return "unpublished"
     except (InstagramTokenError, InstagramUploadError) as exc:
         _log.error(
             "could not settle the final container before giving up — quarantining: "
@@ -704,6 +747,8 @@ def _settle_terminal_container(
         )
         _quarantine_unresolved_publish(container_id, project_name, idem_key, chat_id)
         return "unresolved"
+    instagram_state.mark_publish_settled(idem_key)
+    return "unpublished"
 
 
 def _quarantine_unresolved_publish(
@@ -715,6 +760,10 @@ def _quarantine_unresolved_publish(
     to remember a caveat at the exact moment the system has told them the upload failed,
     and the cost of them forgetting is an irreversible duplicate Reel on a client's
     account. So the block is enforced in state, and the question keeps being asked.
+
+    Explicit rather than relying on instagram_state's in-transaction safety net: this is
+    what produces a TIMELY alert and the IG_UNKNOWN log line. The safety net guarantees the
+    entry exists; this one makes sure a human hears about it at the right moment.
     """
     entry = instagram_state.record_publish_reconciliation(
         container_id, project_name=project_name, idempotency_key=idem_key
@@ -722,6 +771,59 @@ def _quarantine_unresolved_publish(
     instagram_logger.log_publish_unresolved(project_name, container_id)
     if entry:
         _send_alert(chat_id, _unresolved_publish_alert(entry))
+
+
+def _reconcile_quarantined_container(
+    page_token: str, entry: dict, chat_id: str, *, announce: bool
+) -> str:
+    """Ask Instagram about ONE quarantined container and act on a definitive answer.
+
+    Shared by the per-tick drain and the exhausted-claim path, which need identical
+    semantics and differ only in who does the talking. Returns "published",
+    "unpublished", or "unresolved".
+
+    announce=True sends the resolution message itself, for the drain — nothing else will.
+    announce=False stays silent so a caller can fold the outcome into one message of its
+    own. The state changes and log lines happen either way; only the Telegram text is
+    suppressed, and the alert-throttle stamp is still taken so the drain does not
+    immediately repeat what the caller just said.
+    """
+    container_id = entry.get("container_id")
+    project_name = entry.get("project_name", "unknown")
+    idem_key = entry.get("idempotency_key", "")
+
+    try:
+        outcome = _classify_prior_container(page_token, container_id)
+    except (InstagramTokenError, InstagramUploadError) as exc:
+        _log.error(
+            "publish outcome still unresolved: project=%s container_id=%s error=%s",
+            project_name, container_id, _safe_error(exc),
+        )
+        updated = instagram_state.record_publish_reconciliation(
+            container_id, project_name=project_name, idempotency_key=idem_key
+        )
+        if updated and announce:
+            _send_alert(chat_id, _unresolved_publish_alert(updated))
+        return "unresolved"
+
+    if outcome == "published":
+        # record_recovered_publish() retires the key permanently AND drops the quarantine
+        # in one transaction; the explicit clear below is belt and braces for an entry
+        # filed under a container id that key no longer matches.
+        instagram_state.record_recovered_publish(idem_key, project_name, container_id)
+        instagram_logger.log_upload_recovered(project_name, container_id)
+        instagram_state.clear_publish_reconciliation(container_id)
+        if announce:
+            _send_confirmation(chat_id, _recovered_message(project_name))
+        return "published"
+
+    # "reusable" (FINISHED) and "restart" (ERROR/EXPIRED) all mean: never published.
+    status = "FINISHED" if outcome == "reusable" else "ERROR_OR_EXPIRED"
+    instagram_state.clear_publish_reconciliation(container_id)
+    instagram_logger.log_publish_resolved(project_name, container_id, status)
+    if announce:
+        _send_alert(chat_id, _not_published_message(project_name))
+    return "unpublished"
 
 
 def _drain_publish_reconciliations(page_token: str, chat_id: str) -> None:
@@ -739,51 +841,105 @@ def _drain_publish_reconciliations(page_token: str, chat_id: str) -> None:
       - FINISHED / ERROR / EXPIRED: it never published. The quarantine lifts, the key is
         released, and the owner is told it is safe to re-approve.
 
-    Anything else leaves the entry in place. That is the point.
+    Anything else leaves the entry in place. That is the point. Nothing here ever drops an
+    entry to keep the list short — an entry disappearing without an answer is the exact
+    failure this whole mechanism exists to prevent — so a backlog is reported rather than
+    trimmed; see _report_quarantine_backlog().
     """
-    for entry in instagram_state.list_publish_reconciliations():
+    entries = instagram_state.list_publish_reconciliations()
+    _report_quarantine_backlog(entries)
+    for entry in entries:
+        if not entry.get("container_id"):
+            continue
+        _reconcile_quarantined_container(page_token, entry, chat_id, announce=True)
+
+
+def _warn_quarantines_unreachable(chat_id: str) -> None:
+    """Report quarantines that cannot even be CHECKED because there is no Page token.
+
+    Without this the credential-absent case was the one silent failure left in the
+    mechanism: entries kept blocking re-approval correctly, but nothing could ask
+    Instagram anything and nothing said so, so an operator who removed
+    FB_PAGE_ACCESS_TOKEN would see a video permanently un-postable with no explanation
+    anywhere. Every other failure mode — an invalid token, a Graph outage — already
+    retries every tick and re-alerts daily.
+
+    counts_as_check=False: the alert schedule advances, the check count does not. No
+    check happened, and a count that claimed otherwise would misrepresent how hard
+    FieldKit has actually tried.
+    """
+    entries = instagram_state.list_publish_reconciliations()
+    if not entries:
+        return
+    _report_quarantine_backlog(entries)
+    _log.error(
+        "%d unresolved Instagram publish(es) cannot be checked — FB_PAGE_ACCESS_TOKEN is "
+        "not set. These keys stay blocked until the token is restored.",
+        len(entries),
+    )
+    for entry in entries:
         container_id = entry.get("container_id")
-        project_name = entry.get("project_name", "unknown")
-        idem_key = entry.get("idempotency_key", "")
         if not container_id:
             continue
-        try:
-            outcome = _classify_prior_container(page_token, container_id)
-        except (InstagramTokenError, InstagramUploadError) as exc:
-            _log.error(
-                "publish outcome still unresolved: project=%s container_id=%s error=%s",
-                project_name, container_id, _safe_error(exc),
-            )
-            updated = instagram_state.record_publish_reconciliation(
-                container_id, project_name=project_name, idempotency_key=idem_key
-            )
-            if updated:
-                _send_alert(chat_id, _unresolved_publish_alert(updated))
-            continue
-
-        if outcome == "published":
-            instagram_state.record_recovered_publish(idem_key, project_name, container_id)
-            instagram_logger.log_upload_recovered(project_name, container_id)
-            instagram_state.clear_publish_reconciliation(container_id)
-            _send_confirmation(
-                chat_id,
-                f"✅ Resolved: the Instagram Reel for {project_name} IS live — an earlier "
-                "attempt published it but could not confirm it at the time. Nothing was "
-                "posted twice, and FieldKit could not read back the post link, so open the "
-                "account to see it.",
-            )
-            continue
-
-        # "reusable" (FINISHED) and "restart" (ERROR/EXPIRED) all mean: never published.
-        status = "FINISHED" if outcome == "reusable" else "ERROR_OR_EXPIRED"
-        instagram_state.clear_publish_reconciliation(container_id)
-        instagram_logger.log_publish_resolved(project_name, container_id, status)
-        _send_alert(
-            chat_id,
-            f"✅ Resolved: the Instagram Reel for {project_name} was NOT published — "
-            "Instagram confirms the upload never went live. Nothing is on the account, "
-            "and you can safely re-approve this video to try again.",
+        updated = instagram_state.record_publish_reconciliation(
+            container_id,
+            project_name=entry.get("project_name", "unknown"),
+            idempotency_key=entry.get("idempotency_key", ""),
+            counts_as_check=False,
         )
+        if updated:
+            _send_alert(
+                chat_id,
+                f"⚠️ Instagram: the Reel for {updated.get('project_name', 'unknown')} MAY "
+                "already be live, and FieldKit cannot find out — FB_PAGE_ACCESS_TOKEN is "
+                "not set, so it cannot ask Instagram anything. Re-approving this video "
+                "stays blocked until the token is restored and the check can run. "
+                "Reconnect the Page via generate_auth_link.py.",
+            )
+
+
+def _report_quarantine_backlog(entries: list) -> None:
+    """Make a growing quarantine list visible, without ever shortening it.
+
+    pending_publish_reconciliations has no size or age cap by design. Capping it would mean
+    dropping an entry — releasing an idempotency key while a Reel's fate is still unknown —
+    which is precisely the duplicate this mechanism prevents, so growth is the SAFE
+    direction and must stay that way.
+
+    What growth must not be is invisible. Past the threshold every tick logs the backlog,
+    and the per-entry alerts carry the count, so "one unlucky upload" is distinguishable
+    from "this has been quietly accumulating for a month" without anyone reading the state
+    file. Resolving them is an operator action, documented in docs/instagram/README.md.
+    """
+    if len(entries) < _QUARANTINE_BACKLOG_THRESHOLD:
+        return
+    oldest = min(
+        (e.get("recorded_at") or "" for e in entries), default="unknown"
+    ) or "unknown"
+    _log.error(
+        "Instagram publish quarantine backlog: %d unresolved container(s), oldest since "
+        "%s. Each one blocks its video from being re-approved. See "
+        "docs/instagram/README.md for how to resolve them.",
+        len(entries), oldest,
+    )
+
+
+def _recovered_message(project_name: str) -> str:
+    """The confirmation for a publish discovered after the fact. One wording, two callers."""
+    return (
+        f"✅ Resolved: the Instagram Reel for {project_name} IS live — an earlier attempt "
+        "published it but could not confirm it at the time. Nothing was posted twice, and "
+        "FieldKit could not read back the post link, so open the account to see it."
+    )
+
+
+def _not_published_message(project_name: str) -> str:
+    """The confirmation that a quarantined container never went live."""
+    return (
+        f"✅ Resolved: the Instagram Reel for {project_name} was NOT published — Instagram "
+        "confirms the upload never went live. Nothing is on the account, and you can "
+        "safely re-approve this video to try again."
+    )
 
 
 # Appended to any alert about a publish whose outcome is unknown. Kept in one place so the
@@ -801,17 +957,32 @@ def _unresolved_publish_alert(entry: dict) -> str:
 
     The first alert and every re-escalation use this same wording, differing only in the
     check count, so the message never promises follow-up it does not deliver.
+
+    Carries the size of the whole quarantine list when it has grown past
+    _QUARANTINE_BACKLOG_THRESHOLD. One stuck upload and a backlog that has been quietly
+    accumulating for a month produce the same per-entry message otherwise, and they call
+    for very different responses.
     """
     project_name = entry.get("project_name", "unknown")
     container_id = entry.get("container_id", "unknown")
     attempts = entry.get("attempts", 1)
     since = entry.get("recorded_at", "unknown")
+    backlog = len(instagram_state.list_publish_reconciliations())
+    suffix = ""
+    if backlog >= _QUARANTINE_BACKLOG_THRESHOLD:
+        suffix = (
+            f"\n\nNote: {backlog} Instagram uploads are now in this state, the oldest "
+            "since {since}. Each one blocks its own video from being re-approved. Nothing "
+            "is ever dropped from that list, so it will keep growing until the underlying "
+            "problem is fixed — see docs/instagram/README.md."
+        ).format(since=since)
     return (
         f"⚠️ Instagram: the Reel for {project_name} MAY already be live. FieldKit asked "
         f"Instagram to publish it but never learned whether it succeeded, and cannot get "
         f"a definitive answer (container {container_id}).\n"
         f"Checks so far: {attempts}, first unresolved: {since}.\n"
         + _UNRESOLVED_ADVICE
+        + suffix
     )
 
 

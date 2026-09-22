@@ -760,3 +760,110 @@ def test_a_later_tick_resolves_the_quarantine_as_never_published(cron, video):
     assert ig_state.get_pending_upload() is not None
     ig_main([])
     assert ig_state.is_published(_IDEM_KEY) is True
+
+
+# ---------------------------------------------------------------------------
+# The exhausted transition is atomic with the quarantine it requires
+# ---------------------------------------------------------------------------
+#
+# Round 3's quarantine survives mark_failed(), but CREATING it was not atomic with
+# the clear that necessitates it. claim_pending_upload() cleared and fsynced the
+# pending record, returned "exhausted", and only then did the caller quarantine —
+# so a process that died in between left neither a pending job nor an obligation,
+# and the next re-approval could publish a duplicate Reel. Driven here against the
+# REAL state machine, with the caller deliberately prevented from running.
+
+
+def _force_exhausted_with_unresolved_publish():
+    """Leave the pending record one tick away from an exhausted claim, publish unresolved.
+
+    Reproduces the state a process leaves behind when it dies during its final attempt:
+    the attempt budget is spent, and the durable marker plus container id say a publish
+    was asked for and never confirmed.
+    """
+    record = ig_state.get_pending_upload()
+    record["attempt_count"] = 3
+    record["status"] = "pending"
+    record["last_attempt_at"] = "2020-01-01T00:00:00+00:00"
+    record["container_id"] = _CONTAINER_ID
+    record["publish_attempted_at"] = "2026-08-31T14:05:00Z"
+    ig_state.set_pending_upload(record)
+
+
+def test_a_process_that_dies_after_the_exhausted_claim_leaves_the_quarantine_behind(
+    cron, video, mocker
+):
+    """THE round-4 fix, end to end: the entry is durable before the caller gets a turn."""
+    import scripts.upload_instagram as ui
+    _force_exhausted_with_unresolved_publish()
+    # The process dies the instant claim_pending_upload() returns "exhausted".
+    mocker.patch.object(ui, "_handle_exhausted", side_effect=RuntimeError("process killed"))
+
+    with pytest.raises(RuntimeError, match="process killed"):
+        ig_main([])
+
+    assert ig_state.get_pending_upload() is None          # the clear happened
+    assert ig_state.has_unresolved_publish(_IDEM_KEY) is True   # so did the quarantine
+    assert [e["container_id"] for e in ig_state.list_publish_reconciliations()] == [
+        _CONTAINER_ID
+    ]
+
+
+def test_a_re_approval_after_that_death_is_still_refused(cron, video, mocker):
+    """Step 6 of the surviving sequence, now impossible."""
+    import scripts.upload_instagram as ui
+    _force_exhausted_with_unresolved_publish()
+    # The container stays unanswerable, so the block genuinely has to hold rather than
+    # being lifted by a definitive "never published" on the very next tick.
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    mocker.patch.object(ui, "_handle_exhausted", side_effect=RuntimeError("process killed"))
+    with pytest.raises(RuntimeError):
+        ig_main([])
+
+    created_before = ui.instagram_api.create_media_container.call_count
+    published_before = ui.instagram_api.publish_container.call_count
+    approve_main(["--callback-data", "approve"])
+    assert ig_state.get_pending_upload() is None        # nothing re-queued
+
+    # And a later tick cannot turn it into a second Reel either — the quarantine is
+    # still unresolved, so the drain leaves it in place and no job exists to run.
+    ig_main([])
+    assert ui.instagram_api.create_media_container.call_count == created_before
+    assert ui.instagram_api.publish_container.call_count == published_before
+    assert ig_state.has_unresolved_publish(_IDEM_KEY) is True
+
+
+def test_the_next_tick_picks_up_the_orphaned_quarantine_and_resolves_it(cron, video, mocker):
+    """The obligation is not just durable, it is actionable by whatever runs next."""
+    import scripts.upload_instagram as ui
+    _force_exhausted_with_unresolved_publish()
+    handler = mocker.patch.object(
+        ui, "_handle_exhausted", side_effect=RuntimeError("process killed")
+    )
+    with pytest.raises(RuntimeError):
+        ig_main([])
+
+    # A later tick, with the Graph API answering again.
+    handler.side_effect = None
+    ui.instagram_api.get_container_status.side_effect = None
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    ig_main([])
+
+    assert ig_state.list_publish_reconciliations() == []
+    assert ig_state.is_published(_IDEM_KEY) is True
+
+
+def test_an_exhausted_job_that_never_published_stays_re_approvable(cron, video):
+    """The other direction: no publish attempt means no block, so the owner can retry."""
+    record = ig_state.get_pending_upload()
+    record["attempt_count"] = 3
+    record["status"] = "pending"
+    record["last_attempt_at"] = "2020-01-01T00:00:00+00:00"
+    record["container_id"] = _CONTAINER_ID          # built, but never published from
+    ig_state.set_pending_upload(record)
+
+    ig_main([])
+
+    assert ig_state.get_pending_upload() is None
+    assert ig_state.has_unresolved_publish(_IDEM_KEY) is False
+    assert ig_state.list_publish_reconciliations() == []

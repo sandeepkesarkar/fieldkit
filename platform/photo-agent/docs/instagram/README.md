@@ -379,9 +379,56 @@ So an unsettled container is **quarantined durably** in
   permanently; `FINISHED` / `ERROR` / `EXPIRED` → never published, quarantine lifted
   (`IG_RESOLVED`), owner told it is safe to re-approve.
 
+The entry is created **in the same locked state transaction** as the removal that
+makes it necessary — not afterwards by the caller. Every transition that drops a
+pending record without recording a publish (`mark_failed()`, `clear_pending_upload()`,
+and `claim_pending_upload()`'s `exhausted` and `stale_failed` outcomes) quarantines
+first, in one `write()`+`fsync()`. Leaving it to the caller meant a process that died
+between the clear landing on disk and the caller quarantining left neither a job nor
+an obligation, and the next re-approval could publish a duplicate.
+
+The invariant, enforced in `tools/instagram_state.py` rather than by convention at
+call sites: **a pending record carries an unresolved-publish marker
+(`publish_attempted_at`, alongside its `container_id`) if and only if FieldKit asked
+Meta to publish that container and has not since established what happened.**
+`mark_publish_attempted()` sets it before the irreversible call;
+`mark_publish_settled()` clears it when Instagram reports the container as never
+published; `mark_published()` and `record_recovered_publish()` retire any quarantine
+for the key in the same transaction that records the publish, so a resolved obligation
+cannot outlive its own resolution.
+
 This reuses the shape of `pending_share_cleanups` deliberately rather than inventing
 a third mechanism: both are unresolved external obligations that must outlive the
 work that created them.
+
+**The list is never trimmed.** It has no size or age cap, and that is deliberate:
+dropping an entry would release an idempotency key while a Reel's fate is still
+unknown, which is the duplicate the whole mechanism prevents. Growth is the safe
+direction. What it must not be is invisible, so past `_QUARANTINE_BACKLOG_THRESHOLD`
+entries every tick logs the backlog and the per-entry alerts carry the count and the
+age of the oldest.
+
+**If the Page token is removed entirely**, nothing can be asked of Instagram — but the
+entries keep blocking, so that is reported rather than silent: each one alerts (on the
+same daily schedule, without counting as a check that never happened) naming
+`FB_PAGE_ACCESS_TOKEN` as the reason and the reconnect as the fix.
+
+### Resolving a quarantine by hand
+
+Normally you do nothing — the drain resolves entries by itself once Instagram answers.
+If one is stuck because the container has aged out of Meta's view entirely, an operator
+can settle it:
+
+1. Read the list: `pending_publish_reconciliations` in `instagram_state.json`. Each
+   entry names the `project_name`, the `container_id`, and `recorded_at`.
+2. Open the client's Instagram account and look for that project's Reel around
+   `recorded_at`.
+3. If it IS live, nothing needs re-posting — remove the entry.
+4. If it is NOT live, remove the entry; the video can then be re-approved normally.
+
+Edit `instagram_state.json` only while no cron tick is running, and remove entries one
+at a time. Removing one you have not actually checked is the one way back to a
+duplicate Reel.
 
 Note what it does **not** change: `instagram_state.mark_failed()` still discards the
 whole record, mirroring `facebook_state.mark_failed()` exactly (deviation note 1).
@@ -390,12 +437,22 @@ aligned while Instagram still satisfies FR-011.
 
 **Facebook has the same latent exposure, and it is not fixed here.** If
 `facebook_api.upload_video()`'s response is lost, the video may be live with no record
-of it, and a re-approval would post it twice. It cannot be closed the same way: a Page
-video upload is a single call that exposes no handle before it completes, so there is
-nothing to reconcile against afterwards — no container, no client-supplied idempotency
-token. Closing it needs a different mechanism (searching the Page's recent videos, or
-a resumable upload session handle), which is out of scope for this feature and is
-tracked separately rather than left implied by an Instagram-only fix.
+of it, and a re-approval would post it twice.
+
+It cannot be closed the same way **as `facebook_api.py` is currently written**: the
+one-shot multipart POST at `facebook_api.py:174` knows no identifier until the response
+arrives, so there is nothing to reconcile against afterwards and matching the Page's
+recent videos would be a heuristic, not an authority. That is a limitation of this
+implementation, **not of Meta's API** — Meta's sessionized video upload returns both an
+`upload_session_id` and a `video_id` from its `start` phase, before any bytes are
+transferred, which is exactly the durable pre-known handle reconciliation needs. (See
+Meta's official Python Business SDK,
+[`video_uploader.py`](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/video_uploader.py).)
+
+Closing it therefore means moving Facebook onto the sessionized upload, which is out of
+scope for this feature and tracked as an **urgent fast-follow** in issue #78 — the
+exposure predates this change and this PR neither creates nor amplifies it, but Facebook
+is live in production and a duplicate post on a client Page is irreversible.
 
 ### The account a job publishes to
 
