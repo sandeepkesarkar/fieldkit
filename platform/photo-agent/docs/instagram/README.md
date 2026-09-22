@@ -416,12 +416,31 @@ then `fsync`s; a crash mid-write can leave torn or truncated JSON, and an `fsync
 leaves durability indeterminate. So "the entry and the removal reach disk together" is not
 a guarantee this implementation can make, and is not claimed.
 
-What makes that survivable is that **`_read()` fails closed**: malformed JSON raises
-`RuntimeError` rather than silently parsing as defaults. A torn file therefore halts the
-Instagram path loudly — every read and write path raises, and the file is left untouched
-for a human — instead of quietly presenting an empty quarantine list and letting a
-duplicate through. That property is load-bearing for this argument, so it is tested
-directly rather than assumed.
+What makes that survivable is that **`_read()` fails closed** — but that is worth stating
+one shape at a time rather than as a general property, because stating it generally is how
+it was got wrong once already:
+
+| Torn shape | Behaviour |
+|---|---|
+| Malformed / truncated JSON | **fails closed** |
+| Present but zero length | **fails closed** |
+| Parses, but not a JSON object | **fails closed** |
+| Parses as `{}`, or any object with no recognised top-level key | **fails closed** |
+| Absent file | reads as fresh state — *intended*, that is a new client |
+| Parses, carries a recognised key, but is a partial document | **not detected** |
+
+Two things make that table hold. First, `_write()` writes *before* it truncates, so it can
+never shrink a populated file to zero length: killed before the write, the old content is
+wholly intact; killed mid-write, the result is new-prefix + old-tail, which does not parse.
+Second, a file that is created is initialised with the defaults immediately, under the
+lock — otherwise a transaction that declined to commit would leave a zero-length file
+behind, and a legitimate zero-length file would make "present but empty" impossible to
+treat as an anomaly. Both are pinned by tests, because the safety argument rests on them.
+
+The last row is the honest gap: a partial write that happens to parse *and* carry a
+recognised key cannot be detected here. In practice `_write()` emits the whole document in
+one call, so a torn write yields malformed JSON — but that is a property of the write, not
+something the read can verify. Closing it is what issue #79 is for.
 
 Making the write itself crash-atomic needs a write-temp-then-rename protocol, which
 interacts with the `flock` coordination here (replacing the inode invalidates locks held

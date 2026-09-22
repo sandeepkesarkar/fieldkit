@@ -149,20 +149,60 @@ _SHARE_CLEANUP_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
 _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
 
 
+# Every top-level key this module writes. A state file that parses but carries none of
+# them is not a state file — see _read().
+_KNOWN_TOP_LEVEL_KEYS = frozenset(_DEFAULTS)
+
+
 def _read(file_obj) -> dict:
-    """Read and parse instagram_state.json from an open, locked file object."""
+    """Read and parse instagram_state.json from an open, locked file object.
+
+    FAILS CLOSED on anything that is not recognisably this file. That property is
+    load-bearing rather than defensive: pending_publish_reconciliations is what stops a
+    video whose Reel may already be live from being re-approved (FR-011), so a read that
+    quietly produced an EMPTY state would present an empty quarantine and let the
+    duplicate through. Three shapes are refused:
+
+      - present but ZERO LENGTH. An absent file legitimately means a fresh client, but a
+        present empty one cannot arise in normal operation: _write() always writes content
+        before it truncates, and _transaction() initialises a file it creates before
+        yielding, precisely so that nothing leaves a zero-length file behind. (That was not
+        true until this was written — _open_for_write()'s O_CREAT left one whenever a
+        transaction declined to commit, which is exactly why "empty means fresh" was unsafe
+        to assume.) What remains is an external truncation, or a crash in the moment
+        between creating the file and initialising it. Both are better refused than read as
+        "nothing was ever recorded".
+      - not a JSON object.
+      - a JSON object carrying none of this module's top-level keys, which rejects
+        degenerate survivors like `{}` while still accepting a state file written before a
+        newer key existed — absent individual keys fall back to defaults as they always
+        have, so this does not break forward migration.
+
+    NOT detectable here, and deliberately not claimed: a partial write that happens to
+    parse AND carries a recognised key. _write() emits the whole document in one call, so
+    a torn write yields malformed JSON in practice rather than a plausible one — but that
+    is a property of the write, not something this function can verify. See issue #79.
+    """
     file_obj.seek(0)
     content = file_obj.read()
     if not content:
-        # deepcopy, NOT dict(): a shallow copy would alias _DEFAULTS' list values, so any
-        # caller appending to e.g. published_idempotency_keys on an empty/absent state file
-        # would mutate the module-level defaults for the rest of the process.
-        return copy.deepcopy(_DEFAULTS)
+        raise RuntimeError(
+            "instagram_state.json is present but empty — an interrupted write, or a file "
+            "created and never initialised. Refusing to read it as fresh state, which "
+            "would present an empty publish quarantine. If this client has never "
+            "published, delete the file; otherwise restore it."
+        )
     try:
-        return json.loads(content)
+        data = json.loads(content)
     except json.JSONDecodeError as exc:
         logger.warning("instagram_state.json is corrupt: %s", exc)
         raise RuntimeError("instagram_state.json is corrupt — delete or restore it manually") from exc
+    if not isinstance(data, dict) or not (_KNOWN_TOP_LEVEL_KEYS & set(data)):
+        raise RuntimeError(
+            "instagram_state.json parsed but does not look like state (no recognised "
+            "top-level keys) — delete or restore it manually"
+        )
+    return data
 
 
 def _write(file_obj, data: dict) -> None:
@@ -176,9 +216,19 @@ def _write(file_obj, data: dict) -> None:
 
 
 def _open_for_write():
-    """Open instagram_state.json for read+write, creating it if absent."""
-    fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT, 0o644)
-    return os.fdopen(fd_no, "r+")
+    """Open instagram_state.json for read+write. Returns (file, created_by_us).
+
+    O_EXCL rather than plain O_CREAT so the caller can tell a file it just created from
+    one that was already there. _read() refuses a present-but-empty file, so a
+    transaction that creates one has to initialise it rather than read it — and has to do
+    so even if it then declines to commit, or it would leave behind exactly the
+    zero-length file _read() now refuses.
+    """
+    try:
+        fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return os.fdopen(os.open(STATE_FILE, os.O_RDWR, 0o644), "r+"), False
+    return os.fdopen(fd_no, "r+"), True
 
 
 class _Transaction:
@@ -225,19 +275,32 @@ def _transaction():
     and every mutation lands in a single _write() call. It is NOT crash-atomic. _write()
     overwrites and truncates the live file in place, so a crash mid-write can leave torn or
     truncated JSON, and an fsync failure leaves durability indeterminate. What makes that
-    survivable is that _read() FAILS CLOSED: malformed JSON raises RuntimeError rather than
-    silently reading as defaults, so a torn file halts the Instagram path loudly instead of
-    quietly presenting an empty quarantine list and letting a duplicate through. Making the
-    write itself crash-atomic needs a write-temp-then-rename protocol, which interacts with
-    the flock coordination here — replacing the inode invalidates locks held on the old one
-    — and applies equally to facebook_state.py and state.py, which share this write
-    pattern. Tracked as its own issue rather than bolted on here.
+    survivable is that _read() fails closed — on malformed JSON, on a present-but-zero-length
+    file, on JSON that is not an object, and on an object carrying none of this module's
+    keys. It is deliberately NOT claimed in general: a partial write that happens to parse
+    AND carry a recognised key is not detectable there. Read _read() for the shape-by-shape
+    account; asserting this as a general property is how it was got wrong once already.
+
+    Making the write itself crash-atomic needs a write-temp-then-rename protocol, which
+    interacts with the flock coordination here — replacing the inode invalidates locks held
+    on the old one — and applies equally to facebook_state.py and state.py, which share this
+    write pattern. Tracked as issue #79 rather than bolted on here.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _open_for_write() as f:
+    f, created = _open_for_write()
+    with f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
-            data = _read(f)
+            if created:
+                # Initialise immediately, before yielding. A transaction that declines to
+                # commit would otherwise leave the zero-length file it just created, and a
+                # zero-length file is indistinguishable from an interrupted write — so
+                # _read() refuses one. Writing the defaults here is what keeps "present but
+                # empty" a genuine anomaly rather than an ordinary first-run leftover.
+                data = copy.deepcopy(_DEFAULTS)
+                _write(f, data)
+            else:
+                data = _read(f)
             incoming = data.get("pending_instagram_upload")
             incoming = copy.deepcopy(incoming) if incoming is not None else None
             txn = _Transaction(data)
@@ -250,32 +313,63 @@ def _transaction():
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+def _has_open_publish(record: dict | None) -> bool:
+    """True if record is asking an unanswered question about a specific container.
+
+    The obligation is the PAIR — a container id, and a publish attempted against it that
+    has not been settled. Either half alone is not an obligation: a container with no
+    publish attempt cannot have gone live, and a marker with no container names nothing to
+    reconcile. publish_settled_at is what closes it: Instagram reported that very container
+    as never published, so the question has an answer and is no longer open.
+    """
+    if not record:
+        return False
+    return bool(record.get("container_id")) and bool(record.get("publish_attempted_at"))
+
+
 def _preserve_unresolved_obligation(incoming: dict | None, data: dict) -> None:
     """Carry a departing record's unresolved publish into the quarantine list.
 
     Runs on every committed write. `incoming` is the pending record as this transaction
     found it; data["pending_instagram_upload"] is what the transaction is leaving there.
-    Three cases:
 
-      - The same job is still in the slot. It was updated in place, not removed, so
-        whether its marker is still set is the updater's business and nothing is carried.
-      - The job is gone or REPLACED, and its key has since been recorded as published. The
-        question the marker asked has been answered, so any quarantine for that key is
-        retired rather than created.
-      - The job is gone or replaced and its key is not published. If it carried a marker it
-        is quarantined here. Removal and replacement are the same event as far as the
-        obligation is concerned — which is precisely what set_pending_upload() used to miss,
-        since overwriting a record destroys its marker exactly as clearing it does.
+    The question this asks is NOT "is the same key still present" — that was the round-5
+    hole. A record can keep its key and still lose its obligation: set_pending_upload()
+    replacing key 42 (container_A, marker set) with a fresh key 42 (container_id=None, no
+    marker) erased the obligation while looking, to a key comparison, like an in-place
+    update. The question is whether the SPECIFIC OPEN QUESTION the incoming record was
+    asking is still being tracked somewhere. It is, in exactly three cases:
+
+      - the outgoing record is the same job, still holding the same container, and its
+        publish is still open — an ordinary in-place update, nothing has left;
+      - the outgoing record is the same job and same container with the publish SETTLED
+        (publish_settled_at) — Instagram answered, so there is nothing to preserve;
+      - the key has been recorded in published_idempotency_keys — the publish is now a
+        fact, so any quarantine for it is retired rather than created.
+
+    Anything else — removed, replaced, re-keyed, pointed at a different container, or
+    silently stripped of its marker — means the obligation has left the record, and it is
+    quarantined here. Removal, replacement and erasure are the same event as far as the
+    obligation is concerned.
     """
-    if not incoming:
+    if not _has_open_publish(incoming):
         return
     key = incoming.get("idempotency_key")
+    container_id = incoming.get("container_id")
     outgoing = data.get("pending_instagram_upload")
-    if outgoing is not None and outgoing.get("idempotency_key") == key:
+
+    if (
+        outgoing is not None
+        and outgoing.get("idempotency_key") == key
+        and outgoing.get("container_id") == container_id
+        and (_has_open_publish(outgoing) or outgoing.get("publish_settled_at"))
+    ):
         return
+
     if key in data.get("published_idempotency_keys", []):
         _drop_publish_reconciliations_for_key(data, key)
         return
+
     _quarantine_unresolved_in_txn(incoming, data, datetime.now(timezone.utc).isoformat())
 
 
@@ -437,9 +531,9 @@ def _quarantine_unresolved_in_txn(record: dict, data: dict, now: str) -> bool:
     alert; this is what makes the obligation survive when they don't, including at sites
     that do not exist yet.
     """
-    container_id = record.get("container_id")
-    if not container_id or not record.get("publish_attempted_at"):
+    if not _has_open_publish(record):
         return False
+    container_id = record["container_id"]
     added = _add_publish_reconciliation(
         data,
         container_id=container_id,
@@ -576,6 +670,7 @@ def set_container_id(idempotency_key: str, container_id: str) -> None:
     def _update(record, data):
         record["container_id"] = container_id
         record["publish_attempted_at"] = None
+        record["publish_settled_at"] = None
     _update_pending(idempotency_key, _update)
     logger.info("set_container_id: key=%s container_id=%s", idempotency_key, container_id)
 
@@ -604,6 +699,7 @@ def mark_publish_attempted(idempotency_key: str) -> None:
 
     def _update(record, data):
         record["publish_attempted_at"] = now
+        record["publish_settled_at"] = None
     _update_pending(idempotency_key, _update)
     logger.info("mark_publish_attempted: key=%s", idempotency_key)
 
@@ -1034,14 +1130,23 @@ def mark_publish_settled(idempotency_key: str) -> None:
     to drop the record would quarantine it, blocking re-approval of a video Instagram has
     just confirmed was never posted.
 
-    Only the marker is cleared. container_id stays, because it is still the handle for the
-    container this job used and remains useful for debugging and for a retry's own
-    reconciliation.
+    Records the answer rather than merely erasing the question: publish_settled_at is
+    stamped as publish_attempted_at is cleared. That distinction is load-bearing, because
+    _preserve_unresolved_obligation() cannot otherwise tell a legitimate settlement from a
+    mutation that silently stripped the marker off a live record — and treating those the
+    same is how the same-key escape got in. A settlement says so on the record; an erasure
+    does not, and gets quarantined.
+
+    container_id stays, because it is still the handle for the container this job used and
+    remains useful for debugging and for a retry's own reconciliation.
 
     Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
     """
+    now = datetime.now(timezone.utc).isoformat()
+
     def _update(record, data):
         record["publish_attempted_at"] = None
+        record["publish_settled_at"] = now
     _update_pending(idempotency_key, _update)
     logger.info("mark_publish_settled: key=%s", idempotency_key)
 

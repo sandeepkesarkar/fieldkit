@@ -1339,10 +1339,21 @@ def test_no_mutation_entry_point_can_destroy_an_unresolved_obligation(name, vali
     _MUTATORS[name](_marker_bearing(valid_record))
 
     record = ig_state.get_pending_upload()
-    if record is not None and record.get("idempotency_key") == "42":
-        return          # the job is still there; nothing was removed or replaced
+    # "Still there" has to mean the same OPEN QUESTION is still tracked — same job, same
+    # container, publish still open or explicitly settled. Checking only the key was the
+    # round-5 hole: set_pending_upload() could replace key 42 (container_A, marker) with a
+    # fresh key 42 (no container, no marker) and this test would have waved it through.
+    still_tracked = (
+        record is not None
+        and record.get("idempotency_key") == "42"
+        and record.get("container_id") == "container_abc"
+        and (record.get("publish_attempted_at") or record.get("publish_settled_at"))
+    )
+    if still_tracked:
+        return
     assert ig_state.has_unresolved_publish("42") or ig_state.is_published("42"), (
-        f"{name}() removed or replaced a marker-bearing record and lost its obligation"
+        f"{name}() removed, replaced or erased a marker-bearing record and lost its "
+        "obligation"
     )
 
 
@@ -1397,9 +1408,225 @@ def test_a_torn_file_is_not_silently_replaced(valid_record):
     assert ig_state.STATE_FILE.read_text() == _TORN
 
 
-def test_an_empty_state_file_is_not_treated_as_corrupt():
-    """A genuinely empty file is a fresh client, not damage — it must still work."""
-    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ig_state.STATE_FILE.write_text("")
+# --- which torn shapes fail closed, stated one shape at a time ---
+#
+# This replaces a test that asserted the opposite: that a present-but-empty file is
+# "a fresh client, not damage". That was pinning the unsafe behaviour. An ABSENT
+# file means a fresh client; a PRESENT ZERO-LENGTH one cannot arise in normal
+# operation once _transaction() initialises what it creates, so reading it as fresh
+# state would present an empty quarantine and let a duplicate through.
+
+def test_an_absent_state_file_is_fresh_state():
+    """The genuinely-fresh case still works — this is the distinction that matters."""
+    assert ig_state.STATE_FILE.exists() is False
     assert ig_state.get_pending_upload() is None
     assert ig_state.list_publish_reconciliations() == []
+    assert ig_state.has_unresolved_publish("42") is False
+
+
+def test_a_present_but_zero_length_state_file_fails_closed():
+    """The shape the round-5 determination missed."""
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text("")
+    with pytest.raises(RuntimeError, match="present but empty"):
+        ig_state.has_unresolved_publish("42")
+
+
+def test_a_transaction_never_leaves_a_zero_length_file(valid_record):
+    """Removes the one legitimate producer of zero-length files.
+
+    _open_for_write()'s O_CREAT used to leave one behind whenever a transaction declined
+    to commit — mark_failed() against a fresh client was enough. That is what made "empty
+    means fresh" unsafe to assume, and why the next read would have failed closed on a
+    file nothing was wrong with.
+    """
+    ig_state.mark_failed("no-such-key")          # creates the file, commits nothing
+    assert ig_state.STATE_FILE.exists()
+    assert ig_state.STATE_FILE.stat().st_size > 0
+    assert ig_state.get_pending_upload() is None  # and it still reads as fresh state
+
+
+def test_json_that_is_not_an_object_fails_closed():
+    """A list or a bare scalar is not state, however well it parses."""
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text("[1, 2, 3]")
+    with pytest.raises(RuntimeError, match="does not look like state"):
+        ig_state.has_unresolved_publish("42")
+
+
+def test_an_object_with_no_recognised_keys_fails_closed():
+    """`{}` parses and would otherwise present an EMPTY quarantine — the exact hazard."""
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text("{}")
+    with pytest.raises(RuntimeError, match="does not look like state"):
+        ig_state.has_unresolved_publish("42")
+
+
+def test_a_state_file_missing_only_newer_keys_still_loads():
+    """Forward migration must not be collateral damage from the shape check.
+
+    A file written before pending_publish_reconciliations existed carries the older keys
+    and none of the new one. It has to keep working — absent individual keys fall back to
+    defaults, as they always have.
+    """
+    import json
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text(json.dumps({
+        "pending_instagram_upload": None,
+        "published_idempotency_keys": ["7"],
+        "published_history": [],
+    }))
+    assert ig_state.is_published("7") is True
+    assert ig_state.list_publish_reconciliations() == []
+    assert ig_state.has_unresolved_publish("7") is False
+
+
+def test_a_write_truncates_only_after_writing():
+    """Why a torn write yields malformed JSON rather than a plausible one.
+
+    _write() does seek -> write -> truncate, so a process killed before the write leaves
+    the previous content wholly intact and one killed mid-write leaves new-prefix +
+    old-tail, which does not parse. It can never shrink a populated file to zero. That
+    ordering is load-bearing for the fail-closed argument, so it is pinned here rather
+    than left as a comment.
+    """
+    import inspect
+    body = inspect.getsource(ig_state._write)
+    assert body.index("seek(0)") < body.index("write(content)") < body.index("truncate()")
+
+
+# ---------------------------------------------------------------------------
+# The chokepoint, over a GENERATED matrix of transitions
+# ---------------------------------------------------------------------------
+#
+# Round 5's guards were derived — the mutator table came from the module, the
+# write-path check came from the AST — but the SCENARIOS were still hand-chosen,
+# and every hand-chosen set_pending_upload case replaced key 42 with key 99. So
+# the different-key path was covered and the same-key path was not, and the
+# derivation did not save us.
+#
+# This enumerates the input space instead of sampling it: every combination of
+# what the transaction found and what it is leaving behind. A shape nobody thought
+# of is covered because it is generated, not because it was remembered.
+
+_OPEN = {"container_id": "container_A", "publish_attempted_at": "2026-08-31T14:05:00Z"}
+
+
+def _rec(key="42", container=..., attempted=None, settled=None):
+    r = {"idempotency_key": key}
+    if container is not ...:
+        r["container_id"] = container
+    if attempted:
+        r["publish_attempted_at"] = attempted
+    if settled:
+        r["publish_settled_at"] = settled
+    return r
+
+
+# What the transaction FOUND in the pending slot.
+_INCOMING = {
+    "open_publish": _rec(container="container_A", attempted="T1"),
+    "container_but_no_attempt": _rec(container="container_A"),
+    "attempt_but_no_container": _rec(container=None, attempted="T1"),
+    "bare": _rec(container=None),
+    "absent": None,
+}
+
+# What the transaction is LEAVING in the pending slot.
+_OUTGOING = {
+    "removed": None,
+    "same_job_still_open": _rec(container="container_A", attempted="T1"),
+    "same_job_settled": _rec(container="container_A", settled="T2"),
+    "same_job_marker_erased": _rec(container="container_A"),
+    "same_key_container_dropped": _rec(container=None),
+    "same_key_different_container": _rec(container="container_B"),
+    "different_key": _rec(key="99", container=None),
+    "different_key_own_open_publish": _rec(key="99", container="container_Z", attempted="T1"),
+}
+
+
+def _obligation_was_answered(incoming, outgoing, published):
+    """Domain oracle: was the question the incoming record asked actually ANSWERED?
+
+    Three answers exist, and nothing else counts. The publish became a recorded fact;
+    Instagram reported that specific container as never published (a settlement, stamped
+    on the record); or the record still carries that same container with the question
+    still open, so nothing has left and there is nothing yet to preserve.
+    """
+    if published:
+        return True
+    if outgoing is None:
+        return False
+    if outgoing.get("idempotency_key") != incoming.get("idempotency_key"):
+        return False
+    if outgoing.get("container_id") != incoming.get("container_id"):
+        return False
+    return bool(outgoing.get("publish_attempted_at") or outgoing.get("publish_settled_at"))
+
+
+@pytest.mark.parametrize("published", [False, True])
+@pytest.mark.parametrize("out_name", sorted(_OUTGOING))
+@pytest.mark.parametrize("in_name", sorted(_INCOMING))
+def test_the_chokepoint_preserves_every_unanswered_obligation(in_name, out_name, published):
+    """Across the whole generated matrix: an unanswered obligation is never lost."""
+    import copy as _copy
+    incoming = _copy.deepcopy(_INCOMING[in_name])
+    data = {
+        "pending_instagram_upload": _copy.deepcopy(_OUTGOING[out_name]),
+        "published_idempotency_keys": ["42"] if published else [],
+        "pending_publish_reconciliations": [],
+    }
+
+    ig_state._preserve_unresolved_obligation(incoming, data)
+    quarantined = [e["container_id"] for e in data["pending_publish_reconciliations"]]
+
+    had_open_question = bool(
+        incoming
+        and incoming.get("container_id")
+        and incoming.get("publish_attempted_at")
+    )
+    if not had_open_question:
+        assert quarantined == [], f"{in_name}->{out_name}: quarantined with no open question"
+        return
+    if _obligation_was_answered(incoming, data["pending_instagram_upload"], published):
+        assert quarantined == [], f"{in_name}->{out_name}: quarantined an answered question"
+    else:
+        assert quarantined == ["container_A"], (
+            f"{in_name}->{out_name} (published={published}): the open question about "
+            "container_A was lost"
+        )
+
+
+def test_the_matrix_actually_contains_the_shapes_that_were_missed():
+    """Guards the generator itself: coverage claims are worthless if the cases are absent.
+
+    Both historic escapes must be in the matrix by construction — the round-4 different-key
+    replacement, and the round-5 same-key replacement that dropped the container.
+    """
+    assert _OUTGOING["different_key"]["idempotency_key"] != "42"
+    same_key_erasures = [
+        name for name, rec in _OUTGOING.items()
+        if rec is not None
+        and rec.get("idempotency_key") == "42"
+        and not (rec.get("publish_attempted_at") or rec.get("publish_settled_at"))
+    ]
+    assert "same_key_container_dropped" in same_key_erasures
+    assert "same_job_marker_erased" in same_key_erasures
+
+
+def test_a_settlement_is_distinguishable_from_an_erasure():
+    """The distinction the same-key fix rests on, asserted directly.
+
+    Both leave a same-key, same-container record with no open marker. Only one of them
+    recorded an answer, and only the other may be quarantined.
+    """
+    import copy as _copy
+    for out_name, expect_quarantine in (("same_job_settled", False),
+                                        ("same_job_marker_erased", True)):
+        data = {
+            "pending_instagram_upload": _copy.deepcopy(_OUTGOING[out_name]),
+            "published_idempotency_keys": [],
+            "pending_publish_reconciliations": [],
+        }
+        ig_state._preserve_unresolved_obligation(_copy.deepcopy(_INCOMING["open_publish"]), data)
+        assert bool(data["pending_publish_reconciliations"]) is expect_quarantine, out_name

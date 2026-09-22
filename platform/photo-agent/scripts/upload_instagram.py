@@ -433,10 +433,15 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
                     "project=%s container_id=%s", project_name, prior_container_id,
                 )
                 container_id = prior_container_id
-                # FINISHED is Instagram's own word for "ingested, NOT published". That is
-                # authoritative, so whatever an earlier attempt may have tried, nothing was
-                # published from this container and there is no unknown left to carry.
-                publish_attempted = False
+            # FINISHED ("reusable") and ERROR/EXPIRED ("restart") are all Instagram saying
+            # this container did NOT publish. That is authoritative, so the open question is
+            # settled — durably, not just in this function's local flag. Recording it is
+            # what lets the record later be pointed at a fresh container, or dropped, without
+            # instagram_state's chokepoint quarantining a container Instagram has already
+            # cleared; an erased marker and a settled one are deliberately not the same thing
+            # there. (The "published" case returned above and needs no settlement.)
+            instagram_state.mark_publish_settled(idem_key)
+            publish_attempted = False
 
         if container_id is None:
             if not Path(video_path).exists():

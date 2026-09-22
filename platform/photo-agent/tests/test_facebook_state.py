@@ -650,3 +650,62 @@ def test_has_outstanding_job_false_for_a_different_key(valid_record):
     """A pending job under another key says nothing about this one."""
     fb_state.set_pending_upload(valid_record)
     assert fb_state.has_outstanding_job("999") is False
+
+
+# ---------------------------------------------------------------------------
+# Torn or truncated state fails CLOSED (mirrors tools/instagram_state.py)
+# ---------------------------------------------------------------------------
+#
+# Applied here because facebook_state.py shares instagram_state.py's in-place write
+# pattern, and the same misreading applies: an ABSENT file means a fresh client, but
+# a PRESENT ZERO-LENGTH one cannot arise in normal operation. Reading one as fresh
+# state would silently discard published_idempotency_keys — the list that stops a
+# re-approval from posting the same video to the Page twice.
+
+def test_an_absent_state_file_is_fresh_state():
+    """The genuinely-fresh case still works."""
+    assert fb_state.STATE_FILE.exists() is False
+    assert fb_state.get_pending_upload() is None
+    assert fb_state.is_published("42") is False
+
+
+def test_a_present_but_zero_length_state_file_fails_closed():
+    fb_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fb_state.STATE_FILE.write_text("")
+    with pytest.raises(RuntimeError, match="present but empty"):
+        fb_state.is_published("42")
+
+
+def test_malformed_json_fails_closed():
+    fb_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fb_state.STATE_FILE.write_text('{"pending_facebook_upload": {"idem')
+    with pytest.raises(RuntimeError, match="corrupt"):
+        fb_state.is_published("42")
+
+
+def test_an_object_with_no_recognised_keys_fails_closed():
+    """`{}` parses and would otherwise present an empty published-keys list."""
+    fb_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fb_state.STATE_FILE.write_text("{}")
+    with pytest.raises(RuntimeError, match="does not look like state"):
+        fb_state.is_published("42")
+
+
+def test_a_state_file_missing_only_newer_keys_still_loads():
+    """Forward migration is not collateral damage from the shape check."""
+    fb_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fb_state.STATE_FILE.write_text(json.dumps({"published_idempotency_keys": ["7"]}))
+    assert fb_state.is_published("7") is True
+    assert fb_state.get_pending_upload() is None
+
+
+def test_a_declining_writer_never_leaves_a_zero_length_file():
+    """The one legitimate producer of zero-length files, removed here too.
+
+    _open_for_write()'s O_CREAT used to leave one whenever a caller took the lock and
+    then decided not to write — mark_failed() against a fresh client is enough.
+    """
+    fb_state.mark_failed("no-such-key")
+    assert fb_state.STATE_FILE.exists()
+    assert fb_state.STATE_FILE.stat().st_size > 0
+    assert fb_state.get_pending_upload() is None
