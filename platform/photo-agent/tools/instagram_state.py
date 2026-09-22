@@ -40,6 +40,27 @@ Read _transaction()'s docstring before adding a mutator — including what "atom
 does and does not mean for the state file, which is written in place and is
 therefore not crash-atomic, only fail-closed on read.
 
+Two boundaries are worth knowing before changing anything here.
+
+TRUST BOUNDARY. set_pending_upload() is the only function that writes a pending
+record wholesale, and it is therefore the only place a caller can put arbitrary
+fields into state. It refuses publish_attempted_at and publish_settled_at
+(_PROVENANCE_KEYS), because those record what META did and the logic downstream
+reads them as proof. Before that refusal existed, a caller could supply
+publish_settled_at itself and _preserve_unresolved_obligation() would accept it as
+an answer, releasing an unresolved publish with no Meta involvement at all.
+
+VERIFICATION BOUNDARY. Several guarantees here are enforced by tests that parse
+THIS FILE's source — that _write() is called from one place, that the settlement
+stamp is written by three named transitions, that the module defines no class
+other than _Transaction. Those scans are scope-aware: module level, functions,
+nested functions, classes, methods and lambdas. They were not always — an earlier
+version inspected only top-level statements, so a method on a module-level class
+could call _write() directly and every guard stayed green. They still cannot see
+anything outside this file, so a caller in another module that misuses a public
+verb is beyond them; tests/test_upload_instagram.py pins the permitted call sites
+for the verbs that assert Meta answered.
+
 container_id is Instagram-specific and has no Facebook counterpart: the Graph
 API's video publish is a two-phase create-container → publish flow, so an
 attempt has an intermediate server-side handle. It SURVIVES across attempts, and
@@ -121,6 +142,15 @@ _REQUIRED_UPLOAD_KEYS = frozenset({
     "container_id",
     "ig_post_id",
 })
+
+# Fields that assert something about what META did, and are therefore NOT the caller's to
+# supply. Only this module writes them, and only from a transition that has actually
+# established the fact: mark_publish_attempted() before the irreversible call,
+# mark_publish_settled() after a definitive status. set_pending_upload() REFUSES a record
+# carrying either — see its docstring. Without that refusal the whole
+# settled-versus-erased distinction collapses, because a caller could simply write the
+# answer itself and _preserve_unresolved_obligation() would believe it.
+_PROVENANCE_KEYS = frozenset({"publish_attempted_at", "publish_settled_at"})
 
 _DEFAULTS = {
     "pending_instagram_upload": None,
@@ -223,6 +253,14 @@ def _open_for_write():
     transaction that creates one has to initialise it rather than read it — and has to do
     so even if it then declines to commit, or it would leave behind exactly the
     zero-length file _read() now refuses.
+
+    Known, accepted first-run race: the new inode becomes visible between the O_EXCL
+    creation and _transaction() taking its first flock. Another process can open it and
+    win the lock in that window, find it zero length, and fail closed. That is a
+    TRANSIENT FIRST-RUN ERROR on a brand-new client — not lost state and not a duplicate
+    publish — and it self-heals on the next tick, once the creating process has written
+    the defaults. Recorded here so the next reader recognises it as a startup race rather
+    than mistaking it for corruption.
     """
     try:
         fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
@@ -391,12 +429,33 @@ def get_pending_upload() -> dict | None:
 def set_pending_upload(record: dict) -> None:
     """Write the pending InstagramUploadJob.
 
-    Raises ValueError on missing keys or on an idempotency_key that has already
-    been published (the duplicate-post guard behind FR-011/SC-006).
+    The record-ingress API, and therefore a TRUST BOUNDARY: everything downstream that
+    reasons about a job's publish state reads fields that arrive through here. It refuses
+    a record carrying publish_attempted_at or publish_settled_at, because those are this
+    module's account of what Meta did and not a caller's to assert (see _PROVENANCE_KEYS).
+
+    Raises ValueError on missing keys, on a caller-supplied provenance field, on an
+    idempotency_key that has already been published, and on one whose publish is still
+    unresolved (the duplicate-post guards behind FR-011/SC-006).
     """
     missing = _REQUIRED_UPLOAD_KEYS - set(record.keys())
     if missing:
         raise ValueError(f"set_pending_upload: missing required keys: {missing}")
+    # Provenance, not validation. publish_attempted_at and publish_settled_at are this
+    # module's record of what Meta did; a caller supplying either is asserting a fact it
+    # has no standing to assert. That matters because
+    # _preserve_unresolved_obligation() reads publish_settled_at as proof the question was
+    # answered — so accepting one here would let any caller forge an answer and quietly
+    # release an unresolved publish. The sanctioned route is mark_publish_attempted() /
+    # mark_publish_settled(), each of which writes the field only from a transition that
+    # actually established the fact.
+    forged = _PROVENANCE_KEYS & set(record)
+    if forged:
+        raise ValueError(
+            f"set_pending_upload: {sorted(forged)} may not be supplied by a caller — "
+            "these record what Meta did and are written only by mark_publish_attempted() "
+            "and mark_publish_settled()"
+        )
     with _transaction() as txn:
         data = txn.data
         key = record["idempotency_key"]

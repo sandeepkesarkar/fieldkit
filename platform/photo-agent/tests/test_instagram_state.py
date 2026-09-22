@@ -988,19 +988,24 @@ def test_mark_publish_attempted_ignores_a_mismatched_key(valid_record):
 # cooperation whatsoever. That is the point: if the guarantee needed a caller to
 # follow up, it would not be a guarantee.
 
-def _unresolved_record(valid_record, attempts=3):
-    """A record that asked Meta to publish and never found out what happened."""
-    return dict(
-        valid_record,
-        attempt_count=attempts,
-        container_id="container_abc",
-        publish_attempted_at="2026-08-31T14:05:00Z",
+def _store_unresolved(valid_record, attempts=3, key="42", container="container_abc"):
+    """Store a job that asked Meta to publish and never found out what happened.
+
+    Drives the REAL transitions rather than fabricating the fields. Not merely tidier:
+    set_pending_upload() now refuses a caller-supplied publish_attempted_at, because a
+    record whose provenance fields came from the caller proves nothing about what Meta
+    did. Building the state the way production builds it is the only way to reach it.
+    """
+    ig_state.set_pending_upload(
+        dict(valid_record, idempotency_key=key, attempt_count=attempts)
     )
+    ig_state.set_container_id(key, container)
+    ig_state.mark_publish_attempted(key)
 
 
 def test_the_exhausted_transition_quarantines_in_the_same_transaction(valid_record):
     """THE round-4 fix: the entry exists the instant "exhausted" is returned."""
-    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _store_unresolved(valid_record)
     assert _claim("42") == "exhausted"
     # No caller has run. The obligation is already durable.
     assert ig_state.get_pending_upload() is None
@@ -1015,7 +1020,7 @@ def test_a_crash_right_after_the_exhausted_claim_still_blocks_re_approval(valid_
     else happening — the state file is all that is left, and it must already refuse the
     re-approval on its own.
     """
-    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _store_unresolved(valid_record)
     _claim("42")
     with pytest.raises(ValueError, match="unresolved publish"):
         ig_state.set_pending_upload(valid_record)
@@ -1027,7 +1032,7 @@ def test_the_exhausted_quarantine_starts_unchecked_and_unannounced(valid_record)
     Stamping it as already-alerted would mean a crash here bought 24 hours of silence
     about a Reel that may be live.
     """
-    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _store_unresolved(valid_record)
     _claim("42")
     entry = ig_state.list_publish_reconciliations()[0]
     assert entry["attempts"] == 0
@@ -1048,7 +1053,7 @@ def test_an_exhausted_job_that_never_published_is_not_quarantined(valid_record):
 
 def test_a_stale_failed_record_is_quarantined_too(valid_record):
     """Same class of transition, same guarantee — found by looking, not by a later review."""
-    ig_state.set_pending_upload(_unresolved_record(valid_record, attempts=0))
+    _store_unresolved(valid_record, attempts=0)
     import json
     raw = json.loads(ig_state.STATE_FILE.read_text())
     raw["pending_instagram_upload"]["status"] = "failed"
@@ -1059,7 +1064,7 @@ def test_a_stale_failed_record_is_quarantined_too(valid_record):
 
 def test_mark_failed_quarantines_without_caller_cooperation(valid_record):
     """The round-3 call-site convention is now a backstop, not the mechanism."""
-    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _store_unresolved(valid_record)
     ig_state.mark_failed("42")
     assert ig_state.get_pending_upload() is None
     assert ig_state.has_unresolved_publish("42") is True
@@ -1067,7 +1072,7 @@ def test_mark_failed_quarantines_without_caller_cooperation(valid_record):
 
 def test_clear_pending_upload_quarantines_too(valid_record):
     """Nothing calls this today — which is exactly why the guarantee belongs in the module."""
-    ig_state.set_pending_upload(_unresolved_record(valid_record))
+    _store_unresolved(valid_record)
     assert ig_state.clear_pending_upload("42") is True
     assert ig_state.has_unresolved_publish("42") is True
 
@@ -1076,7 +1081,7 @@ def test_a_published_key_is_not_quarantined_on_a_stale_claim(valid_record):
     """Deliberately exempt: the key is already retired, so there is no duplicate to prevent."""
     ig_state.set_pending_upload(valid_record)
     ig_state.mark_published("42", "ig_post_1")
-    ig_state.set_pending_upload(dict(_unresolved_record(valid_record), idempotency_key="99"))
+    _store_unresolved(valid_record, key="99")
     import json
     raw = json.loads(ig_state.STATE_FILE.read_text())
     raw["pending_instagram_upload"]["idempotency_key"] = "42"
@@ -1093,7 +1098,7 @@ def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_recor
     Without clearing the marker, the safety net in mark_failed() would quarantine a video
     Instagram has just confirmed was never posted — trading one failure mode for another.
     """
-    ig_state.set_pending_upload(_unresolved_record(valid_record, attempts=0))
+    _store_unresolved(valid_record, attempts=0)
     ig_state.mark_publish_settled("42")
     ig_state.mark_failed("42")
     assert ig_state.list_publish_reconciliations() == []
@@ -1102,7 +1107,7 @@ def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_recor
 
 def test_mark_publish_settled_keeps_the_container_id(valid_record):
     """Only the open question is closed; the handle stays for debugging and retries."""
-    ig_state.set_pending_upload(_unresolved_record(valid_record, attempts=0))
+    _store_unresolved(valid_record, attempts=0)
     ig_state.mark_publish_settled("42")
     record = ig_state.get_pending_upload()
     assert record["publish_attempted_at"] is None
@@ -1185,10 +1190,7 @@ def test_overwriting_a_marker_bearing_record_preserves_its_obligation(valid_reco
     Overwriting is as much a removal as clearing is. This was the fourth instance of the
     class, and the reason the guarantee stopped being per-site.
     """
-    job_a = dict(
-        valid_record, container_id="container_A", publish_attempted_at="2026-08-31T14:05:00Z"
-    )
-    ig_state.set_pending_upload(job_a)
+    _store_unresolved(valid_record, container="container_A")
     ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
 
     assert ig_state.get_pending_upload()["idempotency_key"] == "99"
@@ -1203,22 +1205,17 @@ def test_the_overwriting_job_is_accepted_not_refused(valid_record):
     no duplicate risk of its own, and quarantining A loses nothing while blocking exactly
     the key that needs blocking.
     """
-    ig_state.set_pending_upload(
-        dict(valid_record, container_id="container_A", publish_attempted_at="2026-08-31T14:05:00Z")
-    )
+    _store_unresolved(valid_record, container="container_A")
     ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
     assert ig_state.has_unresolved_publish("99") is False
 
 
 def test_the_overwritten_job_cannot_be_re_approved(valid_record):
     """And the block that matters actually holds."""
-    job_a = dict(
-        valid_record, container_id="container_A", publish_attempted_at="2026-08-31T14:05:00Z"
-    )
-    ig_state.set_pending_upload(job_a)
+    _store_unresolved(valid_record, container="container_A")
     ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
     with pytest.raises(ValueError, match="unresolved publish"):
-        ig_state.set_pending_upload(job_a)
+        ig_state.set_pending_upload(valid_record)
 
 
 def test_overwriting_a_record_with_no_marker_quarantines_nothing(valid_record):
@@ -1230,55 +1227,157 @@ def test_overwriting_a_record_with_no_marker_quarantines_nothing(valid_record):
 
 # --- structural: every write really does go through the one chokepoint ---
 
-def _module_functions_calling(name):
-    """Return the names of module-level functions whose body calls `name`."""
+def _scope_visitor(on_call=None, on_store=None):
+    """Build a NodeVisitor that tracks the full scope path through every kind of scope.
+
+    Module level, functions, nested functions, CLASSES, methods and lambdas. The scan it
+    replaces walked only `tree.body`, so a module-level class — an ast.ClassDef, not a
+    FunctionDef — was skipped entirely, and with it every method inside. A reviewer built a
+    class whose method opened the state file and called _write() directly, bypassing
+    _transaction() and destroying an obligation, and all three "exactly one place" guards
+    stayed green.
+    """
+    import ast
+
+    scopes = []
+
+    class _Visitor(ast.NodeVisitor):
+        def _scoped(self, node, label):
+            scopes.append(label)
+            self.generic_visit(node)
+            scopes.pop()
+
+        def visit_FunctionDef(self, node):
+            self._scoped(node, node.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):
+            self._scoped(node, node.name)
+
+        def visit_Lambda(self, node):
+            self._scoped(node, "<lambda>")
+
+        def visit_Call(self, node):
+            if on_call:
+                on_call(node, tuple(scopes) if scopes else ("<module>",))
+            self.generic_visit(node)
+
+        def visit_Subscript(self, node):
+            if on_store:
+                on_store(node, tuple(scopes) if scopes else ("<module>",))
+            self.generic_visit(node)
+
+    return _Visitor()
+
+
+def _call_scopes(name):
+    """Full scope path of EVERY call to `name` anywhere in the module.
+
+    Returns a set of tuples, e.g. {("_transaction",)} — or {("_RogueMutator", "wipe")} for
+    a bypass hidden in a class, which is exactly what the previous scan could not see.
+    """
     import ast
     import inspect
-    tree = ast.parse(inspect.getsource(ig_state))
-    out = set()
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        for call in ast.walk(node):
-            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == name:
-                out.add(node.name)
-    return out
+
+    found = set()
+
+    def _on_call(node, path):
+        func = node.func
+        if (isinstance(func, ast.Name) and func.id == name) or (
+            isinstance(func, ast.Attribute) and func.attr == name
+        ):
+            found.add(path)
+
+    _scope_visitor(on_call=_on_call).visit(ast.parse(inspect.getsource(ig_state)))
+    return found
+
+
+def _module_functions_calling(name):
+    """Outermost enclosing function for each call to `name`, anywhere in the module."""
+    return {path[0] for path in _call_scopes(name)}
 
 
 def test_the_state_file_is_written_from_exactly_one_place():
     """The structural claim, checked against the source rather than asserted in prose.
 
     If a future mutator calls _write() directly it bypasses
-    _preserve_unresolved_obligation() entirely — silently, and in exactly the way four
-    previous ones did. This is the test that makes that impossible to do by accident.
+    _preserve_unresolved_obligation() entirely. Asserted on full SCOPE PATHS, so a method
+    on a class is named rather than skipped — the earlier top-level-only scan let exactly
+    that through, and a reviewer demonstrated it.
     """
-    assert _module_functions_calling("_write") == {"_transaction"}
+    assert _call_scopes("_write") == {("_transaction",)}
 
 
 def test_the_state_file_is_opened_for_writing_from_exactly_one_place():
     """Same reasoning one level down: no mutator may take the exclusive lock on its own."""
-    assert _module_functions_calling("_open_for_write") == {"_transaction"}
+    assert _call_scopes("_open_for_write") == {("_transaction",)}
 
 
 def test_the_obligation_check_runs_from_exactly_one_place():
-    """_quarantine_unresolved_in_txn() is the chokepoint's implementation, not a helper.
-
-    Per-site calls are what enumeration kept getting wrong, so there are none left.
-    """
-    assert _module_functions_calling("_quarantine_unresolved_in_txn") == {
-        "_preserve_unresolved_obligation"
+    """_quarantine_unresolved_in_txn() is the chokepoint's implementation, not a helper."""
+    assert _call_scopes("_quarantine_unresolved_in_txn") == {
+        ("_preserve_unresolved_obligation",)
     }
+
+
+def test_the_unresolved_lookup_runs_only_where_it_is_meant_to():
+    """Closes the asymmetry: this helper had no call-site guard while its neighbours did.
+
+    _unresolved_publish_entry() reads already-locked data and mutates nothing, so a stray
+    call cannot corrupt state — but it is the lookup the ingress refusal depends on, and
+    leaving it unguarded meant the module's defence-in-depth stopped one function short of
+    where the reasoning does.
+    """
+    assert _call_scopes("_unresolved_publish_entry") == {
+        ("set_pending_upload",),
+        ("has_unresolved_publish",),
+    }
+
+
+def test_the_settlement_stamp_is_written_from_exactly_one_place():
+    """Provenance, checked structurally rather than trusted.
+
+    _preserve_unresolved_obligation() reads publish_settled_at as proof Meta answered.
+    That is sound only while the field's provenance is guaranteed: set_pending_upload()
+    refuses a caller-supplied stamp, and this is the other half — catching a future site
+    that writes one internally without having established the fact.
+    """
+    import ast
+    import inspect
+
+    writers = set()
+
+    def _on_store(node, path):
+        key = getattr(node.slice, "value", None)
+        if key == "publish_settled_at" and isinstance(getattr(node, "ctx", None), ast.Store):
+            writers.add(path[0])
+
+    _scope_visitor(on_store=_on_store).visit(ast.parse(inspect.getsource(ig_state)))
+    # mark_publish_settled stamps it; the two that invalidate a stale stamp clear it.
+    assert writers == {"mark_publish_settled", "mark_publish_attempted", "set_container_id"}
+
+
+def test_the_module_defines_no_unexpected_classes():
+    """Names the verification boundary instead of leaving it to be inferred.
+
+    The scope-path scan now covers methods, but a class is still where a bypass would most
+    plausibly hide, so its presence is asserted directly. _Transaction is the only one and
+    holds no state-file logic of its own.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(ig_state))
+    classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    assert classes == {"_Transaction"}
 
 
 # --- mechanical: the invariant holds across EVERY mutation entry point ---
 
-def _marker_bearing(valid_record):
-    return dict(
-        valid_record,
-        attempt_count=1,
-        container_id="container_abc",
-        publish_attempted_at="2026-08-31T14:05:00Z",
-    )
+def _store_marker_bearing(valid_record):
+    """Put a job with an open, genuinely-recorded publish into state (see _store_unresolved)."""
+    _store_unresolved(valid_record, attempts=1)
 
 
 # Every public function that can change the state file, with a call that exercises it
@@ -1327,33 +1426,55 @@ def test_every_mutating_entry_point_is_covered_by_the_invariant_test():
     )
 
 
-@pytest.mark.parametrize("name", sorted(_MUTATORS))
-def test_no_mutation_entry_point_can_destroy_an_unresolved_obligation(name, valid_record):
-    """THE invariant, asserted against every mutator rather than the ones I remembered.
+# Mutators that legitimately DISCHARGE an obligation, because invoking one IS the act of
+# recording an answer. Ground truth for the test below comes from this list — from what the
+# test knows it called — never from a field on the record. mark_published() and
+# record_recovered_publish() need no entry: they retire the key, which is_published()
+# observes independently.
+_ANSWER_ASSERTING = {"mark_publish_settled"}
 
-    If a call removes or replaces a record that carried an unresolved publish, the
-    obligation must survive — either as a quarantine entry, or as a retired idempotency
-    key, which answers the question permanently. Nothing may simply make it disappear.
+
+@pytest.mark.parametrize("meta_answered", [False, True])
+@pytest.mark.parametrize("name", sorted(_MUTATORS))
+def test_no_mutation_entry_point_can_destroy_an_unresolved_obligation(
+    name, meta_answered, valid_record
+):
+    """THE invariant, over every mutator, against REACHED state and unfabricatable truth.
+
+    Two things separate this from a matrix of hand-built dicts. The starting state is built
+    by driving the real transitions, so it is a state the module can actually produce —
+    set_pending_upload() would refuse a fabricated one. And "was it answered?" is decided by
+    what THIS TEST did: whether it performed a settlement, or invoked a verb that is itself
+    an answer. It never reads publish_settled_at, the field the implementation consults, so
+    if the implementation's trust in that field were misplaced this test would not move
+    with it.
+
+    That is the round-7 correction. The previous version accepted publish_settled_at on the
+    record as evidence — precisely the assumption under test — so a forged stamp satisfied
+    the oracle by construction. Verified: a mutator injected to discharge the obligation by
+    fabricating a stamp fails this version and passes the previous one.
     """
-    ig_state.set_pending_upload(_marker_bearing(valid_record))
-    _MUTATORS[name](_marker_bearing(valid_record))
+    _store_marker_bearing(valid_record)
+    if meta_answered:
+        ig_state.mark_publish_settled("42")          # the TEST performed the settlement
+
+    _MUTATORS[name](valid_record)
+
+    if meta_answered or name in _ANSWER_ASSERTING or ig_state.is_published("42"):
+        return                                        # genuinely answered; nothing owed
 
     record = ig_state.get_pending_upload()
-    # "Still there" has to mean the same OPEN QUESTION is still tracked — same job, same
-    # container, publish still open or explicitly settled. Checking only the key was the
-    # round-5 hole: set_pending_upload() could replace key 42 (container_A, marker) with a
-    # fresh key 42 (no container, no marker) and this test would have waved it through.
-    still_tracked = (
+    still_open_on_the_record = (
         record is not None
         and record.get("idempotency_key") == "42"
         and record.get("container_id") == "container_abc"
-        and (record.get("publish_attempted_at") or record.get("publish_settled_at"))
+        and record.get("publish_attempted_at")
     )
-    if still_tracked:
+    if still_open_on_the_record:
         return
-    assert ig_state.has_unresolved_publish("42") or ig_state.is_published("42"), (
-        f"{name}() removed, replaced or erased a marker-bearing record and lost its "
-        "obligation"
+    assert ig_state.has_unresolved_publish("42"), (
+        f"{name}() removed, replaced or erased a record whose publish was still open, "
+        "and the obligation did not survive anywhere"
     )
 
 
@@ -1533,27 +1654,38 @@ _INCOMING = {
 }
 
 # What the transaction is LEAVING in the pending slot.
+# Each paired with GROUND TRUTH: whether Meta actually answered. Declared HERE by the
+# fixture, never read back off the record. That is the round-7 correction — the previous
+# oracle decided "was it answered?" by looking at outgoing["publish_settled_at"], the very
+# field the implementation uses to decide the same thing, so the matrix agreed with the
+# implementation by construction and could not falsify it.
 _OUTGOING = {
-    "removed": None,
-    "same_job_still_open": _rec(container="container_A", attempted="T1"),
-    "same_job_settled": _rec(container="container_A", settled="T2"),
-    "same_job_marker_erased": _rec(container="container_A"),
-    "same_key_container_dropped": _rec(container=None),
-    "same_key_different_container": _rec(container="container_B"),
-    "different_key": _rec(key="99", container=None),
-    "different_key_own_open_publish": _rec(key="99", container="container_Z", attempted="T1"),
+    "removed": (None, False),
+    "same_job_still_open": (_rec(container="container_A", attempted="T1"), False),
+    "same_job_settled": (_rec(container="container_A", settled="T2"), True),
+    "same_job_marker_erased": (_rec(container="container_A"), False),
+    "same_key_container_dropped": (_rec(container=None), False),
+    "same_key_different_container": (_rec(container="container_B"), False),
+    "different_key": (_rec(key="99", container=None), False),
+    "different_key_own_open_publish": (
+        _rec(key="99", container="container_Z", attempted="T1"), False
+    ),
 }
 
 
-def _obligation_was_answered(incoming, outgoing, published):
+def _obligation_was_answered(incoming, outgoing, meta_answered, published):
     """Domain oracle: was the question the incoming record asked actually ANSWERED?
 
-    Three answers exist, and nothing else counts. The publish became a recorded fact;
-    Instagram reported that specific container as never published (a settlement, stamped
-    on the record); or the record still carries that same container with the question
-    still open, so nothing has left and there is nothing yet to preserve.
+    Decides from facts THIS TEST established, never from the field the implementation
+    consults: `published` (the test put the key in published_idempotency_keys),
+    `meta_answered` (the fixture declares Instagram really did report on this container),
+    or else nothing has LEFT yet because the outgoing record still holds the same job, the
+    same container, and a publish that is still open.
+
+    publish_settled_at is not consulted below. That is the point: an oracle that reads the
+    implementation's own signal moves in lockstep with it and cannot falsify it.
     """
-    if published:
+    if published or meta_answered:
         return True
     if outgoing is None:
         return False
@@ -1561,7 +1693,7 @@ def _obligation_was_answered(incoming, outgoing, published):
         return False
     if outgoing.get("container_id") != incoming.get("container_id"):
         return False
-    return bool(outgoing.get("publish_attempted_at") or outgoing.get("publish_settled_at"))
+    return bool(outgoing.get("publish_attempted_at"))
 
 
 @pytest.mark.parametrize("published", [False, True])
@@ -1571,8 +1703,9 @@ def test_the_chokepoint_preserves_every_unanswered_obligation(in_name, out_name,
     """Across the whole generated matrix: an unanswered obligation is never lost."""
     import copy as _copy
     incoming = _copy.deepcopy(_INCOMING[in_name])
+    outgoing, meta_answered = _OUTGOING[out_name]
     data = {
-        "pending_instagram_upload": _copy.deepcopy(_OUTGOING[out_name]),
+        "pending_instagram_upload": _copy.deepcopy(outgoing),
         "published_idempotency_keys": ["42"] if published else [],
         "pending_publish_reconciliations": [],
     }
@@ -1588,7 +1721,9 @@ def test_the_chokepoint_preserves_every_unanswered_obligation(in_name, out_name,
     if not had_open_question:
         assert quarantined == [], f"{in_name}->{out_name}: quarantined with no open question"
         return
-    if _obligation_was_answered(incoming, data["pending_instagram_upload"], published):
+    if _obligation_was_answered(
+        incoming, data["pending_instagram_upload"], meta_answered, published
+    ):
         assert quarantined == [], f"{in_name}->{out_name}: quarantined an answered question"
     else:
         assert quarantined == ["container_A"], (
@@ -1603,12 +1738,13 @@ def test_the_matrix_actually_contains_the_shapes_that_were_missed():
     Both historic escapes must be in the matrix by construction — the round-4 different-key
     replacement, and the round-5 same-key replacement that dropped the container.
     """
-    assert _OUTGOING["different_key"]["idempotency_key"] != "42"
+    assert _OUTGOING["different_key"][0]["idempotency_key"] != "42"
     same_key_erasures = [
-        name for name, rec in _OUTGOING.items()
+        name for name, (rec, answered) in _OUTGOING.items()
         if rec is not None
+        and not answered
         and rec.get("idempotency_key") == "42"
-        and not (rec.get("publish_attempted_at") or rec.get("publish_settled_at"))
+        and not rec.get("publish_attempted_at")
     ]
     assert "same_key_container_dropped" in same_key_erasures
     assert "same_job_marker_erased" in same_key_erasures
@@ -1624,9 +1760,99 @@ def test_a_settlement_is_distinguishable_from_an_erasure():
     for out_name, expect_quarantine in (("same_job_settled", False),
                                         ("same_job_marker_erased", True)):
         data = {
-            "pending_instagram_upload": _copy.deepcopy(_OUTGOING[out_name]),
+            "pending_instagram_upload": _copy.deepcopy(_OUTGOING[out_name][0]),
             "published_idempotency_keys": [],
             "pending_publish_reconciliations": [],
         }
         ig_state._preserve_unresolved_obligation(_copy.deepcopy(_INCOMING["open_publish"]), data)
         assert bool(data["pending_publish_reconciliations"]) is expect_quarantine, out_name
+
+
+# ---------------------------------------------------------------------------
+# Provenance: the settlement stamp is not the caller's to write
+# ---------------------------------------------------------------------------
+#
+# The round-6 distinction was "an answer says so on the record". That is only as
+# strong as the record's provenance, and set_pending_upload() — the record-ingress
+# API — accepted arbitrary extra fields. A caller could write the answer itself and
+# _preserve_unresolved_obligation() would believe it, releasing an unresolved
+# publish with no Meta involvement at all.
+
+def test_a_caller_supplied_settlement_stamp_is_refused(valid_record):
+    """The reported exploit, closed at ingress."""
+    with pytest.raises(ValueError, match="publish_settled_at"):
+        ig_state.set_pending_upload(dict(valid_record, publish_settled_at="not-from-Meta"))
+
+
+def test_a_caller_supplied_attempt_marker_is_refused(valid_record):
+    """The same rule for the other half of the pair.
+
+    Forging publish_attempted_at only ever creates a spurious obligation, which is the safe
+    direction — but it is just as unprovenanced, and allowing one while refusing the other
+    would leave the rule to be remembered rather than stated.
+    """
+    with pytest.raises(ValueError, match="publish_attempted_at"):
+        ig_state.set_pending_upload(dict(valid_record, publish_attempted_at="T1"))
+
+
+def test_a_forged_stamp_cannot_release_a_real_obligation(valid_record):
+    """The exploit end to end: the forged replacement is refused, the block holds."""
+    _store_unresolved(valid_record, container="container_A")
+    with pytest.raises(ValueError):
+        ig_state.set_pending_upload(
+            dict(valid_record, container_id="container_A", publish_settled_at="not-from-Meta")
+        )
+    record = ig_state.get_pending_upload()
+    assert record["container_id"] == "container_A"
+    assert record["publish_attempted_at"] is not None
+
+
+def test_an_ordinary_record_is_still_accepted(valid_record):
+    """The refusal must not catch the shape check_approval.py actually writes."""
+    ig_state.set_pending_upload(valid_record)
+    assert ig_state.get_pending_upload()["idempotency_key"] == "42"
+
+
+def test_the_chokepoints_trust_in_the_stamp_is_a_stated_dependency():
+    """Pins the residual honestly rather than implying the chokepoint validates provenance.
+
+    Handed a forged stamp directly, _preserve_unresolved_obligation() DOES release the
+    obligation — it cannot tell a real settlement from a fabricated one, and nothing in it
+    tries to. What makes that sound is that the state is unreachable: set_pending_upload()
+    refuses a caller-supplied stamp, and exactly one transition writes one internally
+    (test_a_caller_supplied_settlement_stamp_is_refused and
+    test_the_settlement_stamp_is_written_from_exactly_one_place).
+
+    This exists so that if either guard is ever removed, what it was holding up is written
+    down in plain sight rather than inferred.
+    """
+    data = {
+        "pending_instagram_upload": {
+            "idempotency_key": "42",
+            "container_id": "container_A",
+            "publish_settled_at": "not-from-Meta",
+        },
+        "published_idempotency_keys": [],
+        "pending_publish_reconciliations": [],
+    }
+    ig_state._preserve_unresolved_obligation(
+        {"idempotency_key": "42", "container_id": "container_A", "publish_attempted_at": "T1"},
+        data,
+    )
+    assert data["pending_publish_reconciliations"] == []
+
+
+def test_the_record_ingress_api_is_the_only_way_in():
+    """Names the trust boundary: no other public function writes a pending record wholesale.
+
+    Every other mutator addresses an EXISTING record by idempotency key and changes named
+    fields. If a second wholesale-write entry point is ever added, the provenance refusal
+    has to be added to it too — so the fact that there is currently only one is asserted
+    rather than assumed.
+    """
+    import inspect
+    writers = [
+        name for name in ig_state.__all__
+        if "record" in inspect.signature(getattr(ig_state, name)).parameters
+    ]
+    assert writers == ["set_pending_upload"]

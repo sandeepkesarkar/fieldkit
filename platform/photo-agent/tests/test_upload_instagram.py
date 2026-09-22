@@ -2042,3 +2042,99 @@ def test_the_exhausted_path_still_writes_the_activity_log_line(base, tmp_path):
     ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
     main([])
     ui.instagram_logger.log_publish_unresolved.assert_called_once_with(_PROJECT, _CONTAINER_ID)
+
+
+# ---------------------------------------------------------------------------
+# Who is allowed to assert that Meta answered
+# ---------------------------------------------------------------------------
+#
+# Round 7's defect class was "the verification mechanism trusts something it has
+# not established". instagram_state.py can refuse a caller-supplied provenance
+# field, but it cannot check whether THIS module had a definitive Graph API status
+# in hand when it called mark_publish_settled(). Nothing can: that fact lives in the
+# call site's control flow.
+#
+# What is checkable is WHERE those verbs are called from. Each one discharges or
+# retires an obligation, so a new call site is a decision about duplicate-publish
+# safety and should be a deliberate act rather than something that slips in. Pinning
+# the permitted sites makes adding one fail here first.
+
+_ANSWER_ASSERTING_CALLERS = {
+    # Settles the open question — only ever after a definitive non-published status.
+    "mark_publish_settled": {"_process_upload", "_settle_terminal_container"},
+    # Lifts a quarantine — only ever after Instagram was definitive either way.
+    "clear_publish_reconciliation": {"_reconcile_quarantined_container"},
+    # Retires the key permanently — only ever after a PUBLISHED status.
+    "record_recovered_publish": {"_reconcile_quarantined_container", "_record_recovered"},
+    # Retires the key on the ordinary success path.
+    "mark_published": {"_process_upload"},
+}
+
+
+def _callers_of(name):
+    """Outermost enclosing function for every call to `name` in upload_instagram.py.
+
+    Scope-aware in the same way as the state module's guard — classes, methods, nested
+    functions and lambdas included — because a top-level-only scan is exactly what let a
+    class-based bypass go unnoticed there.
+    """
+    import ast
+    import inspect
+
+    import scripts.upload_instagram as ui
+
+    tree = ast.parse(inspect.getsource(ui))
+    scopes, found = [], set()
+
+    class _Visitor(ast.NodeVisitor):
+        def _scoped(self, node, label):
+            scopes.append(label)
+            self.generic_visit(node)
+            scopes.pop()
+
+        def visit_FunctionDef(self, node):
+            self._scoped(node, node.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):
+            self._scoped(node, node.name)
+
+        def visit_Lambda(self, node):
+            self._scoped(node, "<lambda>")
+
+        def visit_Call(self, node):
+            func = node.func
+            called = (
+                func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name)
+                else None
+            )
+            if called == name:
+                found.add(scopes[0] if scopes else "<module>")
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return found
+
+
+@pytest.mark.parametrize("verb", sorted(_ANSWER_ASSERTING_CALLERS))
+def test_only_sanctioned_call_sites_assert_that_meta_answered(verb):
+    """A new caller of one of these verbs has to be a deliberate decision, not a drift."""
+    assert _callers_of(verb) == _ANSWER_ASSERTING_CALLERS[verb], (
+        f"{verb}() gained or lost a call site. Each call asserts something about what "
+        "Meta did; adding one is a duplicate-publish safety decision."
+    )
+
+
+def test_a_settlement_only_follows_a_definitive_status(with_pending):
+    """The behavioural half of the same concern, since the AST can only see location.
+
+    An attempt that never obtained a status must not settle anything — that would erase
+    an open question on the strength of nothing.
+    """
+    import scripts.upload_instagram as ui
+    with_pending["container_id"] = _CONTAINER_ID
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    main([])
+    ui.instagram_state.mark_publish_settled.assert_not_called()

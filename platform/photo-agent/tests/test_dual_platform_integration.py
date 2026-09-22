@@ -199,6 +199,28 @@ def cron(approved, mocker, video):
     return mocker
 
 
+def _edit_pending_record(**fields):
+    """Rewrite fields on the pending record by editing the state file directly.
+
+    Deliberately NOT via set_pending_upload(). That function is the record-INGRESS API and
+    now refuses caller-supplied provenance fields, so round-tripping a record through it
+    would either fail (once a real publish marker is present) or launder fabricated
+    provenance into state — which is precisely the hole round 7 closed. Simulating "a
+    minute has passed" or "this attempt was the third" is a test-harness concern about the
+    clock and the counter, not a claim about what Meta did, so it belongs here rather than
+    at an API that exists to police such claims.
+
+    Returns False if there is no pending record.
+    """
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    record = raw.get("pending_instagram_upload")
+    if record is None:
+        return False
+    record.update(fields)
+    ig_state.STATE_FILE.write_text(json.dumps(raw, indent=2))
+    return True
+
+
 def _run_instagram_until_resolved(ticks=3):
     """Drive up to `ticks` cron invocations, bypassing the 60s cooldown between them.
 
@@ -208,11 +230,8 @@ def _run_instagram_until_resolved(ticks=3):
     """
     for _ in range(ticks):
         ig_main([])
-        record = ig_state.get_pending_upload()
-        if record is None:
+        if not _edit_pending_record(last_attempt_at="2020-01-01T00:00:00+00:00"):
             return
-        record["last_attempt_at"] = "2020-01-01T00:00:00+00:00"
-        ig_state.set_pending_upload(record)
 
 
 # ---------------------------------------------------------------------------
@@ -781,13 +800,14 @@ def _force_exhausted_with_unresolved_publish():
     the attempt budget is spent, and the durable marker plus container id say a publish
     was asked for and never confirmed.
     """
-    record = ig_state.get_pending_upload()
-    record["attempt_count"] = 3
-    record["status"] = "pending"
-    record["last_attempt_at"] = "2020-01-01T00:00:00+00:00"
-    record["container_id"] = _CONTAINER_ID
-    record["publish_attempted_at"] = "2026-08-31T14:05:00Z"
-    ig_state.set_pending_upload(record)
+    # The container and the publish marker are written by the REAL transitions, because
+    # they are claims about what happened with Meta and set_pending_upload() now refuses
+    # caller-supplied ones. Only the clock and the attempt counter are forced directly.
+    ig_state.set_container_id(_IDEM_KEY, _CONTAINER_ID)
+    ig_state.mark_publish_attempted(_IDEM_KEY)
+    _edit_pending_record(
+        attempt_count=3, status="pending", last_attempt_at="2020-01-01T00:00:00+00:00"
+    )
 
 
 def test_a_process_that_dies_after_the_exhausted_claim_leaves_the_quarantine_behind(
@@ -855,12 +875,10 @@ def test_the_next_tick_picks_up_the_orphaned_quarantine_and_resolves_it(cron, vi
 
 def test_an_exhausted_job_that_never_published_stays_re_approvable(cron, video):
     """The other direction: no publish attempt means no block, so the owner can retry."""
-    record = ig_state.get_pending_upload()
-    record["attempt_count"] = 3
-    record["status"] = "pending"
-    record["last_attempt_at"] = "2020-01-01T00:00:00+00:00"
-    record["container_id"] = _CONTAINER_ID          # built, but never published from
-    ig_state.set_pending_upload(record)
+    ig_state.set_container_id(_IDEM_KEY, _CONTAINER_ID)   # built, never published from
+    _edit_pending_record(
+        attempt_count=3, status="pending", last_attempt_at="2020-01-01T00:00:00+00:00"
+    )
 
     ig_main([])
 
