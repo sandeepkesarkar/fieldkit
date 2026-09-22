@@ -100,8 +100,8 @@ def _dispatch_block(skill_md: Path) -> str:
     return matching[0]
 
 
-def _resolution_only(block: str) -> str:
-    """The block with its real script invocation replaced by `pwd`.
+def _resolution_only(block: str, invocation: str = "pwd") -> str:
+    """The block with its real script invocation replaced by *invocation*.
 
     Keeps every line of the actual resolution and guard logic intact — this
     is the block's own code, not a hand-copied imitation — while making it
@@ -113,11 +113,11 @@ def _resolution_only(block: str) -> str:
         if re.search(r"python3 scripts/\S+\.py", line) and not line.lstrip().startswith(
             ("[", "#")
         ):
-            lines.append("pwd")
+            lines.append(invocation)
         else:
             lines.append(line)
     script = "\n".join(lines)
-    assert "pwd" in script, "script invocation line not found for substitution"
+    assert invocation in script, "script invocation line not found for substitution"
     return script
 
 
@@ -268,7 +268,7 @@ def _fake_checkout(root: Path, dirname: str, skill_md: Path) -> Path:
     return skill_dir
 
 
-def _run_as_dispatched(skill_md: Path, skill_dir: Path, cwd: Path):
+def _run_as_dispatched(skill_md: Path, skill_dir: Path, cwd: Path, invocation: str = "pwd"):
     """Substitute the token with *skill_dir* exactly as Hermes does, then run.
 
     Hermes performs a plain textual replacement of the bare `${HERMES_SKILL_DIR}`
@@ -277,7 +277,7 @@ def _run_as_dispatched(skill_md: Path, skill_dir: Path, cwd: Path):
     it as a textual replace here keeps the test hermetic (no Hermes import)
     while reproducing the property under test.
     """
-    script = _resolution_only(_dispatch_block(skill_md))
+    script = _resolution_only(_dispatch_block(skill_md), invocation)
     script = script.replace(_SKILL_DIR_TOKEN, str(skill_dir))
     return subprocess.run(
         ["/bin/bash", "-c", script],
@@ -351,6 +351,161 @@ def test_benign_path_shapes_still_resolve(tmp_path, skill_md, dirname):
     landed = Path(result.stdout.strip().splitlines()[-1]).resolve()
     assert landed == skill_dir.parents[1].resolve()
 # ---------------------------------------------------------------------------
+# Heredoc delimiter and newline payloads (PR #75 round-3 review, blocking 1)
+# ---------------------------------------------------------------------------
+# A quoted heredoc stops expanding, but it still TERMINATES: a pasted pathname
+# containing a newline followed by a line exactly equal to the delimiter ends
+# the heredoc early, and the rest of the pathname becomes shell source that
+# runs before any guard can inspect it.
+#
+# That is not fixable in bash, and this suite should not pretend otherwise.
+# Every bash quoting construct has a finite, known terminator — `"` for double
+# quotes, `'` for single quotes and $'...', a newline for a comment, a
+# delimiter line for a heredoc — and a pathname may contain any printable
+# text, since the only bytes a path cannot hold are `/` within a component and
+# NUL, while no heredoc delimiter can contain NUL. So for every construct
+# there exists a pathname that escapes it. The airtight fix is not ours to
+# make: it would be Hermes passing the skill directory as an environment
+# variable (data) instead of pasting it into the skill body (source).
+#
+# What IS in our control, and what these tests pin:
+#   * the delimiter must not be a guessable or obvious string, so realistic
+#     and accidental collisions are nil;
+#   * a newline alone must fail closed;
+#   * delimiter text inside an ordinary path component must resolve normally;
+#   * in the residual case the damage stays bounded — the block still refuses
+#     to cd or run the real script, and still reports ERROR.
+#
+# Severity bound, stated rather than implied: the path comes from
+# operator-configured `skills.external_dirs`, so reaching any of this requires
+# someone who can already write the Hermes config — i.e. who already has code
+# execution as that user.
+
+# The obvious delimiter name, and the one this repo used before round 3. A
+# payload carrying it must not escape: that is what makes "improbable
+# delimiter" a property under test rather than a claim in a comment.
+_GUESSABLE_DELIMITER = "FIELDKIT_SKILL_DIR_EOF"
+
+# Written by an injected `touch` if the pasted path ever becomes shell source.
+# A filesystem sentinel rather than a marker in the output, because the guards
+# legitimately echo the offending path back, which would make any
+# string-matching check on stdout self-triggering.
+_SENTINEL = "PWNED"
+
+_REACHED = "FIELDKIT_REACHED_INVOCATION"
+
+
+def _heredoc_delimiter(block: str) -> str:
+    match = re.search(r"read -r SKILL_DIR <<'([A-Za-z0-9_]+)'", block)
+    assert match, "no `read -r SKILL_DIR <<'DELIM'` heredoc found in the block"
+    return match.group(1)
+
+
+def _payload(delimiter: str) -> str:
+    """A directory name that terminates *delimiter* early and runs a command.
+
+    The trailing `#` comments out the remainder of the pathname that Hermes
+    pastes after the skill directory, so the injected line stands alone —
+    this is the reviewer's exact shape.
+    """
+    return f"repo\n{delimiter}\ntouch {_SENTINEL}\n#"
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+def test_guessable_heredoc_delimiter_does_not_escape(tmp_path, skill_md):
+    """A pathname carrying the OBVIOUS delimiter name must not break out.
+
+    Round 2 used `FIELDKIT_SKILL_DIR_EOF` verbatim, so this exact payload
+    terminated the heredoc and executed. The delimiter is now long and
+    improbable, which is the practical mitigation — and this test fails if
+    anyone shortens it back to something guessable.
+    """
+    skill_dir = _fake_checkout(tmp_path, _payload(_GUESSABLE_DELIMITER), skill_md)
+    result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
+    combined = result.stdout + result.stderr
+
+    assert not (tmp_path / _SENTINEL).exists(), (
+        f"{skill_md}: a pathname containing the line {_GUESSABLE_DELIMITER!r} "
+        f"terminated the heredoc and EXECUTED the rest of the path. The "
+        f"delimiter must not be a guessable string.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert result.returncode != 0 and "ERROR" in combined, (
+        f"{skill_md}: did not fail closed.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+def test_newline_without_delimiter_line_fails_closed(tmp_path, skill_md):
+    """A newline alone truncates the read and must abort, running nothing."""
+    skill_dir = _fake_checkout(tmp_path, f"repo\ntouch {_SENTINEL}", skill_md)
+    result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
+    combined = result.stdout + result.stderr
+
+    assert not (tmp_path / _SENTINEL).exists(), (
+        f"{skill_md}: text after a newline in the pathname executed.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert result.returncode != 0 and "ERROR" in combined, (
+        f"{skill_md}: a truncated skill directory did not fail closed.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+def test_delimiter_text_inside_a_path_component_resolves(tmp_path, skill_md):
+    """The delimiter as a SUBSTRING of an ordinary component is harmless.
+
+    Only a whole line equal to the delimiter terminates a heredoc, so this
+    must keep resolving normally rather than being rejected out of caution.
+    """
+    delimiter = _heredoc_delimiter(_dispatch_block(skill_md))
+    skill_dir = _fake_checkout(tmp_path, f"repo{delimiter}x", skill_md)
+    result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
+    assert result.returncode == 0, (
+        f"{skill_md}: rejected a legitimate path containing the delimiter as "
+        f"a substring.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    landed = Path(result.stdout.strip().splitlines()[-1]).resolve()
+    assert landed == skill_dir.parents[1].resolve()
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+def test_actual_delimiter_payload_stays_bounded(tmp_path, skill_md):
+    """The documented residual, pinned honestly.
+
+    A payload carrying the REAL delimiter still terminates the heredoc — no
+    bash construct can prevent that (see the section comment above). So this
+    test does NOT assert that nothing runs; it asserts the blast radius stays
+    bounded: the block reports ERROR, exits non-zero, and never reaches the
+    script invocation. If a future change closes this properly, tighten this
+    test — do not delete it.
+    """
+    delimiter = _heredoc_delimiter(_dispatch_block(skill_md))
+    skill_dir = _fake_checkout(tmp_path, _payload(delimiter), skill_md)
+
+    result = _run_as_dispatched(
+        skill_md, skill_dir, cwd=tmp_path, invocation=f"echo {_REACHED}"
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0, (
+        f"{skill_md}: exited 0 despite a tampered skill directory.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ERROR" in combined, (
+        f"{skill_md}: no ERROR line reported.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert _REACHED not in result.stdout, (
+        f"{skill_md}: reached the script invocation despite a tampered skill "
+        f"directory — the damage must stay bounded to the injected text "
+        f"itself.\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stale-path guard for operator-facing docs (PR #75 review, non-blocking 2)
 # ---------------------------------------------------------------------------
 # The skills are fixed, but an operator following a stale runbook reintroduces
@@ -420,10 +575,132 @@ def test_no_stale_repo_path_in_current_docs():
     )
 
 
-def test_dated_records_point_at_the_current_location():
-    """Every exempt file must still exist, so the list cannot rot silently."""
+def test_dated_record_exemptions_still_exist():
+    """Every exempt file must still exist, so the list cannot rot silently.
+
+    Named for what it actually checks: existence only. Whether a record points
+    readers at the current location is a separate property, asserted below for
+    the records that carry a stale config snippet.
+    """
     for rel in sorted(_DATED_RECORDS):
         assert (_REPO_ROOT / rel).is_file(), (
             f"_DATED_RECORDS lists {rel}, which no longer exists — remove it "
             f"from the exemption list."
         )
+
+
+# Dated records whose stale text is a `skills.external_dirs` snippet a reader
+# might copy, as opposed to a crontab transcript or an incident write-up.
+# These must visibly redirect to the current location; the others need no
+# pointer because there is nothing in them to copy.
+_RECORDS_WITH_STALE_CONFIG_SNIPPETS = (
+    "platform/docs/hermes/03-process-photos-skill.md",
+    "platform/docs/hermes/04-check-approval-skill.md",
+    "platform/docs/hermes/08-check-email-skill.md",
+)
+
+_CURRENT_LOCATION_DOC = "platform/docs/hermes/12-skill-path-resolution.md"
+
+
+def test_stale_config_snippets_point_at_the_current_location():
+    """A reader landing on a stale config snippet must be redirected."""
+    assert (_REPO_ROOT / _CURRENT_LOCATION_DOC).is_file(), (
+        f"{_CURRENT_LOCATION_DOC} is missing — it is the single current "
+        f"location every stale snippet points at."
+    )
+    for rel in _RECORDS_WITH_STALE_CONFIG_SNIPPETS:
+        assert rel in _DATED_RECORDS, f"{rel} should be a dated record"
+        text = (_REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "12-skill-path-resolution.md" in text, (
+            f"{rel} still shows a stale skills.external_dirs snippet but no "
+            f"longer points readers at {_CURRENT_LOCATION_DOC} — a reader will "
+            f"copy the stale paths."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Integration: Hermes's own message builder (PR #75 round-3 review, suggestion)
+# ---------------------------------------------------------------------------
+# Everything above models Hermes's substitution with `str.replace()`, which is
+# a faithful model of the primitive (`substitute_template_vars` performs a
+# plain textual replacement of the bare token) and keeps the suite hermetic.
+# This test closes the remaining gap: it drives the installed Hermes's real
+# `_build_skill_message()` — the function `build_skill_invocation_message()`
+# calls on the Telegram slash-command path — and executes what it produces, so
+# live dispatch behaviour is pinned by the suite instead of by manual
+# verification each review round.
+#
+# It runs inside Hermes's own venv as a subprocess, so Hermes's imports never
+# touch the pytest process and the test does not depend on the test
+# interpreter having Hermes's dependencies. Skipped when Hermes is not
+# installed, which keeps the suite runnable on a dev machine.
+
+_HERMES_AGENT_DIR = Path.home() / ".hermes" / "hermes-agent"
+_HERMES_PYTHON = _HERMES_AGENT_DIR / "venv" / "bin" / "python"
+
+# Printed around the block so the harness can find it in the subprocess output.
+_BLOCK_START = "===FIELDKIT_BLOCK_START==="
+_BLOCK_END = "===FIELDKIT_BLOCK_END==="
+
+_EXTRACT_VIA_HERMES = '''
+import re, sys
+sys.path.insert(0, sys.argv[1])
+from agent.skill_commands import _build_skill_message
+from pathlib import Path
+
+skill_dir = Path(sys.argv[2])
+loaded = {"content": (skill_dir / "SKILL.md").read_text(), "name": skill_dir.name}
+message = _build_skill_message(
+    loaded, skill_dir, activation_note="[test]", session_id="test-session"
+)
+block = next(
+    b for b in re.findall(r"```bash\\n(.*?)```", message, re.DOTALL)
+    if re.search(r"python3 scripts/\\S+\\.py", b)
+)
+print(sys.argv[3])
+print(block)
+print(sys.argv[4])
+'''
+
+
+@pytest.mark.skipif(
+    not _HERMES_PYTHON.is_file(), reason="Hermes is not installed on this machine"
+)
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+def test_real_hermes_builder_substitutes_and_resolves(skill_md):
+    """Hermes's real builder must substitute the token, and the block it
+    produces must execute and land on this checkout's agent directory."""
+    extract = subprocess.run(
+        [
+            str(_HERMES_PYTHON), "-c", _EXTRACT_VIA_HERMES,
+            str(_HERMES_AGENT_DIR), str(skill_md.parent), _BLOCK_START, _BLOCK_END,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert extract.returncode == 0, (
+        f"could not build the dispatch message via Hermes:\n{extract.stderr}"
+    )
+    block = extract.stdout.split(_BLOCK_START, 1)[1].split(_BLOCK_END, 1)[0].strip("\n")
+
+    # Hermes really did the substitution: no placeholder survives into the
+    # content the agent receives.
+    assert _SKILL_DIR_TOKEN not in block, (
+        f"{skill_md}: Hermes did not substitute {_SKILL_DIR_TOKEN} — is "
+        f"skills.template_vars disabled in the local Hermes config?"
+    )
+    assert str(skill_md.parent) in block, (
+        f"{skill_md}: the substituted block does not contain this skill's own "
+        f"directory."
+    )
+
+    result = _run(_resolution_only(block))
+    assert result.returncode == 0, (
+        f"{skill_md}: the block Hermes produced failed to resolve with exit "
+        f"{result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    landed = Path(result.stdout.strip().splitlines()[-1]).resolve()
+    assert landed == skill_md.resolve().parents[2], (
+        f"{skill_md}: Hermes's own output resolved to {landed}, expected "
+        f"{skill_md.resolve().parents[2]}"
+    )

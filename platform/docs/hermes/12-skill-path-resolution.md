@@ -43,6 +43,47 @@ Two properties are deliberate and enforced by tests
    aborts with an `ERROR:` line instead of running somewhere else. Issue #59
    was a cross-client data leak caused by a silent fallback.
 
+### Known limitation — and why it is not closed here
+
+The substitution is textual, so the skill directory arrives as shell **source**,
+not shell data. The quoted heredoc stops all expansion, but a heredoc still
+terminates: a checkout path containing a newline followed by a line exactly
+equal to the delimiter would end it early, and the remainder of the pathname
+would run as shell code before any guard could inspect it.
+
+**This cannot be fixed in bash.** Every bash quoting construct has a finite,
+known terminator — `"` for double quotes, `'` for single quotes and `$'...'`,
+a newline for a comment, a delimiter line for a heredoc — and a pathname may
+contain any printable text, since the only bytes a path cannot hold are `/`
+within a component and NUL, and no heredoc delimiter can contain NUL. For
+every construct there therefore exists a pathname that escapes it. Round 2 of
+the PR #75 review closed the double-quote hole; round 3 found the heredoc
+delimiter hole; the pattern is structural, not a sequence of oversights.
+
+What is done instead, and what it is worth:
+
+- The delimiter is long and improbable
+  (`__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__`), so accidental or realistic
+  collision is nil. A regression test fails if anyone shortens it back to a
+  guessable string.
+- A newline *without* a matching delimiter line truncates the value and fails
+  closed, as does every other malformed shape.
+- In the residual case the damage stays bounded: the block still refuses to
+  `cd`, never runs the dispatched script, and still reports `ERROR`. A test
+  pins exactly that, and deliberately does **not** claim nothing executes.
+
+**Severity bound.** The path comes from operator-configured
+`skills.external_dirs`. Reaching this requires someone who can already write
+the Hermes config — i.e. who already has code execution as this user — so it
+is not a privilege boundary FieldKit can defend, and it is not reachable by a
+Telegram sender or by anything in the photo/email pipelines.
+
+**The real fix is upstream.** If Hermes passed the skill directory to the
+block as an environment variable (data) rather than pasting it into the skill
+body (source), the whole class disappears and the guards here become
+redundant. That is worth raising with Hermes rather than contorting four
+`SKILL.md` files further.
+
 ### Layout assumption
 
 Two-levels-up is correct for skills living in a fieldkit checkout, which is how

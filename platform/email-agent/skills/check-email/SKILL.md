@@ -79,13 +79,24 @@ block immediately:
 # all, so the path arrives as literal data whatever it contains. Never
 # hardcode an absolute repo path here either — a moved checkout silently
 # broke every command for three weeks that way (issue #74).
-IFS= read -r SKILL_DIR <<'FIELDKIT_SKILL_DIR_EOF'
+# Residual, documented rather than papered over: a pathname containing a
+# newline followed by a line exactly equal to the delimiter below would still
+# end the heredoc early. No bash construct prevents that — each has a finite
+# terminator a pathname may contain — so the delimiter is long and improbable
+# and the guards below bound the damage. See
+# platform/docs/hermes/12-skill-path-resolution.md.
+IFS= read -r SKILL_DIR <<'__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__'
 ${HERMES_SKILL_DIR}
-FIELDKIT_SKILL_DIR_EOF
-# An unsubstituted placeholder arrives as the literal token (the heredoc does
-# not expand it), so test for that text rather than for an empty value.
+__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__
+[ -n "${SKILL_DIR//[[:space:]]/}" ] || { echo "ERROR: FieldKit skill directory unresolved — the substituted value is empty or blank."; exit 1; }
+# An unsubstituted placeholder arrives as the literal token, because the
+# quoted heredoc does not expand it either. The comparison value is assembled
+# from fragments so Hermes's own substitution regex does not rewrite this line
+# along with the placeholder above; matching the literal keeps the diagnostic
+# exact instead of misreporting a real path that merely contains the name.
+FIELDKIT_PLACEHOLDER='${'"HERMES_SKILL_DIR"'}'
 case "$SKILL_DIR" in
-  ""|*HERMES_SKILL_DIR*) echo "ERROR: FieldKit skill directory unresolved — the HERMES_SKILL_DIR placeholder reached the shell unsubstituted, which points at Hermes's skills.template_vars setting."; exit 1 ;;
+  "$FIELDKIT_PLACEHOLDER") echo "ERROR: FieldKit skill directory unresolved — the HERMES_SKILL_DIR placeholder reached the shell unsubstituted, which points at Hermes's skills.template_vars setting."; exit 1 ;;
 esac
 # Defence in depth behind the heredoc: a checkout path carrying a shell
 # metacharacter is pathological, and refusing it loudly is safer than
