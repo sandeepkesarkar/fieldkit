@@ -61,6 +61,23 @@ def lock_mock(mocker):
     return mock
 
 
+@pytest.fixture(autouse=True)
+def isolated_activity_log(tmp_path, monkeypatch):
+    """Keep the activity log out of the developer's real client log directory.
+
+    instagram_logger resolves LOG_DIR from FIELDKIT_LOG_DIR at IMPORT time, and the
+    scripts under test load the real client .env at import — so any logging call that
+    is not individually mocked appends to the actual checkout's photo-agent.log. Relying
+    on the mock list staying exhaustive is what let that happen; patching the path makes
+    it structural, and keeps newly-added log events from silently reintroducing it.
+    """
+    import tools.instagram_logger as ig_logger
+    log_dir = tmp_path / "activity_log"
+    monkeypatch.setattr(ig_logger, "LOG_DIR", log_dir)
+    monkeypatch.setattr(ig_logger, "LOG_FILE", log_dir / "photo-agent.log")
+    return ig_logger
+
+
 @pytest.fixture
 def isolated_worker_health(tmp_path, monkeypatch):
     """Redirect worker_health's heartbeat file, and mark BOTH workers as deployed.
@@ -960,3 +977,82 @@ def test_a_disabled_client_is_not_alerted_about_a_missing_cron(base, mocker, mon
     ca.instagram_state.set_pending_upload.assert_not_called()
     texts = [c.args[0] for c in ca._notify_admin.call_args_list]
     assert not any("cron is not running" in t for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# A video with an unresolved publish cannot be re-queued (FR-011)
+# ---------------------------------------------------------------------------
+#
+# An idempotency check alone cannot catch this. A publish whose response was lost
+# never reached published_idempotency_keys, so is_published() says "no" and would
+# wave the re-approval straight through into a second, irreversible Reel.
+
+@pytest.fixture
+def ig_publish_unresolved(base_ig, mocker):
+    """The previous upload of this video reached publish and its outcome is unknown."""
+    mocker.patch(
+        "scripts.check_approval.instagram_state.has_unresolved_publish", return_value=True
+    )
+    return base_ig
+
+
+def test_an_unresolved_publish_blocks_the_enqueue(ig_publish_unresolved):
+    """Nothing is queued, so nothing can be published a second time."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_the_block_happens_even_though_is_published_says_no(ig_publish_unresolved):
+    """Pins why the existing idempotency check is not sufficient on its own.
+
+    is_published() returns False here — that is the whole problem — so if the block
+    depended on it, the duplicate would be posted.
+    """
+    import scripts.check_approval as ca
+    ca.instagram_state.is_published.return_value = False
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_a_blocked_enqueue_alerts_the_admin_with_the_reason(ig_publish_unresolved):
+    """The owner needs to know their video was not queued, and that it may already be up."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    texts = [c.args[0] for c in ca._notify_admin.call_args_list]
+    assert any("NOT re-queued" in t for t in texts)
+    assert any("duplicate" in t for t in texts)
+    assert any("unblock this automatically" in t for t in texts)
+
+
+def test_a_blocked_enqueue_is_recorded_in_the_activity_log(ig_publish_unresolved, mocker):
+    """IG_BLOCKED, distinct from IG_NOWORKER — a different refusal for a different reason."""
+    import scripts.check_approval as ca
+    blocked = mocker.patch(
+        "scripts.check_approval.instagram_logger.log_enqueue_blocked_unresolved"
+    )
+    main(_APPROVE_ARGS)
+    blocked.assert_called_once_with(_PROJECT)
+
+
+def test_a_blocked_instagram_enqueue_does_not_block_facebook(ig_publish_unresolved):
+    """FR-013 again: the two platforms' outcomes stay independent."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    ca.facebook_state.set_pending_upload.assert_called_once()
+
+
+def test_a_blocked_instagram_enqueue_still_completes_the_approval(ig_publish_unresolved, capsys):
+    """The owner's approval is theirs; a quarantine must not swallow it."""
+    main(_APPROVE_ARGS)
+    assert "Approved:" in capsys.readouterr().out
+
+
+def test_a_resolved_publish_lets_the_enqueue_through(base_ig, mocker):
+    """The block lifts by itself once upload_instagram.py gets an answer out of Instagram."""
+    import scripts.check_approval as ca
+    mocker.patch(
+        "scripts.check_approval.instagram_state.has_unresolved_publish", return_value=False
+    )
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_called_once()

@@ -55,6 +55,40 @@ _PENDING_RECORD = {
 
 
 @pytest.fixture(autouse=True)
+def isolated_activity_log(tmp_path, monkeypatch):
+    """Keep the activity log out of the developer's real client log directory.
+
+    instagram_logger resolves LOG_DIR from FIELDKIT_LOG_DIR at IMPORT time, and the
+    scripts under test load the real client .env at import — so any logging call that
+    is not individually mocked appends to the actual checkout's photo-agent.log. Relying
+    on the mock list staying exhaustive is what let that happen; patching the path makes
+    it structural, and keeps newly-added log events from silently reintroducing it.
+    """
+    import tools.instagram_logger as ig_logger
+    log_dir = tmp_path / "activity_log"
+    monkeypatch.setattr(ig_logger, "LOG_DIR", log_dir)
+    monkeypatch.setattr(ig_logger, "LOG_FILE", log_dir / "photo-agent.log")
+    return ig_logger
+
+
+@pytest.fixture(autouse=True)
+def isolated_state_file(tmp_path, monkeypatch):
+    """Keep instagram_state's file out of the developer's real client data directory.
+
+    Most state calls are mocked in `base`, but "most" is exactly the problem: a code path
+    that reaches an UNMOCKED state function writes to whatever STATE_FILE resolved to at
+    import, and upload_instagram.py loads the real client .env at import. That is how a
+    test run came to leave real entries in clients/_demo/data. Patching the path makes the
+    isolation structural instead of depending on the mock list staying exhaustive.
+    """
+    import tools.instagram_state as ig_state
+    data_dir = tmp_path / "state"
+    monkeypatch.setattr(ig_state, "DATA_DIR", data_dir)
+    monkeypatch.setattr(ig_state, "STATE_FILE", data_dir / "instagram_state.json")
+    return ig_state
+
+
+@pytest.fixture(autouse=True)
 def isolated_worker_health(tmp_path, monkeypatch):
     """Keep heartbeats out of the developer's real client data directory.
 
@@ -67,6 +101,20 @@ def isolated_worker_health(tmp_path, monkeypatch):
     monkeypatch.setattr(wh, "DATA_DIR", data_dir)
     monkeypatch.setattr(wh, "HEALTH_FILE", data_dir / "worker_health.json")
     return wh
+
+
+@pytest.fixture(autouse=True)
+def isolated_video_tmp_dir(tmp_path, monkeypatch):
+    """Pin VIDEO_TMP_DIR so an ambient setting cannot change what these tests exercise.
+
+    The orphan sweep reads state and walks this directory on every tick. Left to the
+    environment, whether it does either depends on the developer's shell, which made four
+    assertions below pass or fail according to ambient configuration rather than behaviour.
+    """
+    root = tmp_path / "video_tmp"
+    root.mkdir()
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(root))
+    return root
 
 
 @pytest.fixture
@@ -108,6 +156,25 @@ def base(mocker, env):
     )
     mocker.patch.object(ui.instagram_state, "list_share_cleanups", return_value=[])
     mocker.patch.object(ui.instagram_state, "clear_share_cleanup", return_value=True)
+    mocker.patch.object(ui.instagram_state, "record_share_intent")
+    # The FR-011 quarantine surface. Mocked by default so ordinary tests neither write it
+    # nor read a leftover from a previous test; the tests that care override these.
+    mocker.patch.object(ui.instagram_state, "mark_publish_attempted")
+    mocker.patch.object(ui.instagram_state, "list_publish_reconciliations", return_value=[])
+    mocker.patch.object(
+        ui.instagram_state,
+        "record_publish_reconciliation",
+        return_value={
+            "container_id": _CONTAINER_ID, "project_name": _PROJECT,
+            "idempotency_key": _IDEM_KEY, "attempts": 1,
+            "recorded_at": "2026-08-31T14:00:00Z",
+        },
+    )
+    mocker.patch.object(ui.instagram_state, "clear_publish_reconciliation", return_value=True)
+    mocker.patch.object(ui.instagram_state, "record_recovered_publish")
+    mocker.patch.object(ui.instagram_logger, "log_publish_unresolved")
+    mocker.patch.object(ui.instagram_logger, "log_publish_resolved")
+    mocker.patch.object(ui.instagram_logger, "log_upload_recovered")
     # Cross-platform deletion coordination: default to "no other platform is waiting",
     # so the tests that don't care about coordination behave as before. The tests that
     # DO care override this, and test_dual_platform_integration.py exercises the real
@@ -160,11 +227,19 @@ def with_pending(base, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_missing_ig_account_id_exits_silently(base, monkeypatch):
-    """FR-016: an unconfigured client exercises no Instagram code path at all."""
+    """FR-016: an unconfigured client exercises no Instagram UPLOAD code path at all.
+
+    Asserts on claim_pending_upload() rather than get_pending_upload(), because the two
+    mean different things now. Claiming is the gateway to doing any work on a job, and is
+    what must not happen. Merely READING the pending record is something the unconditional
+    orphan sweep does on every tick to find out which videos are still in use — legitimate,
+    unrelated to Instagram, and not what FR-016 is about. Pinning the read made this test's
+    result depend on whether VIDEO_TMP_DIR happened to exist in the developer's shell.
+    """
     import scripts.upload_instagram as ui
     monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
     main([])
-    ui.instagram_state.get_pending_upload.assert_not_called()
+    ui.instagram_state.claim_pending_upload.assert_not_called()
     ui.instagram_api.create_media_container.assert_not_called()
 
 
@@ -173,7 +248,8 @@ def test_empty_ig_account_id_exits_silently(base, monkeypatch):
     import scripts.upload_instagram as ui
     monkeypatch.setenv("IG_BUSINESS_ACCOUNT_ID", "")
     main([])
-    ui.instagram_state.get_pending_upload.assert_not_called()
+    ui.instagram_state.claim_pending_upload.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
 
 
 def test_missing_ig_account_id_does_not_touch_state(base, monkeypatch):
@@ -584,8 +660,9 @@ def test_disabled_instagram_still_publishes_nothing(base, monkeypatch):
     import scripts.upload_instagram as ui
     monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
     main([])
-    ui.instagram_state.get_pending_upload.assert_not_called()
+    ui.instagram_state.claim_pending_upload.assert_not_called()
     ui.instagram_api.create_media_container.assert_not_called()
+    ui.instagram_api.publish_container.assert_not_called()
 
 
 def test_cleanup_is_skipped_when_the_lock_is_held(base, mocker):
@@ -680,7 +757,8 @@ def test_env_validation_runs_before_any_state_access(base, monkeypatch):
     monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
     with pytest.raises(SystemExit):
         main([])
-    ui.instagram_state.get_pending_upload.assert_not_called()
+    ui.instagram_state.claim_pending_upload.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
 
 
 def test_disabled_client_exits_before_token_validation(base, monkeypatch):
@@ -1247,11 +1325,10 @@ def test_an_exhausted_job_still_reconciles_its_last_container(base, tmp_path):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
     ui.instagram_state.get_pending_upload.return_value = dict(
-        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID, attempt_count=3
+        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID,
+        attempt_count=3, publish_attempted_at="2026-08-31T14:05:00Z",
     )
     ui.instagram_state.claim_pending_upload.return_value = "exhausted"
-    ui.instagram_state.record_recovered_publish = base.MagicMock()
-    ui.instagram_logger.log_upload_recovered = base.MagicMock()
     ui.instagram_api.get_container_status.return_value = "PUBLISHED"
 
     main([])
@@ -1273,15 +1350,21 @@ def test_an_exhausted_job_that_cannot_be_reconciled_warns_about_a_possible_live_
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
     ui.instagram_state.get_pending_upload.return_value = dict(
-        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID, attempt_count=3
+        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID,
+        attempt_count=3, publish_attempted_at="2026-08-31T14:05:00Z",
     )
     ui.instagram_state.claim_pending_upload.return_value = "exhausted"
     ui.instagram_api.get_container_status.side_effect = InstagramUploadError("network down")
 
     main([])
+    # The control is the durable quarantine, not the message.
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
+    ui.instagram_logger.log_publish_unresolved.assert_called_once_with(_PROJECT, _CONTAINER_ID)
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "MAY already be live" in text
-    assert "before re-approving" in text.lower() or "BEFORE re-approving" in text
+    assert "blocked" in text
     ui.instagram_logger.log_upload_exhausted.assert_called_once()
 
 
@@ -1300,14 +1383,60 @@ def test_an_ordinary_exhaustion_does_not_cry_wolf(base, tmp_path):
     assert "check logs" in text
 
 
-def test_a_publish_that_loses_its_response_warns_on_the_final_attempt(with_pending):
-    """The ambiguity flag is set BEFORE the irreversible call, not after it returns."""
+def test_a_lost_publish_response_that_cannot_be_settled_is_quarantined(with_pending):
+    """The defect round 2 left open: a publish lands, and nothing can confirm it.
+
+    Three attempts exhaust without Instagram ever giving a definitive answer. Without a
+    durable quarantine, mark_failed() would discard the container id, a re-approval would
+    be accepted, and a second Reel would go onto the client's real account.
+    """
     import scripts.upload_instagram as ui
     with_pending["attempt_count"] = 2          # this attempt is the third and last
     ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    # The settle call at terminal time cannot get an answer either.
+    ui.instagram_api.get_container_status.side_effect = [
+        "FINISHED",                                  # the pre-publish poll
+        InstagramUploadError("graph api unavailable"),  # the terminal settle
+    ]
     main([])
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "MAY already be live" in text
+    assert "blocked" in text
+
+
+def test_a_lost_publish_response_that_instagram_settles_is_not_quarantined(with_pending):
+    """A definitive FINISHED means the publish did NOT land — an ordinary failure.
+
+    Quarantining here would block a re-approval for no reason. Instagram's own word for
+    "ingested but not published" is authoritative, so the owner is told plainly that
+    nothing went live and the video can be re-approved.
+    """
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    main([])
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" not in text
+    assert "can be re-approved" in text
+
+
+def test_a_terminal_failure_that_settles_as_published_is_recorded_not_failed(with_pending):
+    """If the settle call says PUBLISHED, the job succeeded — however the attempt went."""
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    ui.instagram_api.get_container_status.side_effect = ["FINISHED", "PUBLISHED"]
+    main([])
+    ui.instagram_state.record_recovered_publish.assert_called_once_with(
+        _IDEM_KEY, _PROJECT, _CONTAINER_ID
+    )
+    ui.instagram_state.mark_failed.assert_not_called()
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
 
 
 def test_a_failure_before_publish_does_not_warn_on_the_final_attempt(with_pending):
@@ -1539,9 +1668,16 @@ def test_a_token_that_expires_at_the_publish_step_warns_about_a_possible_live_re
     import scripts.upload_instagram as ui
     ui.instagram_api.publish_container.side_effect = InstagramTokenError("code 190")
     main([])
+    # No classification is even attempted — the call that would answer is the one that
+    # just failed — so this quarantines directly and lets the drain ask once the Page
+    # is reconnected.
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "token expired" in text
-    assert "MAY be live" in text
+    assert "MAY already be live" in text
+    assert "blocked" in text
 
 
 def test_a_token_that_expires_before_the_publish_step_does_not_cry_wolf(with_pending):
@@ -1549,6 +1685,205 @@ def test_a_token_that_expires_before_the_publish_step_does_not_cry_wolf(with_pen
     import scripts.upload_instagram as ui
     ui.instagram_api.create_media_container.side_effect = InstagramTokenError("code 190")
     main([])
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "token expired" in text
-    assert "MAY be live" not in text
+    assert "MAY already be live" not in text
+
+
+# ---------------------------------------------------------------------------
+# The quarantine drain — keep asking until Instagram is definitive
+# ---------------------------------------------------------------------------
+
+_QUARANTINE_ENTRY = {
+    "container_id": _CONTAINER_ID,
+    "project_name": _PROJECT,
+    "idempotency_key": _IDEM_KEY,
+    "recorded_at": "2026-08-31T14:00:00Z",
+    "last_attempt_at": "2026-08-31T14:00:00Z",
+    "last_alerted_at": "2026-08-31T14:00:00Z",
+    "attempts": 1,
+}
+
+
+@pytest.fixture
+def with_quarantine(base):
+    """One container whose publish outcome is unknown, and no pending job."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = [dict(_QUARANTINE_ENTRY)]
+    return ui
+
+
+def test_the_drain_resolves_a_container_instagram_reports_as_published(with_quarantine):
+    """The Reel was live all along: recorded, key retired, quarantine lifted."""
+    ui = with_quarantine
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    main([])
+    ui.instagram_state.record_recovered_publish.assert_called_once_with(
+        _IDEM_KEY, _PROJECT, _CONTAINER_ID
+    )
+    ui.instagram_state.clear_publish_reconciliation.assert_called_once_with(_CONTAINER_ID)
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "IS live" in text
+    assert "posted twice" in text
+
+
+@pytest.mark.parametrize("status", ["FINISHED", "ERROR", "EXPIRED"])
+def test_the_drain_releases_a_container_that_never_published(with_quarantine, status):
+    """All three mean the same thing — it never went live — so the key is released."""
+    ui = with_quarantine
+    ui.instagram_api.get_container_status.return_value = status
+    main([])
+    ui.instagram_state.clear_publish_reconciliation.assert_called_once_with(_CONTAINER_ID)
+    ui.instagram_state.record_recovered_publish.assert_not_called()
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "NOT published" in text
+    assert "re-approve" in text
+
+
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "SOMETHING_NEW"])
+def test_the_drain_keeps_an_undetermined_container_quarantined(with_quarantine, status):
+    """Anything short of a definitive answer leaves the block in place. That is the point."""
+    ui = with_quarantine
+    ui.instagram_api.get_container_status.return_value = status
+    main([])
+    ui.instagram_state.clear_publish_reconciliation.assert_not_called()
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
+
+
+def test_the_drain_keeps_an_unreachable_container_quarantined(with_quarantine):
+    """A Graph outage is not an answer — it is the reason the quarantine exists."""
+    ui = with_quarantine
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    main([])
+    ui.instagram_state.clear_publish_reconciliation.assert_not_called()
+    ui.instagram_state.record_publish_reconciliation.assert_called_once()
+
+
+def test_the_drain_runs_even_when_instagram_is_disabled(with_quarantine, monkeypatch):
+    """Disabling the feature must not strand a Reel that may be live on the account.
+
+    Same reasoning as the share-link drain: the obligation outlives the feature being
+    switched on, and reading a container's status needs only the Page token.
+    """
+    ui = with_quarantine
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    main([])
+    ui.instagram_state.record_recovered_publish.assert_called_once()
+
+
+def test_the_drain_is_skipped_without_a_page_token(base, monkeypatch):
+    """Nothing to ask with. Not an error — the entry simply waits for the next tick."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = [dict(_QUARANTINE_ENTRY)]
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    main([])                                  # must not raise
+    ui.instagram_api.get_container_status.assert_not_called()
+    ui.instagram_state.clear_publish_reconciliation.assert_not_called()
+
+
+def test_the_drain_runs_before_any_upload_work(with_pending):
+    """Resolving an unknown publish is what UNBLOCKS the queue, so it goes first.
+
+    Ordered against claim_pending_upload() — the gateway to actually working a job —
+    rather than against reading state, which the unconditional orphan sweep does first
+    on every tick for its own unrelated reasons.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = [dict(_QUARANTINE_ENTRY)]
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    order = []
+    ui.instagram_state.clear_publish_reconciliation.side_effect = (
+        lambda *a, **k: order.append("drained") or True
+    )
+    ui.instagram_state.claim_pending_upload.side_effect = (
+        lambda *a, **k: order.append("claimed") or "claimed"
+    )
+    main([])
+    assert order[:2] == ["drained", "claimed"]
+
+
+def test_an_entry_with_no_container_id_is_skipped(base):
+    """Defensive: a malformed entry must not crash the tick for everything else."""
+    import scripts.upload_instagram as ui
+    ui.instagram_state.list_publish_reconciliations.return_value = [
+        {"project_name": _PROJECT, "idempotency_key": _IDEM_KEY}
+    ]
+    main([])                                  # must not raise
+    ui.instagram_api.get_container_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# What is and is not quarantined
+# ---------------------------------------------------------------------------
+
+def test_a_container_that_never_reached_publish_is_not_quarantined(with_pending):
+    """The stuck-container case: 3 poll timeouts, no publish call, no block.
+
+    publish_container() was never invoked, so Meta cannot have published it. Quarantining
+    would hold a re-approval hostage for a video that demonstrably never went live.
+    """
+    import scripts.upload_instagram as ui
+    _set_attempt(with_pending, 2)
+    ui.instagram_api.get_container_status.return_value = "IN_PROGRESS"
+    main([])
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+
+
+def test_a_prior_attempts_publish_marker_drives_the_terminal_decision(base, tmp_path):
+    """The second round-2 defect: the alert read only THIS attempt's flag.
+
+    Attempt 3 fails before reaching publish, but attempt 2 already asked Meta to publish
+    and never heard back. The durable marker is what carries that across, so the job is
+    quarantined and the operator is told the Reel may be live — instead of being told this
+    was an ordinary failure at the precise moment that distinction matters most.
+    """
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    ui.instagram_state.get_pending_upload.return_value = dict(
+        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID,
+        attempt_count=2, publish_attempted_at="2026-08-31T14:05:00Z",
+    )
+    # This attempt dies while classifying, long before any publish call of its own.
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
+    main([])
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" in text
+
+
+def test_a_finished_container_clears_a_stale_publish_marker(with_pending):
+    """Instagram saying FINISHED is authoritative: nothing was published from it.
+
+    So an earlier attempt's marker must not survive to quarantine the job later — the
+    question has been answered.
+    """
+    import scripts.upload_instagram as ui
+    with_pending["container_id"] = _CONTAINER_ID
+    with_pending["publish_attempted_at"] = "2026-08-31T14:05:00Z"
+    _set_attempt(with_pending, 2)
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    # The terminal settle also reports FINISHED -> definitively unpublished.
+    main([])
+    ui.instagram_state.record_publish_reconciliation.assert_not_called()
+
+
+def test_the_publish_marker_is_written_before_the_publish_call(with_pending):
+    """Ordering is the whole guarantee — afterwards would miss the case it describes."""
+    import scripts.upload_instagram as ui
+    order = []
+    ui.instagram_state.mark_publish_attempted.side_effect = lambda *a: order.append("marked")
+    ui.instagram_api.publish_container.side_effect = lambda *a: (
+        order.append("published") or _POST_ID
+    )
+    main([])
+    assert order == ["marked", "published"]

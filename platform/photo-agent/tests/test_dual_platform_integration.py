@@ -43,6 +43,23 @@ _PERMALINK = "https://www.instagram.com/reel/AbCdEfGhIjK/"
 _SHARE_LINK = "https://drive.google.com/uc?export=download&id=drive_file_1"
 
 
+@pytest.fixture(autouse=True)
+def isolated_activity_log(tmp_path, monkeypatch):
+    """Keep the activity log out of the developer's real client log directory.
+
+    instagram_logger resolves LOG_DIR from FIELDKIT_LOG_DIR at IMPORT time, and the
+    scripts under test load the real client .env at import — so any logging call that
+    is not individually mocked appends to the actual checkout's photo-agent.log. Relying
+    on the mock list staying exhaustive is what let that happen; patching the path makes
+    it structural, and keeps newly-added log events from silently reintroducing it.
+    """
+    import tools.instagram_logger as ig_logger
+    log_dir = tmp_path / "activity_log"
+    monkeypatch.setattr(ig_logger, "LOG_DIR", log_dir)
+    monkeypatch.setattr(ig_logger, "LOG_FILE", log_dir / "photo-agent.log")
+    return ig_logger
+
+
 @pytest.fixture
 def real_state(tmp_path, monkeypatch):
     """Point BOTH real state modules at isolated tmp files in one data dir.
@@ -66,6 +83,13 @@ def real_state(tmp_path, monkeypatch):
     wh.record_heartbeat("facebook")
     wh.record_heartbeat("instagram")
     monkeypatch.setenv("FIELDKIT_LOG_DIR", str(tmp_path / "logs"))
+    # Pin VIDEO_TMP_DIR explicitly. Left unset it DEFAULTS to a path under
+    # FIELDKIT_DATA_DIR — but only if the ambient environment has not already set it to
+    # something absolute, in which case the `video` fixture's file would sit outside the
+    # allowed root and _delete_local_file would refuse it. These tests would then pass or
+    # fail according to the developer's shell rather than the coordination behaviour they
+    # exist to check.
+    monkeypatch.setenv("VIDEO_TMP_DIR", str(tmp_path / "data" / "photo-agent" / "tmp"))
     return data_dir
 
 
@@ -78,7 +102,12 @@ def video(real_state, tmp_path):
     wrong reason — the file would survive because deletion was refused, not because
     the cross-platform coordination held it back.
     """
-    tmp_root = tmp_path / "data" / "photo-agent" / "tmp"
+    # Resolved through paths.get_video_tmp_root(), the SAME function _delete_local_file
+    # uses, rather than by rebuilding the default layout by hand. Hard-coding it meant the
+    # fixture and the code under test could disagree about where the root is — which is
+    # exactly what happened once VIDEO_TMP_DIR was set in the environment.
+    import tools.paths as paths
+    tmp_root = paths.get_video_tmp_root()
     tmp_root.mkdir(parents=True, exist_ok=True)
     p = tmp_root / "video.mp4"
     p.write_bytes(b"\x00" * 64)
@@ -597,3 +626,137 @@ def test_disabled_instagram_drains_cleanup_without_publishing(cron, video, monke
 
     assert ig_state.list_share_cleanups() == []
     ui.instagram_api.create_media_container.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# FR-011 end to end: a lost publish response must never become a second Reel
+# ---------------------------------------------------------------------------
+#
+# Walks the exact sequence a cross-vendor review identified, against the REAL state
+# machines rather than mocks — because every component of the guarantee tested
+# elsewhere in isolation can be individually correct while the path between them
+# leaks. The sequence:
+#
+#   1. publish_container() succeeds at Meta, but its response is lost.
+#   2. The saved container cannot be reconciled for the whole retry budget.
+#   3. The final attempt takes the terminal path and calls mark_failed().
+#   4. mark_failed() deletes the record, and container_id with it.
+#   5. A later re-approval is accepted, because no tombstone remains.
+#   6. A fresh container is created and published -> duplicate Reel, irreversibly.
+#
+# Steps 5 and 6 are what must now be impossible.
+
+
+def _lost_publish_then_unreachable(ui):
+    """Make the publish land at Meta invisibly, and every later question go unanswered.
+
+    One FINISHED poll lets the first attempt reach the publish call; after that nothing
+    can be established about the container, which is precisely the state that used to end
+    with the container id discarded and the key free.
+    """
+    calls = {"n": 0}
+
+    def _status(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "FINISHED"
+        raise InstagramUploadError("Graph API unavailable")
+
+    ui.instagram_api.get_container_status.side_effect = _status
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError(
+        "Publish request failed: connection reset by peer"
+    )
+
+
+def test_an_unreconcilable_publish_is_quarantined_not_forgotten(cron, video):
+    """Steps 1-4: the job ends, but the obligation does not."""
+    import scripts.upload_instagram as ui
+    _lost_publish_then_unreachable(ui)
+
+    _run_instagram_until_resolved()
+
+    assert ig_state.get_pending_upload() is None            # step 4: record really is gone
+    assert ig_state.is_published(_IDEM_KEY) is False        # nothing was ever confirmed
+    entries = ig_state.list_publish_reconciliations()
+    assert [e["container_id"] for e in entries] == [_CONTAINER_ID]
+    assert entries[0]["idempotency_key"] == _IDEM_KEY
+
+
+def test_a_re_approval_cannot_publish_a_second_reel(cron, video, mocker):
+    """Steps 5-6, the irreversible outcome — now refused.
+
+    The re-approval runs the real approve path again. Before the quarantine existed it
+    would have enqueued a fresh job, and the next cron tick would have built and published
+    a second container onto the client's real Instagram account.
+    """
+    import scripts.check_approval as ca
+    import scripts.upload_instagram as ui
+    _lost_publish_then_unreachable(ui)
+    _run_instagram_until_resolved()
+    assert ig_state.has_unresolved_publish(_IDEM_KEY) is True
+
+    created_before = ui.instagram_api.create_media_container.call_count
+    approve_main(["--callback-data", "approve"])
+
+    assert ig_state.get_pending_upload() is None            # nothing re-queued
+    ig_main([])
+    assert ui.instagram_api.create_media_container.call_count == created_before
+    ui.instagram_api.publish_container.assert_called_once()  # still exactly the one attempt
+
+
+def test_the_quarantine_does_not_block_the_facebook_side(cron, video):
+    """FR-013 holds even here: Facebook publishes normally and is not held back."""
+    import scripts.upload_instagram as ui
+    _lost_publish_then_unreachable(ui)
+    _run_instagram_until_resolved()
+    fb_main([])
+    assert fb_state.is_published(_IDEM_KEY) is True
+
+
+def test_a_later_tick_resolves_the_quarantine_as_published(cron, video):
+    """Instagram finally answers PUBLISHED: recorded once, key retired permanently."""
+    import scripts.upload_instagram as ui
+    _lost_publish_then_unreachable(ui)
+    _run_instagram_until_resolved()
+
+    # The Graph API comes back and reports what actually happened.
+    ui.instagram_api.get_container_status.side_effect = None
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    ig_main([])
+
+    assert ig_state.list_publish_reconciliations() == []
+    assert ig_state.is_published(_IDEM_KEY) is True
+    entry = ig_state.find_published(_PROJECT)
+    assert entry["recovered"] is True
+    assert entry["ig_container_id"] == _CONTAINER_ID
+    # And the key stays retired: a re-approval is still refused, permanently this time.
+    approve_main(["--callback-data", "approve"])
+    assert ig_state.get_pending_upload() is None
+
+
+def test_a_later_tick_resolves_the_quarantine_as_never_published(cron, video):
+    """Instagram answers EXPIRED: nothing went live, so the video becomes re-approvable.
+
+    The mirror image, and just as important — a quarantine that could never lift would
+    turn one lost response into a permanently un-postable video.
+    """
+    import scripts.upload_instagram as ui
+    _lost_publish_then_unreachable(ui)
+    _run_instagram_until_resolved()
+
+    ui.instagram_api.get_container_status.side_effect = None
+    ui.instagram_api.get_container_status.return_value = "EXPIRED"
+    ig_main([])
+
+    assert ig_state.list_publish_reconciliations() == []
+    assert ig_state.has_unresolved_publish(_IDEM_KEY) is False
+    assert ig_state.is_published(_IDEM_KEY) is False
+
+    # Re-approval now goes through, and a fresh upload can publish for real.
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    ui.instagram_api.publish_container.side_effect = None
+    ui.instagram_api.publish_container.return_value = _IG_POST_ID
+    approve_main(["--callback-data", "approve"])
+    assert ig_state.get_pending_upload() is not None
+    ig_main([])
+    assert ig_state.is_published(_IDEM_KEY) is True

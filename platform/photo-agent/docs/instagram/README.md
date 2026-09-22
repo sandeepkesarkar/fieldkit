@@ -108,12 +108,33 @@ Re-running the script against an already-configured client is safe: it updates
 * * * * * /usr/local/bin/python3 /path/to/fieldkit/platform/photo-agent/scripts/upload_instagram.py --source cron >> /path/to/fieldkit/logs/cron.log 2>&1
 ```
 
-Verify it is really running before relying on it — one minute after saving the
-crontab, this file should exist and carry a recent `instagram` timestamp:
+Verify it is really running before relying on it. One minute after saving the
+crontab, the heartbeat file should exist and carry a recent `instagram` timestamp.
+
+`FIELDKIT_DATA_DIR` is set in the **client** `.env`, not in your shell, so read it
+from there rather than expecting it to be exported — run this from the fieldkit
+checkout:
 
 ```bash
-cat "$FIELDKIT_DATA_DIR/photo-agent/worker_health.json"
+client=$(sed -n 's/^CLIENT_NAME=//p' .env)
+data_dir=$(sed -n 's/^FIELDKIT_DATA_DIR=//p' "clients/$client/src/photo-agent/.env")
+cat "$data_dir/photo-agent/worker_health.json"
 ```
+
+With the conventional layout from `.env.example` that resolves to
+`clients/<client>/data/photo-agent/worker_health.json`, which you can also just
+`cat` directly. Either way you want something like this, with a timestamp from the
+last minute or two:
+
+```json
+{
+  "instagram": { "last_seen_at": "2026-09-22T09:41:00.123456+00:00" },
+  "facebook":  { "last_seen_at": "2026-09-22T09:41:00.098765+00:00" }
+}
+```
+
+No file, no `instagram` key, or a timestamp more than an hour old all mean the same
+thing: the cron is not running, and approvals will not queue Instagram jobs.
 
 The two upload scripts are independent: separate state files, separate lock
 files, separate claim namespaces. Neither serializes against the other, and
@@ -325,7 +346,7 @@ script asks Instagram what became of it:
 | anything else, or unreachable | Treated as a retryable failure. Not knowing a container's fate is never grounds for creating a second one. |
 
 The same check runs when the attempt budget is exhausted, because the final attempt
-can crash after publishing exactly like any other — and by then the pending record is
+can die after publishing exactly like any other — and by then the pending record is
 already cleared, so this is the last chance to notice.
 
 A recovered publish records `ig_post_id: null` and the container ID instead. The
@@ -334,10 +355,47 @@ container → media lookup, and guessing from the account's recent media could j
 easily match something a human posted. The Telegram message says so rather than
 inventing a link.
 
-If reconciliation is impossible and the job gives up, the alert says the Reel **may
-already be live** and to check the account *before* re-approving — because an owner
-who believes nothing was posted will re-approve, and that is precisely how a
-duplicate Reel lands on a client's account.
+**When the question cannot be answered at all.** Surviving *attempts* is not enough
+on its own: if the publish lands, its response is lost, and the container then cannot
+be reconciled for the whole retry budget, `mark_failed()` would discard the record —
+and the container ID with it — leaving nothing that could ever check again and no
+reason to refuse a later re-approval. A Telegram warning is not a control here; it
+asks a person to remember a caveat at the exact moment the system has told them the
+upload failed.
+
+So an unsettled container is **quarantined durably** in
+`pending_publish_reconciliations`, and that entry:
+
+- **outlives the job.** It is stored outside the upload record, so `mark_failed()`
+  clearing the record does not touch it.
+- **blocks its idempotency key.** `check_approval.py` refuses to re-queue that video
+  and says why (`IG_BLOCKED`); `set_pending_upload()` refuses it too, as a backstop.
+  Note this is what an idempotency check alone cannot do — a publish whose response
+  was lost never reached `published_idempotency_keys`.
+- **keeps being retried.** `_drain_publish_reconciliations()` asks Instagram again on
+  every tick, including ticks with no job and ticks where Instagram is no longer
+  enabled for the client.
+- **clears only on a definitive answer.** `PUBLISHED` → recorded and the key retired
+  permanently; `FINISHED` / `ERROR` / `EXPIRED` → never published, quarantine lifted
+  (`IG_RESOLVED`), owner told it is safe to re-approve.
+
+This reuses the shape of `pending_share_cleanups` deliberately rather than inventing
+a third mechanism: both are unresolved external obligations that must outlive the
+work that created them.
+
+Note what it does **not** change: `instagram_state.mark_failed()` still discards the
+whole record, mirroring `facebook_state.mark_failed()` exactly (deviation note 1).
+Keeping the obligation *outside* the record is what lets the two state modules stay
+aligned while Instagram still satisfies FR-011.
+
+**Facebook has the same latent exposure, and it is not fixed here.** If
+`facebook_api.upload_video()`'s response is lost, the video may be live with no record
+of it, and a re-approval would post it twice. It cannot be closed the same way: a Page
+video upload is a single call that exposes no handle before it completes, so there is
+nothing to reconcile against afterwards — no container, no client-supplied idempotency
+token. Closing it needs a different mechanism (searching the Page's recent videos, or
+a resumable upload session handle), which is out of scope for this feature and is
+tracked separately rather than left implied by an Instagram-only fix.
 
 ### The account a job publishes to
 
@@ -363,6 +421,9 @@ as every other pipeline event, in the same pipe-delimited format:
 | `IG_CONT_RDY` | Container finished processing, ready to publish |
 | `IG_PUBLISHED` | Reel published (with post ID) |
 | `IG_RECOVER` | A container was found **already published** after an interrupted run; recorded without republishing |
+| `IG_UNKNOWN` | A publish was attempted and its outcome could not be established — container quarantined, key blocked |
+| `IG_RESOLVED` | A quarantined container was finally confirmed as never published — quarantine lifted |
+| `IG_BLOCKED` | An enqueue was **refused** because that video has an unresolved publish |
 | `IG_FAILED` | One attempt failed (retryable, with error detail) |
 | `IG_EXHAUSTED` | All 3 attempts consumed — terminal |
 | `IG_TOKEN_EXP` | Page token invalid/expired — reconnect needed |
@@ -371,11 +432,19 @@ Two conditions are alerted to the admin over Telegram but not given their own lo
 event: a share link that could not be revoked (see above), and a publish whose
 permalink lookup failed (the Reel is live; only the link is missing).
 
-No token value or PII is ever written to the log: none of the logging functions
-even accepts a token argument.
+No token value or PII is ever written to the log. No logging function accepts a
+token argument, and `_safe_error()` redacts credentials out of arbitrary exception
+text before it is written — see `tools/redaction.py`.
 
-State lives in `$FIELDKIT_DATA_DIR/photo-agent/instagram_state.json` — a separate
-file from `facebook_state.json`.
+State lives in `<FIELDKIT_DATA_DIR>/photo-agent/instagram_state.json` — a separate
+file from `facebook_state.json`. Two lists in it are worth knowing by name when
+auditing:
+
+- `pending_share_cleanups` — Drive links that may still be public
+- `pending_publish_reconciliations` — publishes whose outcome is unknown. A
+  non-empty list means a Reel **may** be live on the account with nothing recording
+  it, and that its idempotency key is blocked against re-approval until Instagram
+  answers. Both empty is the healthy state.
 
 ---
 

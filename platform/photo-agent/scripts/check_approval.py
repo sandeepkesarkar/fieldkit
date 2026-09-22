@@ -296,6 +296,30 @@ def _enqueue_instagram_upload(
         )
         return
     idem_key = str(telegram_message_id)
+    if instagram_state.has_unresolved_publish(idem_key):
+        # An earlier upload for this exact video reached Instagram's publish step and never
+        # learned whether it succeeded. is_published() below cannot catch this: a publish
+        # whose response was lost never made it into published_idempotency_keys, so the
+        # idempotency check would wave the re-approval straight through and post a SECOND
+        # Reel. The block lifts by itself the moment upload_instagram.py gets a definitive
+        # answer out of Instagram — which it keeps asking for on every tick.
+        _log.error(
+            "IG upload NOT enqueued for project=%s key=%s — a previous publish for this "
+            "video is still unresolved; refusing to risk a duplicate Reel (FR-011)",
+            project_name, idem_key,
+        )
+        try:
+            instagram_logger.log_enqueue_blocked_unresolved(project_name)
+        except (OSError, ValueError) as exc:
+            _log.error("could not log the blocked IG enqueue: %s", exc)
+        _notify_admin(
+            f"⚠️ Instagram: {project_name} was NOT re-queued. An earlier attempt already "
+            "asked Instagram to publish this video and never learned the outcome, so "
+            "posting it again could duplicate a live Reel. Facebook is unaffected. "
+            "FieldKit is still checking and will unblock this automatically once "
+            "Instagram answers."
+        )
+        return
     try:
         if instagram_state.is_published(idem_key):
             _log.warning("IG upload already published for key=%s — skipping enqueue", idem_key)

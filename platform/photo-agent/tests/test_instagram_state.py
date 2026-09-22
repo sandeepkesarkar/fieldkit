@@ -773,3 +773,201 @@ def test_recovered_entries_respect_the_history_cap(valid_record):
     import json
     history = json.loads(ig_state.STATE_FILE.read_text())["published_history"]
     assert len(history) == ig_state._PUBLISH_HISTORY_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# pending_publish_reconciliations — FR-011 across TERMINAL failure
+# ---------------------------------------------------------------------------
+#
+# Keeping container_id alive across attempts closes the crash window within a job.
+# It does not close it across the end of the job: if the publish lands, its response
+# is lost, and the container then cannot be reconciled for the whole retry budget,
+# mark_failed() discards the record and container_id with it. Nothing can check
+# again, and a re-approval is accepted because the key never reached
+# published_idempotency_keys. These tests pin the durable quarantine that closes it.
+
+def test_record_publish_reconciliation_registers_the_container():
+    """An unknown publish outcome is written down, not merely warned about."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    entries = ig_state.list_publish_reconciliations()
+    assert [e["container_id"] for e in entries] == ["container_abc"]
+    assert entries[0]["idempotency_key"] == "42"
+    assert entries[0]["project_name"] == "kitchen_remodel"
+
+
+def test_an_unresolved_publish_survives_mark_failed(valid_record):
+    """THE property the round-2 fix was missing.
+
+    mark_failed() discards the whole record — deliberately, mirroring facebook_state —
+    so anything stored ON the record dies with it. The quarantine is stored outside the
+    record precisely so that the two can both be true.
+    """
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    ig_state.mark_failed("42")
+    assert ig_state.get_pending_upload() is None          # record really is gone
+    assert ig_state.has_unresolved_publish("42") is True  # obligation really is not
+
+
+def test_an_unresolved_publish_blocks_re_approval(valid_record):
+    """The control itself: the same video cannot be queued again while its fate is unknown."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    with pytest.raises(ValueError, match="unresolved publish"):
+        ig_state.set_pending_upload(valid_record)
+
+
+def test_the_block_is_scoped_to_the_held_key(valid_record):
+    """A different video is not collateral damage — only the unresolved one is held."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    other = dict(valid_record, idempotency_key="99")
+    ig_state.set_pending_upload(other)                    # must not raise
+    assert ig_state.get_pending_upload()["idempotency_key"] == "99"
+    assert ig_state.has_unresolved_publish("99") is False
+
+
+def test_clearing_the_quarantine_releases_the_key(valid_record):
+    """Once Instagram says it never published, the video must become re-approvable."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    assert ig_state.clear_publish_reconciliation("container_abc") is True
+    assert ig_state.has_unresolved_publish("42") is False
+    ig_state.set_pending_upload(valid_record)             # must not raise
+
+
+def test_clearing_an_unknown_container_reports_false():
+    """Distinguishes "resolved it" from "there was nothing there"."""
+    assert ig_state.clear_publish_reconciliation("never_recorded") is False
+
+
+def test_recording_a_publish_recovery_also_permanently_retires_the_key(valid_record):
+    """The PUBLISHED resolution is doubly safe: quarantine cleared, key in the published list."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    ig_state.clear_publish_reconciliation("container_abc")
+    assert ig_state.has_unresolved_publish("42") is False
+    with pytest.raises(ValueError, match="already in published_idempotency_keys"):
+        ig_state.set_pending_upload(valid_record)
+
+
+def test_re_recording_bumps_the_check_count_rather_than_duplicating():
+    """The drain re-records on every failed check; the list must not grow per tick."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    entries = ig_state.list_publish_reconciliations()
+    assert len(entries) == 1
+    assert entries[0]["attempts"] == 2
+
+
+def test_the_admin_is_alerted_on_the_first_record():
+    """A Reel that may be live on a client account is not something to notice silently."""
+    assert ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    ) is not None
+
+
+def test_the_admin_is_not_re_alerted_within_the_reminder_window():
+    """The drain runs every minute; alerting every minute would be noise, not signal."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    assert ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    ) is None
+
+
+def test_the_admin_is_re_alerted_once_the_window_elapses(monkeypatch):
+    """A permanently-unresolvable container must keep surfacing, not be mentioned once."""
+    monkeypatch.setattr(ig_state, "_PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS", 0)
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    for _ in range(3):
+        assert ig_state.record_publish_reconciliation(
+            "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+        ) is not None
+
+
+def test_has_unresolved_publish_is_false_with_no_state_file():
+    """Read on every approval, including the very first one on a new client."""
+    assert ig_state.has_unresolved_publish("42") is False
+
+
+def test_quarantines_for_different_containers_coexist():
+    """Two videos can be unresolved at once without either masking the other."""
+    ig_state.record_publish_reconciliation(
+        "container_a", project_name="kitchen", idempotency_key="1"
+    )
+    ig_state.record_publish_reconciliation(
+        "container_b", project_name="bathroom", idempotency_key="2"
+    )
+    assert ig_state.has_unresolved_publish("1") is True
+    assert ig_state.has_unresolved_publish("2") is True
+    ig_state.clear_publish_reconciliation("container_a")
+    assert ig_state.has_unresolved_publish("1") is False
+    assert ig_state.has_unresolved_publish("2") is True
+
+
+# --- mark_publish_attempted: the marker that makes the quarantine precise ---
+
+def test_mark_publish_attempted_records_the_marker(valid_record):
+    """Written BEFORE publish_container(), so it exists even if that call never returns."""
+    ig_state.set_pending_upload(valid_record)
+    _claim("42")
+    ig_state.mark_publish_attempted("42")
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
+
+
+def test_the_publish_marker_survives_a_released_claim(valid_record):
+    """The next attempt has to know an earlier one already asked Meta to publish."""
+    ig_state.set_pending_upload(valid_record)
+    _claim("42")
+    ig_state.set_container_id("42", "container_abc")
+    ig_state.mark_publish_attempted("42")
+    ig_state.release_claim("42")
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
+    assert ig_state.get_pending_upload()["container_id"] == "container_abc"
+
+
+def test_a_new_container_clears_the_publish_marker(valid_record):
+    """A stale marker on a fresh container would quarantine a job for no reason.
+
+    The two fields are one fact — which container is in play, and whether anything has
+    been published from it — so set_container_id() resets the marker in the same
+    transaction.
+    """
+    ig_state.set_pending_upload(valid_record)
+    _claim("42")
+    ig_state.set_container_id("42", "container_abc")
+    ig_state.mark_publish_attempted("42")
+    ig_state.set_container_id("42", "container_xyz")
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is None
+    assert ig_state.get_pending_upload()["container_id"] == "container_xyz"
+
+
+def test_a_record_without_the_marker_reads_as_not_attempted(valid_record):
+    """Back-compatibility: a job enqueued before this field existed must still work."""
+    ig_state.set_pending_upload(valid_record)
+    assert ig_state.get_pending_upload().get("publish_attempted_at") is None
+
+
+def test_mark_publish_attempted_ignores_a_mismatched_key(valid_record):
+    """Compare-and-update, like every other mutator here."""
+    ig_state.set_pending_upload(valid_record)
+    _claim("42")
+    ig_state.mark_publish_attempted("999")
+    assert ig_state.get_pending_upload().get("publish_attempted_at") is None

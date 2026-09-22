@@ -88,6 +88,11 @@ __all__ = [
     "find_published",
     "has_outstanding_job",
     "record_recovered_publish",
+    "mark_publish_attempted",
+    "record_publish_reconciliation",
+    "list_publish_reconciliations",
+    "clear_publish_reconciliation",
+    "has_unresolved_publish",
     "record_share_intent",
     "record_share_cleanup",
     "list_share_cleanups",
@@ -112,6 +117,7 @@ _DEFAULTS = {
     "published_idempotency_keys": [],
     "published_history": [],
     "pending_share_cleanups": [],
+    "pending_publish_reconciliations": [],
 }
 
 # Cap on published_history so instagram_state.json doesn't grow without bound over a client's
@@ -124,6 +130,13 @@ _PUBLISH_HISTORY_LIMIT = 100
 # problem silently becomes permanent. Deliberately a wall-clock interval rather than a retry
 # count: the cron cadence is a deployment detail, "you have been told once a day" is not.
 _SHARE_CLEANUP_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
+
+# Same cadence, same reasoning, for a container whose publish outcome is still unknown
+# (see the pending_publish_reconciliations section at the end of this module). A Reel that
+# may or may not be live on a client's account is at least as worth a daily reminder as a
+# public link, and for the same reason: the retry loop is silent, so without a recurring
+# alert a permanently-unresolvable container would be mentioned once and then never again.
+_PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 def _read(file_obj) -> dict:
@@ -191,6 +204,18 @@ def set_pending_upload(record: dict) -> None:
             if key in data.get("published_idempotency_keys", []):
                 raise ValueError(
                     f"set_pending_upload: idempotency_key {key!r} already in published_idempotency_keys"
+                )
+            # An unresolved publish holds this key hostage until Meta is definitive about
+            # it. Accepting a new job here would let a re-approval create and publish a
+            # SECOND container for a Reel that may already be live — the duplicate FR-011
+            # forbids, and the one an idempotency check alone cannot catch, because a
+            # publish whose response was lost never made it into published_idempotency_keys.
+            # check_approval.py checks has_unresolved_publish() first and reports it
+            # properly; this is the backstop that makes the guarantee structural.
+            if _unresolved_publish_entry(data, key) is not None:
+                raise ValueError(
+                    f"set_pending_upload: idempotency_key {key!r} has an unresolved publish "
+                    "awaiting reconciliation with Instagram"
                 )
             data["pending_instagram_upload"] = record
             _write(f, data)
@@ -340,12 +365,46 @@ def set_container_id(idempotency_key: str, container_id: str) -> None:
     persisted before the container is ever published so that an interrupted publish can be
     reconciled against it rather than blindly repeated (FR-011) — see the module docstring.
 
+    Clears publish_attempted_at at the same time, in the same transaction. The two fields
+    are one fact — "this is the container in play, and whether anything has been published
+    from it" — and a stale marker carried onto a fresh container would quarantine a job
+    whose new container demonstrably never reached a publish call.
+
     Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
     """
     def _update(record, data):
         record["container_id"] = container_id
+        record["publish_attempted_at"] = None
     _update_pending(idempotency_key, _update)
     logger.info("set_container_id: key=%s container_id=%s", idempotency_key, container_id)
+
+
+def mark_publish_attempted(idempotency_key: str) -> None:
+    """Record, BEFORE calling it, that publish_container() is about to be attempted.
+
+    The whole point is that it is written first. Afterwards is too late: the failure this
+    guards against is the process dying, or the response being lost, during that very call,
+    and a marker written after the call returns would be missing in exactly the case it
+    exists to describe.
+
+    What it buys is the ability to tell "we never asked Meta to publish this container"
+    from "we asked and never heard back". The first is definitively unpublished and needs
+    no further thought; the second is an unknown that must be quarantined rather than
+    retried blindly (see pending_publish_reconciliations below). Without the distinction
+    the only safe policy would be to quarantine every leftover container, which would
+    needlessly block re-approval for the ordinary stuck-container case.
+
+    Optional field: a record written before this existed simply has no key, which reads as
+    "not attempted" — the same answer it would have given.
+
+    Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _update(record, data):
+        record["publish_attempted_at"] = now
+    _update_pending(idempotency_key, _update)
+    logger.info("mark_publish_attempted: key=%s", idempotency_key)
 
 
 def release_claim(idempotency_key: str) -> None:
@@ -692,5 +751,183 @@ def clear_share_cleanup(file_id: str) -> bool:
                 _write(f, data)
                 logger.info("clear_share_cleanup: file_id=%s revoked", file_id)
             return removed
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# Unresolved publishes awaiting reconciliation with Instagram
+# ---------------------------------------------------------------------------
+#
+# publish_container() is an irreversible side effect on a real client account;
+# mark_published() is the durable record of it. A crash, a kill, or a lost HTTP
+# response between the two leaves Meta holding a live Reel FieldKit has no record
+# of. Keeping container_id alive across ATTEMPTS closes most of that gap — the
+# next attempt asks Instagram what became of the container before publishing
+# anything — but it does not close it across TERMINAL FAILURE.
+#
+# The surviving sequence: the publish lands at Meta, its response is lost, and the
+# container then cannot be reconciled for the whole retry budget (a Graph outage, a
+# network partition, a status code this code does not recognise). mark_failed()
+# discards the record, container_id goes with it, and nothing is left that could
+# ever check again. A later re-approval is then accepted — the key never reached
+# published_idempotency_keys, because the publish was never observed — and a second
+# container is created and published. Duplicate Reel, irreversible, on a client's
+# real account. An advisory Telegram warning is not a control: it asks a human to
+# remember something at the exact moment the system has told them it failed.
+#
+# So an unknown fate is quarantined DURABLY here instead, and stays quarantined
+# until Meta is definitive. This list is keyed by container id, carries the
+# idempotency key it is holding, and — exactly like pending_share_cleanups above —
+# is independent of the upload job's lifecycle: the job is terminal, the obligation
+# is not. That shape is reused deliberately rather than invented again; the two are
+# the same category of thing (an unresolved external obligation that must outlive
+# the work that created it, be retried on every later tick, and clear only on
+# genuine resolution), and a third mechanism would be a third thing to get right.
+#
+# Note what this does NOT require: mark_failed() still discards the whole record,
+# mirroring facebook_state.mark_failed() exactly as before. Storing the obligation
+# OUTSIDE the job record is what lets the two state modules stay aligned while
+# Instagram still satisfies FR-011. See upload_instagram.py's module docstring for
+# the Facebook side, which has the same latent exposure and cannot be fixed this
+# way — a Page video upload exposes no handle that could be reconciled after the
+# fact.
+
+
+def _unresolved_publish_entry(data: dict, idempotency_key: str) -> dict | None:
+    """Return the unresolved-publish entry holding idempotency_key, or None.
+
+    Takes already-read state rather than reading it, so callers that are mid-transaction
+    under the exclusive lock can use it without re-entering the lock.
+    """
+    for entry in data.get("pending_publish_reconciliations", []):
+        if entry.get("idempotency_key") == idempotency_key:
+            return entry
+    return None
+
+
+def has_unresolved_publish(idempotency_key: str) -> bool:
+    """True if a publish for idempotency_key is still awaiting a definitive answer.
+
+    Read by check_approval.py before enqueueing, so a re-approval of a video whose fate is
+    unknown is refused and explained rather than silently turned into a second Reel.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_FILE, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return _unresolved_publish_entry(_read(f), idempotency_key) is not None
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
+
+
+def record_publish_reconciliation(
+    container_id: str, *, project_name: str, idempotency_key: str
+) -> dict | None:
+    """Record that container_id's publish outcome is unknown and must keep being checked.
+
+    Returns the entry dict when the admin SHOULD BE ALERTED right now, or None when they
+    should not — the same contract, and for the same reason, as record_share_cleanup():
+    the decision needs the entry's alert history, and deciding-and-stamping has to happen
+    inside the same exclusive-lock transaction that bumps the attempt count, or two
+    overlapping ticks could both decide to alert about the same container.
+
+    The admin is alerted on the FIRST record and then every
+    _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS for as long as it stays unresolved, because
+    this is a state a human may eventually have to resolve by looking at the account.
+
+    Idempotent per container: re-recording bumps attempts rather than duplicating.
+    """
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            pending = data.setdefault("pending_publish_reconciliations", [])
+            for entry in pending:
+                if entry.get("container_id") != container_id:
+                    continue
+                entry["attempts"] = entry.get("attempts", 1) + 1
+                entry["last_attempt_at"] = now
+                should_alert = _has_elapsed(
+                    entry.get("last_alerted_at"),
+                    _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS,
+                    now_dt,
+                )
+                if should_alert:
+                    entry["last_alerted_at"] = now
+                _write(f, data)
+                logger.warning(
+                    "record_publish_reconciliation: container_id=%s still unresolved after "
+                    "%d checks (re-alerting=%s)",
+                    container_id, entry["attempts"], should_alert,
+                )
+                return dict(entry) if should_alert else None
+
+            entry = {
+                "container_id": container_id,
+                "project_name": project_name,
+                "idempotency_key": idempotency_key,
+                "recorded_at": now,
+                "last_attempt_at": now,
+                "last_alerted_at": now,
+                "attempts": 1,
+            }
+            pending.append(entry)
+            _write(f, data)
+            logger.error(
+                "record_publish_reconciliation: container_id=%s project=%s key=%s — publish "
+                "outcome UNKNOWN; the Reel may be live. Re-approval of this key is blocked "
+                "until Instagram is definitive.",
+                container_id, project_name, idempotency_key,
+            )
+            return dict(entry)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def list_publish_reconciliations() -> list[dict]:
+    """Return the containers whose publish outcome is still unknown (oldest first)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_FILE, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return list(_read(f).get("pending_publish_reconciliations", []))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return []
+
+
+def clear_publish_reconciliation(container_id: str) -> bool:
+    """Drop container_id from the unresolved list once Instagram has been definitive.
+
+    Call this ONLY on a definitive answer — PUBLISHED (record it via
+    record_recovered_publish() first), or FINISHED/ERROR/EXPIRED, all three of which mean
+    the container was never published. Clearing on anything less would release the
+    idempotency key while the Reel's fate is still unknown, which is the whole thing this
+    list exists to prevent.
+
+    Returns True if an entry was removed, False if there was nothing recorded for it.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            pending = data.get("pending_publish_reconciliations", [])
+            remaining = [e for e in pending if e.get("container_id") != container_id]
+            if len(remaining) == len(pending):
+                return False
+            data["pending_publish_reconciliations"] = remaining
+            _write(f, data)
+            logger.info("clear_publish_reconciliation: container_id=%s resolved", container_id)
+            return True
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)

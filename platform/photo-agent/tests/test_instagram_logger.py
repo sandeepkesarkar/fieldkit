@@ -317,3 +317,41 @@ def test_new_event_tags_fit_the_shared_column_width():
     """Every tag is <= 12 chars or the combined per-client log stops aligning."""
     for tag in ("IG_NOWORKER", "IG_RECOVER"):
         assert len(tag) <= 12
+
+
+def test_log_publish_unresolved_writes_a_well_formed_line():
+    """IG_UNKNOWN names the container, because that is the handle a human can chase."""
+    ig_logger.log_publish_unresolved("kitchen_remodel", "container_99")
+    assert _line() == (
+        "2026-08-31 14:00 | IG_UNKNOWN   | project=kitchen_remodel container_id=container_99"
+    )
+
+
+def test_log_publish_resolved_records_the_status_instagram_finally_gave():
+    """"Never published" arrives as FINISHED, ERROR or EXPIRED — which one is worth keeping."""
+    ig_logger.log_publish_resolved("kitchen_remodel", "container_99", "EXPIRED")
+    assert _line() == (
+        "2026-08-31 14:00 | IG_RESOLVED  | project=kitchen_remodel "
+        "container_id=container_99 status=EXPIRED"
+    )
+
+
+def test_log_enqueue_blocked_unresolved_writes_a_well_formed_line():
+    """IG_BLOCKED is a different refusal from IG_NOWORKER and must be distinguishable."""
+    ig_logger.log_enqueue_blocked_unresolved("kitchen_remodel")
+    assert _line() == "2026-08-31 14:00 | IG_BLOCKED   | project=kitchen_remodel"
+
+
+def test_the_two_enqueue_refusals_are_distinct_events():
+    """One means "Instagram is not deployed", the other "this video may already be up"."""
+    ig_logger.log_enqueue_blocked("kitchen_remodel")
+    ig_logger.log_enqueue_blocked_unresolved("kitchen_remodel")
+    lines = ig_logger.LOG_FILE.read_text().strip().splitlines()
+    assert "IG_NOWORKER" in lines[0]
+    assert "IG_BLOCKED" in lines[1]
+
+
+def test_quarantine_event_tags_fit_the_shared_column_width():
+    """Every tag is <= 12 chars or the combined per-client log stops aligning."""
+    for tag in ("IG_UNKNOWN", "IG_RESOLVED", "IG_BLOCKED"):
+        assert len(tag) <= 12

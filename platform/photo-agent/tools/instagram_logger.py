@@ -18,6 +18,12 @@ Events:
   IG_PUBLISHED — the Reel was published
   IG_RECOVER   — a container was found ALREADY published by Instagram after an
     interrupted run; recorded without republishing (FR-011)
+  IG_UNKNOWN   — a publish was attempted but its outcome could not be established;
+    the container is quarantined durably and the idempotency key blocked (FR-011)
+  IG_RESOLVED  — a quarantined container was finally established as never published;
+    the quarantine is lifted and the video may be re-approved
+  IG_BLOCKED   — an enqueue was REFUSED because that idempotency key is held by an
+    unresolved publish
   IG_FAILED    — one attempt failed (retryable)
   IG_EXHAUSTED — all retry attempts consumed; terminal failure
   IG_TOKEN_EXP — the reused Facebook Page token is invalid/expired; retries skipped
@@ -162,6 +168,52 @@ def log_upload_recovered(project_name: str, container_id: str) -> None:
     _append(
         f"{_now()} | {'IG_RECOVER':<12} | project={project_name} container_id={container_id}"
     )
+
+
+def log_publish_unresolved(project_name: str, container_id: str) -> None:
+    """Append an IG_UNKNOWN line when a publish outcome cannot be established.
+
+    The most consequential line this module writes. It means Instagram was asked to
+    publish and FieldKit never learned whether it did, so the Reel may be live on a real
+    client account with nothing recording it. Written once, when the container is
+    quarantined — not on every later retry, which would bury it.
+    """
+    _validate_token(project_name, "project_name")
+    _validate_token(container_id, "container_id")
+    logger.error("IG_UNKNOWN project=%s container_id=%s", project_name, container_id)
+    _append(
+        f"{_now()} | {'IG_UNKNOWN':<12} | project={project_name} container_id={container_id}"
+    )
+
+
+def log_publish_resolved(project_name: str, container_id: str, status: str) -> None:
+    """Append an IG_RESOLVED line when a quarantined container turns out never to have published.
+
+    Closes the loop opened by IG_UNKNOWN. Carries the status_code Instagram finally
+    reported, because "never published" arrives in three different shapes (FINISHED,
+    ERROR, EXPIRED) and which one it was is the first thing anyone auditing this will ask.
+    """
+    _validate_token(project_name, "project_name")
+    _validate_token(container_id, "container_id")
+    _validate_token(status, "status")
+    logger.warning(
+        "IG_RESOLVED project=%s container_id=%s status=%s", project_name, container_id, status
+    )
+    _append(
+        f"{_now()} | {'IG_RESOLVED':<12} | project={project_name} "
+        f"container_id={container_id} status={status}"
+    )
+
+
+def log_enqueue_blocked_unresolved(project_name: str) -> None:
+    """Append an IG_BLOCKED line when an enqueue is refused by an unresolved publish.
+
+    Distinct from IG_NOWORKER: that one means Instagram is not deployed, this one means
+    Instagram may have already posted this exact video and FieldKit will not risk a second.
+    """
+    _validate_token(project_name, "project_name")
+    logger.error("IG_BLOCKED project=%s", project_name)
+    _append(f"{_now()} | {'IG_BLOCKED':<12} | project={project_name}")
 
 
 def log_upload_attempt_failed(project_name: str, attempt: int, error: str) -> None:
