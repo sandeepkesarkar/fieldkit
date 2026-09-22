@@ -16,6 +16,17 @@ The fix makes the SKILL.md's own bash block select at runtime between
 bash block (not a hand-copied expectation of it) and drive it as a real
 subprocess to prove the selection logic actually works in all three cases,
 rather than re-asserting a claim.
+
+Issue #74 note: the extracted script now also contains the block's
+repo-root resolution, which reads `${HERMES_SKILL_DIR}` -- the token Hermes
+substitutes with the absolute skill directory at dispatch time. These tests
+therefore apply that same substitution before executing (see
+`_as_dispatched`), exactly as Hermes does, instead of depending on any
+particular checkout location. Before #74 the block hardcoded
+`cd ~/src/fieldkit/...`; these four parametrized cases failed outright once
+the repo moved, because the extracted script executed that dead `cd`. They
+now exercise the real resolution, so a re-hardcoded (or otherwise
+unresolvable) path makes them fail again rather than passing by accident.
 """
 
 import re
@@ -39,6 +50,20 @@ def _invocation_block() -> str:
     blocks = _extract_bash_blocks()
     block = next(b for b in blocks if "process_photos.py" in b)
     return block
+
+
+def _as_dispatched(script: str) -> str:
+    """Apply the one substitution Hermes performs before the agent runs this.
+
+    Hermes replaces the literal `${HERMES_SKILL_DIR}` token in SKILL.md with
+    the absolute skill directory (agent/skill_preprocessing.py's
+    `substitute_template_vars`, gated on `skills.template_vars`, default
+    true). It is a *template* token, not an exported environment variable, so
+    reproducing dispatch faithfully means substituting it here too -- with
+    this skill's real directory, derived from this test file's location rather
+    than hardcoded.
+    """
+    return script.replace("${HERMES_SKILL_DIR}", str(_SKILL_MD.parent))
 
 
 def test_skill_no_longer_hardcodes_unconditional_timeout_660():
@@ -97,7 +122,7 @@ def test_binary_selection_logic_runs_correctly_for_each_case(tmp_path, stub_bina
         stub.write_text("#!/usr/bin/env bash\nexec \"$@\"\n")
         stub.chmod(0o755)
 
-    script = selection_script + '\necho "SELECTED=[$TIMEOUT_BIN]"\n'
+    script = _as_dispatched(selection_script) + '\necho "SELECTED=[$TIMEOUT_BIN]"\n'
     result = subprocess.run(
         ["/bin/bash", "-c", script],
         env={"PATH": str(stub_dir)},

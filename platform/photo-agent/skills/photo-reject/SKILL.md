@@ -53,12 +53,23 @@ The script owns state access, validation, and all rejection side effects
 logging); the agent's role is limited to invoking it and reporting the result.
 
 ```bash
-cd ~/src/fieldkit/platform/photo-agent || { echo "ERROR: photo-agent directory not found"; exit 1; }
+# Repo location is derived from this skill file's own directory: Hermes
+# substitutes HERMES_SKILL_DIR with the absolute skill directory before the
+# agent sees this block (skills.template_vars, on by default). Never hardcode
+# an absolute repo path here — a moved checkout silently broke every command
+# for three weeks that way (issue #74).
+SKILL_DIR="${HERMES_SKILL_DIR}"
+[ -n "$SKILL_DIR" ] || { echo "ERROR: skill directory unresolved — HERMES_SKILL_DIR was neither substituted nor exported. Enable skills.template_vars in the Hermes config and restart the gateway."; exit 1; }
+AGENT_DIR="$(cd "$SKILL_DIR/../.." 2>/dev/null && pwd)" || { echo "ERROR: cannot resolve the photo-agent directory two levels above the skill directory: $SKILL_DIR"; exit 1; }
+[ -f "$AGENT_DIR/scripts/check_approval.py" ] || { echo "ERROR: scripts/check_approval.py not found under $AGENT_DIR — this skill is not installed from a fieldkit checkout; check skills.external_dirs in the Hermes config."; exit 1; }
+cd "$AGENT_DIR" || { echo "ERROR: cannot enter $AGENT_DIR"; exit 1; }
 python3 scripts/check_approval.py --callback-data reject 2>&1
 ```
 
-> **Note:** `~/src/fieldkit/` is the expected repo location. If the repo is cloned
-> elsewhere, update this path before saving.
+> **Path resolution (issue #74):** the repo location is derived from this
+> skill file's own directory, substituted into the block above by Hermes at
+> dispatch time. Moving or renaming the checkout needs no edit here — do NOT
+> replace this with an absolute path.
 
 ## Output handling
 
