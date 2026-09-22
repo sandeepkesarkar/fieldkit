@@ -45,6 +45,25 @@ _PENDING_RECORD = {
 }
 
 
+@pytest.fixture(autouse=True)
+def isolated_worker_health(tmp_path, monkeypatch):
+    """Keep heartbeats out of the developer's real client data directory.
+
+    worker_health resolves its file path from FIELDKIT_DATA_DIR at IMPORT time, and
+    upload_facebook.py loads the real client .env at import, so an unpatched `main([])`
+    would write into the actual checkout. Both workers are marked deployed because that
+    is the normal state the coordination assertions here assume.
+    """
+    import tools.upload_cleanup as cleanup
+    import tools.worker_health as wh
+    data_dir = tmp_path / "health"
+    monkeypatch.setattr(wh, "DATA_DIR", data_dir)
+    monkeypatch.setattr(wh, "HEALTH_FILE", data_dir / "worker_health.json")
+    wh.record_heartbeat(cleanup.FACEBOOK)
+    wh.record_heartbeat(cleanup.INSTAGRAM)
+    return wh
+
+
 @pytest.fixture
 def env(monkeypatch):
     monkeypatch.setenv("FB_PAGE_ACCESS_TOKEN", _PAGE_TOKEN)
@@ -756,12 +775,23 @@ def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tm
     """
     import threading
     import scripts.upload_facebook as uf
-    get_pending_spy = mocker.spy(real_state, "get_pending_upload")
     video = tmp_path / "video.mp4"
     video.write_bytes(b"\x00" * 64)
     record = dict(_PENDING_RECORD, video_local_path=str(video))
     real_state.set_pending_upload(record)
-    get_pending_spy.reset_mock()  # ignore the set_pending_upload-adjacent setup above
+
+    # Record WHICH thread read the state, not merely how many reads happened. A plain call
+    # count used to stand in for "thread2 never read facebook_state", but thread1 legitimately
+    # reads it more than once per tick (the orphan sweep in tools/upload_cleanup.py consults
+    # every platform's pending record). Naming the reader asserts the actual guarantee.
+    readers = []
+    _real_get_pending = real_state.get_pending_upload
+
+    def _recording_get_pending(*args, **kwargs):
+        readers.append(threading.current_thread().name)
+        return _real_get_pending(*args, **kwargs)
+
+    mocker.patch.object(real_state, "get_pending_upload", side_effect=_recording_get_pending)
 
     call_started = threading.Event()
     release_call = threading.Event()
@@ -773,11 +803,11 @@ def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tm
 
     uf.facebook_api.upload_video.side_effect = slow_upload_video
 
-    thread1 = threading.Thread(target=main, args=([],))
+    thread1 = threading.Thread(target=main, args=([],), name="thread1")
     thread1.start()
     assert call_started.wait(timeout=5), "thread1 never entered upload_video"
 
-    thread2 = threading.Thread(target=main, args=([],))
+    thread2 = threading.Thread(target=main, args=([],), name="thread2")
     thread2.start()
     thread2.join(timeout=5)
     assert not thread2.is_alive(), "thread2 (should have been declined) is still running"
@@ -785,7 +815,8 @@ def test_overlapping_main_invocations_only_one_calls_upload_video(real_state, tm
     # thread2 must have been blocked by the OS lock, not by reaching claim_pending_upload and
     # losing a state-level race — only thread1's own call should be recorded here (thread2 must
     # never have read facebook_state at all).
-    assert get_pending_spy.call_count == 1, "thread2 read facebook_state before being declined"
+    assert "thread2" not in readers, "thread2 read facebook_state before being declined"
+    assert "thread1" in readers, "thread1 should have read facebook_state"
 
     release_call.set()
     thread1.join(timeout=5)

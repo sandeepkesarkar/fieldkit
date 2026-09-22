@@ -34,11 +34,27 @@ key — compare-and-update, not blind overwrite.
 
 container_id is Instagram-specific and has no Facebook counterpart: the Graph
 API's video publish is a two-phase create-container → publish flow, so an
-attempt has an intermediate server-side handle worth persisting for
-debugging/observability. It is scoped strictly to ONE attempt — set_container_id()
-records it, and release_claim() clears it, because every retry creates a fresh
-container and must never republish a previous attempt's. mark_published() and
-mark_failed() clear the whole record, so they discard it implicitly.
+attempt has an intermediate server-side handle. It SURVIVES across attempts, and
+that is load-bearing for FR-011 rather than merely convenient.
+
+This inverts an earlier decision in this file, which scoped container_id to a
+single attempt and had both claim_pending_upload() and release_claim() clear it,
+on the reasoning that a retry must never republish a previous attempt's
+container. That reasoning had it backwards. The irreversible external side effect
+is publish_container(); the durable record of it is mark_published(). A crash,
+kill, or lost HTTP response between the two leaves Meta holding a published Reel
+that FieldKit has no record of — and the old rule then DISCARDED the one handle
+that could have revealed it, so the next attempt created a second container and
+published the same video again. Duplicate Reels on a real client account, which
+is precisely what FR-011 forbids and is irreversible.
+
+Keeping container_id lets upload_instagram.py ask Instagram what actually
+happened before it publishes anything: a container whose status_code is PUBLISHED
+is authoritative proof the Reel is already live. The "never republish a previous
+attempt's container" rule is preserved, and is now enforced where it belongs — by
+that reconciliation, not by throwing the evidence away. See
+upload_instagram.py's _classify_prior_container(), and record_recovered_publish()
+below for how a publish discovered this way is recorded.
 
 FB_PAGE_ACCESS_TOKEN is never stored here. Sensitive token values are never logged.
 """
@@ -71,6 +87,8 @@ __all__ = [
     "is_published",
     "find_published",
     "has_outstanding_job",
+    "record_recovered_publish",
+    "record_share_intent",
     "record_share_cleanup",
     "list_share_cleanups",
     "clear_share_cleanup",
@@ -302,9 +320,12 @@ def claim_pending_upload(
             record["status"] = "uploading"
             record["attempt_count"] = attempt_count + 1
             record["last_attempt_at"] = now_dt.isoformat()
-            # A reclaimed abandoned attempt may have left a container_id behind. Each attempt
-            # creates a fresh container, so start every claim with a clean slate.
-            record["container_id"] = None
+            # container_id is deliberately PRESERVED here. A reclaimed abandoned attempt may
+            # have left one behind, and that container is the only evidence of whether the
+            # abandoned attempt got as far as publishing. Clearing it — which this function
+            # used to do — is what allowed a crash between publish and mark_published to
+            # produce a duplicate Reel. The caller reconciles it before acting; see the
+            # module docstring.
             _write(f, data)
             return "claimed"
         finally:
@@ -315,9 +336,9 @@ def set_container_id(idempotency_key: str, container_id: str) -> None:
     """Record the media container created for the CURRENT attempt.
 
     Instagram-specific, with no facebook_state.py counterpart: the container is a server-side
-    handle for an in-flight attempt, persisted for operational visibility while the poll runs.
-    It is deliberately never used to resume a previous attempt — release_claim() clears it, and
-    claim_pending_upload() resets it, so a retry always creates a fresh container.
+    handle that outlives the attempt that created it, both on Meta's side and here. It is
+    persisted before the container is ever published so that an interrupted publish can be
+    reconciled against it rather than blindly repeated (FR-011) — see the module docstring.
 
     Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
     """
@@ -333,14 +354,16 @@ def release_claim(idempotency_key: str) -> None:
     rather than the much longer abandoned-claim lease. attempt_count/last_attempt_at — already
     advanced by the claim — are left as they are.
 
-    Also clears container_id: the attempt is over, and the next one must create its own
-    container rather than risk republishing this attempt's.
+    Deliberately does NOT clear container_id — see the module docstring. The next attempt
+    needs it to establish whether this one published before it failed; discarding it is
+    what turned an interrupted publish into a duplicate Reel. Deciding whether that
+    container may be reused, must be reconciled, or should be abandoned is the caller's
+    job, and it needs the id in hand to do it.
 
     Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
     """
     def _update(record, data):
         record["status"] = "pending"
-        record["container_id"] = None
     _update_pending(idempotency_key, _update)
     logger.info("release_claim: key=%s", idempotency_key)
 
@@ -378,6 +401,66 @@ def mark_published(idempotency_key: str, post_id: str, permalink: str | None = N
         data["pending_instagram_upload"] = None
     _update_pending(idempotency_key, _update)
     logger.info("mark_published: key=%s post_id=%s", idempotency_key, post_id)
+
+
+def record_recovered_publish(
+    idempotency_key: str, project_name: str, container_id: str
+) -> None:
+    """Record a publish that Instagram reports as done but FieldKit never observed.
+
+    The recovery counterpart to mark_published(), for the window FR-011 has to survive:
+    publish_container() succeeded on Meta's side, and the process died (or lost the
+    response) before mark_published() could record it. A later run discovers the truth by
+    reading the container's status_code, and this is how it writes that down.
+
+    Differs from mark_published() in two ways that both matter:
+
+      - It does NOT require a pending record to still exist, and clears one only if it
+        happens to match. The interrupted attempt may well have been the job's last, in
+        which case claim_pending_upload() has already cleared the record as "exhausted" —
+        and that must not stop the publish from being recorded, or a re-approval of the
+        same video would post a SECOND Reel.
+      - The history entry carries ig_post_id=None and the container id instead. The media
+        ID is genuinely unknowable after the fact: the Graph API offers no container →
+        media lookup, and guessing from the account's recent media could just as easily
+        latch onto something a human posted. recovered=True marks the entry so nothing
+        downstream mistakes a null post id for a bug.
+
+    What it MUST do, and does, is put idempotency_key into published_idempotency_keys.
+    That list is what set_pending_upload() and claim_pending_upload() consult, so this one
+    write is what makes the duplicate impossible from here on.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            keys = data.setdefault("published_idempotency_keys", [])
+            if idempotency_key not in keys:
+                keys.append(idempotency_key)
+            history = data.setdefault("published_history", [])
+            history.append({
+                "project_name": project_name,
+                "idempotency_key": idempotency_key,
+                "ig_post_id": None,
+                "ig_permalink": None,
+                "ig_container_id": container_id,
+                "recovered": True,
+                "published_at": now,
+            })
+            del history[:-_PUBLISH_HISTORY_LIMIT]
+            record = data.get("pending_instagram_upload")
+            if record is not None and record.get("idempotency_key") == idempotency_key:
+                data["pending_instagram_upload"] = None
+            _write(f, data)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    logger.warning(
+        "record_recovered_publish: key=%s container_id=%s — Instagram reports this "
+        "container as already published; recorded without republishing",
+        idempotency_key, container_id,
+    )
 
 
 def mark_failed(idempotency_key: str) -> None:
@@ -461,6 +544,52 @@ def is_published(idempotency_key: str) -> bool:
 # job is terminal, the cleanup is not — and it is deliberately not gated on Instagram
 # still being configured for the client, since a link that is already public stays public
 # whether or not anyone intends to publish another Reel.
+
+
+def record_share_intent(file_id: str, project_name: str) -> None:
+    """Register a cleanup obligation for a Drive file BEFORE it is made public.
+
+    Called from drive.create_temporary_share_link()'s on_file_id hook, at the one moment
+    when the file exists but no public permission has been granted yet. It closes an
+    otherwise unrecoverable window: if the permission POST succeeds server-side and its
+    response is lost to a timeout or a crash, the permission is real, the call raises, and
+    the caller holds no file id — an untracked public link with nothing left that could
+    ever revoke it. Registering the obligation first means the id is already written down
+    no matter how that call turns out.
+
+    Deliberately SILENT, unlike record_share_cleanup(): nothing has gone wrong yet. This is
+    an intent, not a failure, so it does not alert, and it starts at attempts=0 with no
+    last_alerted_at — the admin hears about it only if a later revoke actually fails. The
+    normal path clears it moments later via clear_share_cleanup().
+
+    Idempotent: re-registering a file id that is already recorded leaves the existing
+    entry, and its alert history, untouched.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_for_write() as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = _read(f)
+            cleanups = data.setdefault("pending_share_cleanups", [])
+            if any(entry.get("file_id") == file_id for entry in cleanups):
+                return
+            cleanups.append({
+                "file_id": file_id,
+                "project_name": project_name,
+                "recorded_at": now,
+                "last_attempt_at": None,
+                "last_alerted_at": None,
+                "attempts": 0,
+            })
+            _write(f, data)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    logger.info(
+        "record_share_intent: file_id=%s project=%s — cleanup obligation registered "
+        "before the file was shared",
+        file_id, project_name,
+    )
 
 
 def record_share_cleanup(file_id: str, project_name: str) -> dict | None:

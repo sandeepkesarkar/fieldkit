@@ -34,6 +34,30 @@ Instagram-specific differences from upload_facebook.py:
     already-approved, already-metadata-stripped asset the Facebook upload posts,
     never a re-processed copy (FR-014).
 
+    The cleanup obligation is registered BEFORE the file is made public, not after
+    the share call returns (see _register_share and drive.create_temporary_share_link's
+    on_file_id hook). Registering it afterwards left one unrecoverable case: a
+    permission POST that succeeds server-side and then loses its response raises
+    without ever yielding a file id, so the link would be real and untracked, with
+    nothing left that could revoke it. Registering first means the id is written
+    down regardless of how that call turns out, and revoking a file that never
+    became public is a harmless no-op. An anonymous Drive permission cannot carry
+    an expirationTime — the API restricts that to user and group permissions — so
+    this pre-registration plus the per-tick drain IS the time bound: at worst one
+    attempt plus one cron tick, even if this process is killed at the worst moment.
+
+  - Duplicate-publish reconciliation (FR-011). publish_container() is the
+    irreversible external side effect; mark_published() is the durable record of
+    it. A crash, kill, or lost HTTP response between the two leaves Meta holding a
+    live Reel this system has no record of. The re-entrancy lock cannot help — the
+    holder is already dead — so the container id is persisted instead and survives
+    across attempts, and no attempt publishes anything while a previous container's
+    fate is unknown. _classify_prior_container() asks Instagram directly: a
+    container whose status_code is PUBLISHED is authoritative proof the Reel is
+    already live, and it is recorded rather than published again. A duplicate Reel
+    on a real client account cannot be taken back, so ambiguity is always resolved
+    by refusing to publish, never by trying again.
+
   - Deleting the local video file is COORDINATED, not owned by either script. One
     approval produces one file with two independent consumers, so whichever enabled
     platform resolves LAST deletes it — see tools/upload_cleanup.py. Deleting on
@@ -46,6 +70,21 @@ Instagram-specific differences from upload_facebook.py:
     without touching state (FR-016). That absence is the entire mechanism keeping
     clients like _construction_co out of this code path — no client-name
     special-casing anywhere.
+
+  - Deployment heartbeat. The env var above says Instagram is CONFIGURED; it says
+    nothing about whether this script is installed in crontab, and those are two
+    separate acts that nothing can make atomic. So every tick stamps a heartbeat
+    (tools/worker_health.py) before any gate. check_approval.py refuses to enqueue
+    an Instagram job without a fresh one, and tools/upload_cleanup.py stops
+    retaining the shared video for a platform whose worker has gone quiet. Both
+    directions self-heal: install the cron and the next tick restores normal
+    behaviour with no other action.
+
+  - The account a job publishes to is the one recorded ON THE JOB at approval time,
+    not whatever IG_BUSINESS_ACCOUNT_ID holds when the cron happens to run. If the
+    two disagree the job is failed and the owner is told, rather than silently
+    preferring either: reconfiguring a client between approval and publish must not
+    be able to post their video to a different Instagram account.
 
 Platform independence (FR-013): instagram_state.json, upload_instagram.lock, and
 this script's claim namespace are all separate from the Facebook equivalents. A
@@ -106,8 +145,10 @@ from tools import (
     paths,
     telegram_api,
     upload_cleanup,
+    worker_health,
 )
 from tools.instagram_api import InstagramTokenError, InstagramUploadError
+from tools.redaction import redact_secrets
 
 _log = logging.getLogger(__name__)
 
@@ -165,11 +206,24 @@ def main(argv=None) -> None:
             _log.error("%s is required — add it to your client .env file", var)
             sys.exit(1)
 
+    # Stamp liveness BEFORE the lock and before every gate below. The heartbeat attests
+    # that this cron ENTRY exists and fired, which is a different fact from whether
+    # Instagram is switched on for this client or whether there is anything to do. It is
+    # what check_approval.py consults before queueing a job it would otherwise have no way
+    # of knowing nobody will ever drain, and what tools/upload_cleanup.py consults before
+    # retaining a shared video on this platform's behalf. See tools/worker_health.py.
+    worker_health.record_heartbeat(upload_cleanup.INSTAGRAM)
+
     lock_f = _try_acquire_upload_lock()
     if lock_f is None:
         _log.debug("another upload_instagram instance is running — exiting")
         return
     try:
+        # Recovery sweep for approved videos that nothing can still be waiting on. Like the
+        # share-link drain below it is unconditional: it exists to catch files the normal
+        # coordinated delete could not, which by definition means no job will invoke it.
+        upload_cleanup.sweep_orphaned_videos()
+
         # Share-link cleanup runs FIRST, before the Instagram/Meta config gates below,
         # and is deliberately not conditional on either of them. Revoking a Drive
         # permission needs Drive credentials and nothing else — not an Instagram account
@@ -211,11 +265,17 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
     fields. Every decision about whether and how to proceed — staleness, cooldown, attempt
     budget, claiming — is made by claim_pending_upload() against the CURRENT, freshly-locked
     state in one exclusive-lock transaction, exactly as upload_facebook.py does.
+
+    container_id is read from the snapshot too, and unlike the rest it is NOT immutable —
+    it is read here because it belongs to the PREVIOUS attempt, which is exactly what makes
+    it useful. Reading it before the claim is safe because this whole function runs under
+    upload_instagram.lock: no other invocation of this script can be mutating it.
     """
     project_name = record["project_name"]
     video_path = record["video_local_path"]
     idem_key = record["idempotency_key"]
     attempt_count = record.get("attempt_count", 0)  # pre-claim value; claim() advances it by 1
+    prior_container_id = record.get("container_id")
 
     claim = instagram_state.claim_pending_upload(
         idem_key,
@@ -234,96 +294,169 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         )
         return
     if claim == "exhausted":
-        # claim_pending_upload() has already cleared the record, so this job is terminal:
-        # release the shared video too, or a crash during the final attempt would leave it
-        # on disk with nothing left to clean it up.
-        _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
-        instagram_logger.log_upload_exhausted(project_name)
-        _delete_local_file_if_last(video_path, project_name, idem_key)
-        _send_alert(
-            chat_id,
-            f"⚠️ Instagram upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
+        _handle_exhausted(
+            page_token, prior_container_id, project_name, idem_key, video_path, chat_id
         )
         return
     assert claim == "claimed", f"unexpected claim outcome: {claim!r}"
 
-    if not Path(video_path).exists():
-        # Under the coordinated-deletion rule this should no longer be reachable via the
-        # other platform having deleted the file out from under us; it now means the file
-        # genuinely vanished (manual cleanup, disk loss). Still terminal — there is
-        # nothing to upload — but alert rather than failing silently.
-        _log.error("video file missing: project=%s path=%s", project_name, video_path)
+    # The job names the account it was approved FOR. Publishing to whatever
+    # IG_BUSINESS_ACCOUNT_ID happens to hold right now would mean that reconfiguring a
+    # client between approval and publish sends their video to a different Instagram
+    # account — a wrong, irreversible post on someone's real account. The queued value
+    # wins, and a disagreement is terminal rather than silently resolved in either
+    # direction: neither value can be shown to be the intended one, so the only correct
+    # action is to publish nothing and say so.
+    queued_account_id = record.get("ig_business_account_id") or ""
+    if queued_account_id != ig_account_id:
+        _log.error(
+            "Instagram account mismatch — refusing to publish: project=%s queued=%r current=%r",
+            project_name, queued_account_id, ig_account_id,
+        )
         instagram_state.mark_failed(idem_key)
         instagram_logger.log_upload_attempt_failed(
-            project_name, attempt_count + 1, "video file missing on disk"
+            project_name,
+            attempt_count + 1,
+            "queued Instagram account does not match the configured one",
         )
+        _delete_local_file_if_last(video_path, project_name, idem_key)
         _send_alert(
             chat_id,
-            f"⚠️ Instagram upload failed for {project_name} — the approved video file "
-            "is missing on disk",
+            f"⚠️ Instagram upload cancelled for {project_name} — this video was approved "
+            f"for account {queued_account_id or '(none recorded)'}, but "
+            f"IG_BUSINESS_ACCOUNT_ID is now {ig_account_id}. Nothing was published. "
+            "Re-approve the video once the account configuration is settled.",
         )
         return
 
     attempt_number = attempt_count + 1
     instagram_logger.log_upload_started(project_name, attempt_number)
 
-    share_link = None
+    share_file_id = None
+    # Set the instant before the irreversible call, NOT after it returns. Its whole job is
+    # to distinguish "we never asked Meta to publish" from "we asked and never heard back",
+    # and only the second of those can have put a live Reel on a client's account.
+    publish_attempted = False
+
+    def _register_share(file_id: str) -> None:
+        """Record the cleanup obligation the instant the Drive file exists.
+
+        Runs BEFORE the file is made public (see drive.create_temporary_share_link's
+        on_file_id). Capturing the id here rather than parsing it out of the returned URL
+        is what makes the obligation survive a share call that raises — including the
+        ambiguous case where the permission was actually created and only its response
+        was lost.
+        """
+        nonlocal share_file_id
+        share_file_id = file_id
+        instagram_state.record_share_intent(file_id, project_name)
+
     try:
-        share_link = drive.create_temporary_share_link(video_path)
+        container_id = None
+        if prior_container_id:
+            outcome = _classify_prior_container(page_token, prior_container_id)
+            if outcome == "published":
+                _log.warning(
+                    "container was already published by Instagram — recovering instead of "
+                    "republishing: project=%s container_id=%s", project_name, prior_container_id,
+                )
+                _record_recovered(
+                    project_name, idem_key, prior_container_id, video_path, chat_id
+                )
+                return
+            if outcome == "reusable":
+                _log.info(
+                    "resuming an interrupted attempt on its existing container: "
+                    "project=%s container_id=%s", project_name, prior_container_id,
+                )
+                container_id = prior_container_id
 
-        container_id = instagram_api.create_media_container(
-            page_token, ig_account_id, share_link
-        )
-        instagram_state.set_container_id(idem_key, container_id)
-        instagram_logger.log_container_created(project_name, container_id)
+        if container_id is None:
+            if not Path(video_path).exists():
+                # Reachable only when there is no container to fall back on. Under the
+                # coordinated-deletion rule the other platform can no longer pull the file
+                # out from under us, so this means it genuinely vanished (manual cleanup,
+                # disk loss). Terminal — there is nothing to upload — but alerted rather
+                # than failing silently.
+                _log.error("video file missing: project=%s path=%s", project_name, video_path)
+                instagram_state.mark_failed(idem_key)
+                instagram_logger.log_upload_attempt_failed(
+                    project_name, attempt_number, "video file missing on disk"
+                )
+                _send_alert(
+                    chat_id,
+                    f"⚠️ Instagram upload failed for {project_name} — the approved video file "
+                    "is missing on disk",
+                )
+                return
 
-        instagram_api.wait_for_container(page_token, container_id)
-        instagram_logger.log_container_ready(project_name, container_id)
+            share_link = drive.create_temporary_share_link(
+                video_path, on_file_id=_register_share
+            )
+            container_id = instagram_api.create_media_container(
+                page_token, queued_account_id, share_link
+            )
+            instagram_state.set_container_id(idem_key, container_id)
+            instagram_logger.log_container_created(project_name, container_id)
 
-        post_id = instagram_api.publish_container(page_token, ig_account_id, container_id)
+            instagram_api.wait_for_container(page_token, container_id)
+            instagram_logger.log_container_ready(project_name, container_id)
+
+        publish_attempted = True
+        post_id = instagram_api.publish_container(page_token, queued_account_id, container_id)
         permalink = _fetch_permalink(page_token, post_id, project_name)
     except InstagramTokenError as exc:
         # Token expiry is terminal after ONE attempt (FR-008): retrying cannot fix it, and
         # burning the remaining attempt budget would only delay the alert the owner needs.
         # Checked before InstagramUploadError below — it is deliberately NOT a subclass.
-        _revoke_share_link(share_link, project_name, chat_id)
-        _log.error("Instagram token error: project=%s: %s", project_name, exc)
+        _revoke_share_link(share_file_id, project_name, chat_id)
+        _log.error("Instagram token error: project=%s: %s", project_name, _safe_error(exc))
         instagram_state.mark_failed(idem_key)
         instagram_logger.log_token_expired(project_name)
         _delete_local_file_if_last(video_path, project_name, idem_key)
-        _send_alert(
-            chat_id,
+        alert = (
             f"⚠️ Instagram token expired — reconnect {project_name}'s account "
-            "via generate_auth_link.py",
+            "via generate_auth_link.py"
         )
+        if publish_attempted:
+            # The one case reconciliation cannot rescue: the token died at or after the
+            # publish call, so the container's fate is unknowable — asking Instagram is
+            # exactly what just returned "your token is invalid". mark_failed() has cleared
+            # the record and with it the container id, so nothing will ever check again.
+            # The owner is the only remaining check, and they need to be told BEFORE they
+            # re-approve, because a re-approval on a Reel that did publish is how the
+            # duplicate lands.
+            alert += (
+                ". This attempt had already reached the publish step, so the Reel MAY be "
+                "live — check the account before re-approving this video."
+            )
+        _send_alert(chat_id, alert)
         return
     except (InstagramUploadError, RuntimeError, OSError) as exc:
         # Transient: an Instagram API/network error, a container that reported ERROR or
         # never finished within the poll cap, or a Drive failure creating the share link.
         # RuntimeError/OSError are caught alongside InstagramUploadError because the Drive
         # helpers raise those — a Drive failure is just as retryable as an Instagram one.
-        _revoke_share_link(share_link, project_name, chat_id)
-        _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, exc)
-        instagram_logger.log_upload_attempt_failed(project_name, attempt_number, str(exc))
+        _revoke_share_link(share_file_id, project_name, chat_id)
+        detail = _safe_error(exc)
+        _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, detail)
+        instagram_logger.log_upload_attempt_failed(project_name, attempt_number, detail)
         if attempt_number >= _MAX_ATTEMPTS:
             instagram_state.mark_failed(idem_key)
             instagram_logger.log_upload_exhausted(project_name)
             _delete_local_file_if_last(video_path, project_name, idem_key)
-            _send_alert(
-                chat_id,
-                f"⚠️ Instagram upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
-            )
+            _send_alert(chat_id, _exhausted_alert(project_name, publish_attempted))
         else:
             # A KNOWN, caught failure with retries remaining: release the claim immediately so
             # the next attempt is gated by the short _COOLDOWN_SECONDS rather than the much
             # longer _UPLOAD_LEASE_SECONDS an abandoned claim would wait out. release_claim()
-            # also clears container_id — the next attempt builds a fresh container.
+            # deliberately KEEPS container_id so the next attempt can reconcile against it.
             instagram_state.release_claim(idem_key)
         return
 
     # Success path. The share link is revoked first: Instagram has already ingested the
     # video by the time a container publishes, so nothing needs it to stay public.
-    _revoke_share_link(share_link, project_name, chat_id)
+    _revoke_share_link(share_file_id, project_name, chat_id)
     instagram_state.mark_published(idem_key, post_id, permalink=permalink)
     instagram_logger.log_upload_published(project_name, post_id)
     # mark_published() above is what makes this job terminal in the state file, and it has
@@ -341,24 +474,170 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         )
 
 
-def _revoke_share_link(share_link: str | None, project_name: str, chat_id: str) -> None:
+def _safe_error(exc) -> str:
+    """Render an exception as text with any embedded credential removed.
+
+    tools/instagram_api.py already redacts everything it raises, so in the normal case
+    this changes nothing. It is applied again here because this is where exception text
+    fans out to TWO sinks — the durable activity log and stderr, which under cron becomes
+    mail or a captured job log — and not every exception reaching this handler came from
+    instagram_api (Drive and OS errors land here too). A permanent Page token is worth
+    redacting twice; see tools/redaction.py.
+    """
+    return redact_secrets(str(exc))
+
+
+def _classify_prior_container(page_token: str, container_id: str) -> str:
+    """Ask Instagram what became of a container left behind by an earlier attempt.
+
+    This is the FR-011 duplicate-publication guard. publish_container() is the irreversible
+    external side effect and mark_published() is the durable record of it; a crash, a kill,
+    or a lost HTTP response in between leaves Meta holding a live Reel that FieldKit has no
+    record of. Without this check the next attempt simply publishes again, and a duplicate
+    Reel on a real client account cannot be taken back.
+
+    The container's own status_code is the authority, because Meta is the only party that
+    knows what actually happened. Returns:
+
+      "published" — status_code PUBLISHED. The Reel is already live. Record it; never
+                    publish again.
+      "reusable"  — status_code FINISHED. Ingested, not yet published: publishing THIS
+                    container is the correct, duplicate-free way to finish the job.
+      "restart"   — status_code ERROR or EXPIRED. Definitively never published and no
+                    longer usable, so a fresh container is safe.
+
+    Anything else — IN_PROGRESS, or a status_code this code does not recognise — raises
+    InstagramUploadError and is handled as an ordinary retryable failure. That is the
+    deliberate strict reading: IN_PROGRESS means a container that already blew through the
+    300s poll cap once, which is spec.md's "stuck container" case and is better retried than
+    waited on again; and an unrecognised value might be a publish state Meta has added since,
+    so treating it as "safe to build a new container" could duplicate a post. Failing the
+    attempt costs a retry from a bounded budget. Guessing costs a client a duplicate Reel.
+
+    Network and API failures propagate for the same reason: not knowing a container's fate
+    is never grounds for publishing another one.
+    """
+    status = instagram_api.get_container_status(page_token, container_id)
+    if status == "PUBLISHED":
+        return "published"
+    if status == "FINISHED":
+        return "reusable"
+    if status in ("ERROR", "EXPIRED"):
+        return "restart"
+    raise InstagramUploadError(
+        f"Container {container_id} is in state {status!r}; refusing to create a second "
+        "container until its fate is known (FR-011)"
+    )
+
+
+def _record_recovered(
+    project_name: str, idem_key: str, container_id: str, video_path: str, chat_id: str
+) -> None:
+    """Record a publish that Instagram reports as done but this system never observed.
+
+    The job is terminal and successful — the Reel IS live — so it takes the success path:
+    the idempotency key is retired, the shared video is released, and the owner is told
+    their Reel is up. The message is deliberately honest about the gap rather than
+    presenting a normal success, because FieldKit cannot name the post or link to it: the
+    Graph API offers no container → media lookup.
+    """
+    instagram_state.record_recovered_publish(idem_key, project_name, container_id)
+    instagram_logger.log_upload_recovered(project_name, container_id)
+    _delete_local_file_if_last(video_path, project_name, idem_key)
+    _send_confirmation(
+        chat_id,
+        f"✅ Reel is live on Instagram for {project_name} — an earlier attempt was "
+        "interrupted after publishing, so FieldKit could not record the post link. "
+        "Nothing was posted twice. Open the account to see it.",
+    )
+
+
+def _handle_exhausted(
+    page_token: str,
+    prior_container_id: str | None,
+    project_name: str,
+    idem_key: str,
+    video_path: str,
+    chat_id: str,
+) -> None:
+    """Resolve a job whose attempt budget ran out, reconciling a leftover container first.
+
+    claim_pending_upload() has already cleared the record, so this job is terminal either
+    way. But "terminal" must not mean "assumed unpublished": the final attempt is exactly
+    as capable of crashing between publish and mark_published as any other, and this is the
+    last moment anything will ever look at its container. Skipping the check here would
+    leave a live Reel unrecorded and its idempotency key unretired — so a re-approval of
+    the same video would post a duplicate, which is the outcome FR-011 exists to prevent.
+
+    record_recovered_publish() is used rather than mark_published() precisely because the
+    pending record is already gone; see its docstring.
+    """
+    if prior_container_id:
+        try:
+            if _classify_prior_container(page_token, prior_container_id) == "published":
+                _log.warning(
+                    "attempt budget exhausted, but the last container was already "
+                    "published: project=%s container_id=%s", project_name, prior_container_id,
+                )
+                _record_recovered(
+                    project_name, idem_key, prior_container_id, video_path, chat_id
+                )
+                return
+        except (InstagramTokenError, InstagramUploadError) as exc:
+            # Cannot tell. Fall through to the failure path, but say so in the alert —
+            # "failed" and "might be live" call for very different follow-up.
+            _log.error(
+                "could not reconcile the final container before giving up: "
+                "project=%s container_id=%s error=%s",
+                project_name, prior_container_id, exc,
+            )
+            _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
+            instagram_logger.log_upload_exhausted(project_name)
+            _delete_local_file_if_last(video_path, project_name, idem_key)
+            _send_alert(chat_id, _exhausted_alert(project_name, ambiguous=True))
+            return
+
+    _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
+    instagram_logger.log_upload_exhausted(project_name)
+    _delete_local_file_if_last(video_path, project_name, idem_key)
+    _send_alert(chat_id, _exhausted_alert(project_name, ambiguous=False))
+
+
+def _exhausted_alert(project_name: str, ambiguous: bool) -> str:
+    """Build the terminal-failure alert, distinguishing "did not post" from "might have".
+
+    An owner who believes nothing was posted will re-approve the video. If the last attempt
+    actually reached publish_container() and only lost its response, that re-approval is how
+    a duplicate Reel gets onto a client's account. The two cases therefore cannot share one
+    message.
+    """
+    if ambiguous:
+        return (
+            f"⚠️ Instagram upload failed for {project_name} after {_MAX_ATTEMPTS} attempts. "
+            "The final attempt reached the publish step, so the Reel MAY already be live — "
+            "check the account BEFORE re-approving this video, or you may post it twice."
+        )
+    return (
+        f"⚠️ Instagram upload failed for {project_name} after {_MAX_ATTEMPTS} attempts "
+        "— check logs"
+    )
+
+
+def _revoke_share_link(file_id: str | None, project_name: str, chat_id: str) -> None:
     """Revoke the temporary public Drive link, if one was created this attempt.
 
+    Takes the file id captured by _register_share() before the file was ever made public,
+    not the returned URL — so a share call that raised after creating the permission is
+    still revocable. Revoking a file that never actually became public is a harmless no-op.
+
     A revoke failure must not undo a live post or mask the real upload error, so it does
-    not raise here. But it is emphatically NOT treated as success: the file id is written
-    to instagram_state's pending-cleanup list, retried on every later tick by
-    _drain_share_cleanups(), and the admin is alerted once, naming the specific file, so a
+    not raise here. But it is emphatically NOT treated as success: the file id stays in
+    instagram_state's pending-cleanup list, is retried on every later tick by
+    _drain_share_cleanups(), and the admin is alerted, naming the specific file, so a
     public link can never be left dangling with no record of it.
     """
-    if not share_link:
+    if not file_id:
         return
-    try:
-        file_id = drive.extract_file_id(share_link)
-    except ValueError as exc:
-        # Nothing to record against — we cannot name the file to retry or clean up.
-        _log.error("cannot parse share link to revoke it: project=%s error=%s", project_name, exc)
-        return
-
     try:
         drive.revoke_share_link(file_id)
     except RuntimeError as exc:
@@ -370,6 +649,9 @@ def _revoke_share_link(share_link: str | None, project_name: str, chat_id: str) 
         entry = instagram_state.record_share_cleanup(file_id, project_name)
         if entry:
             _send_alert(chat_id, _share_cleanup_alert(entry))
+        return
+    # Revoked for real — retire the obligation registered before the file was shared.
+    instagram_state.clear_share_cleanup(file_id)
 
 
 def _drain_share_cleanups(chat_id: str) -> None:

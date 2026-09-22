@@ -20,6 +20,23 @@ shareable URL and cannot be turned into one by string formatting — Instagram's
 public URLs use an unrelated permalink shortcode. get_media_permalink() fetches
 the real, working link; anything shown to a human must come from there.
 
+Credential handling. FB_PAGE_ACCESS_TOKEN is a PERMANENT Page token that never
+expires, so a single leaked copy stays valid until a human rotates it by hand —
+this repo has already had to do that once (issue #27). Two rules follow, and both
+are enforced here rather than left to call sites:
+
+  - The token is NEVER placed in a query string. Every GET authenticates with an
+    Authorization header via _graph_get(); only the POSTs carry it, in the form
+    body, where the Graph API requires it and where a rendered URL cannot expose
+    it. This matters because a requests connection/redirect/timeout exception
+    renders the PREPARED URL in its str() — so a token in the query string would
+    travel inside any exception text folded into an InstagramUploadError, and from
+    there into the durable activity log or a CLI's stdout.
+  - Every exception message built here is passed through _safe() first, which
+    strips both the literal token value and anything shaped like a credential
+    parameter. Belt and braces on top of the rule above: a future call site that
+    reintroduces a token into a URL still cannot leak it through this module.
+
 Exception hierarchy (mirrors facebook_api.py's):
   InstagramTokenError(RuntimeError)          — token invalid/expired (Graph API
     error code 190); skip retries, the token must be renewed via generate_auth_link.py
@@ -33,6 +50,8 @@ import logging
 import time
 
 import requests
+
+from tools.redaction import redact_secrets, redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +88,38 @@ class InstagramUploadError(RuntimeError):
 _ACCOUNT_TYPES = frozenset({"BUSINESS", "CREATOR"})
 
 
+def _safe(detail, access_token: str | None = None) -> str:
+    """Render detail as text with any credential removed.
+
+    Applied to EVERY exception and response body this module interpolates into an
+    error message. Two passes, because they catch different things: redact_value()
+    matches the literal token the caller handed us wherever it appears, and
+    redact_secrets() matches anything merely SHAPED like a credential (an
+    access_token= query parameter, a Bearer header) including credentials this
+    module never saw — a redirect to a URL carrying someone else's token, say.
+    """
+    return redact_value(redact_secrets(str(detail)), access_token)
+
+
+def _graph_get(node: str, fields: str, access_token: str):
+    """GET a Graph API node, authenticating via the Authorization header.
+
+    The single place this module performs a read, and the reason there is a helper
+    for something this small: it is what guarantees the token is NOT in the query
+    string. The Graph API accepts a Page token either way; only one of the two ways
+    keeps it out of the prepared URL that a requests exception will happily print.
+
+    Returns the raw response — each caller raises its own errors, whose wording
+    callers and tests depend on.
+    """
+    return requests.get(
+        f"{_GRAPH_BASE}/{node}",
+        params={"fields": fields},
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+
+
 def _json_or_empty(resp) -> dict:
     """Return the response's parsed JSON body, or {} if it isn't valid JSON."""
     try:
@@ -91,9 +142,13 @@ def _raise_for_api_error(data: dict, context: str) -> None:
         return
     code = error.get("code") if isinstance(error, dict) else None
     msg = error.get("message", "") if isinstance(error, dict) else str(error)
+    # msg is attacker-adjacent text we did not author: it is whatever Meta chose to
+    # echo back, which for some errors includes the request that produced it. Redact
+    # it on the way into an exception that will be logged durably.
+    safe_msg = redact_secrets(msg)
     if code == 190:
-        raise InstagramTokenError(f"Instagram token invalid/expired {context}: {msg}")
-    raise InstagramUploadError(f"Instagram API error {code} {context}: {msg}")
+        raise InstagramTokenError(f"Instagram token invalid/expired {context}: {safe_msg}")
+    raise InstagramUploadError(f"Instagram API error {code} {context}: {safe_msg}")
 
 
 def create_media_container(access_token: str, ig_user_id: str, video_url: str) -> str:
@@ -118,7 +173,9 @@ def create_media_container(access_token: str, ig_user_id: str, video_url: str) -
             timeout=30,
         )
     except requests.exceptions.RequestException as exc:
-        raise InstagramUploadError(f"Container creation request failed: {exc}") from exc
+        raise InstagramUploadError(
+            f"Container creation request failed: {_safe(exc, access_token)}"
+        ) from exc
 
     data = _json_or_empty(resp)
     _raise_for_api_error(data, "creating container")
@@ -130,7 +187,8 @@ def create_media_container(access_token: str, ig_user_id: str, video_url: str) -
         return data["id"]
     except (KeyError, TypeError) as exc:
         raise InstagramUploadError(
-            f"Container creation response missing 'id' field: {exc} — response: {data!r}"
+            f"Container creation response missing 'id' field: {_safe(exc, access_token)} "
+            f"— response: {_safe(repr(data), access_token)}"
         ) from exc
 
 
@@ -145,15 +203,12 @@ def get_container_status(access_token: str, container_id: str) -> str:
         InstagramTokenError — Graph API error code 190 (token invalid/expired).
         InstagramUploadError — on any other API error, HTTP error, or network failure.
     """
-    url = f"{_GRAPH_BASE}/{container_id}"
     try:
-        resp = requests.get(
-            url,
-            params={"fields": "status_code", "access_token": access_token},
-            timeout=30,
-        )
+        resp = _graph_get(container_id, "status_code", access_token)
     except requests.exceptions.RequestException as exc:
-        raise InstagramUploadError(f"Container status poll request failed: {exc}") from exc
+        raise InstagramUploadError(
+            f"Container status poll request failed: {_safe(exc, access_token)}"
+        ) from exc
 
     data = _json_or_empty(resp)
     _raise_for_api_error(data, "polling container")
@@ -216,13 +271,11 @@ def get_media_permalink(access_token: str, media_id: str) -> str:
             response with no permalink field.
     """
     try:
-        resp = requests.get(
-            f"{_GRAPH_BASE}/{media_id}",
-            params={"fields": "permalink", "access_token": access_token},
-            timeout=30,
-        )
+        resp = _graph_get(media_id, "permalink", access_token)
     except requests.exceptions.RequestException as exc:
-        raise InstagramUploadError(f"Permalink lookup request failed: {exc}") from exc
+        raise InstagramUploadError(
+            f"Permalink lookup request failed: {_safe(exc, access_token)}"
+        ) from exc
 
     data = _json_or_empty(resp)
     _raise_for_api_error(data, "fetching permalink")
@@ -233,7 +286,8 @@ def get_media_permalink(access_token: str, media_id: str) -> str:
     permalink = data.get("permalink")
     if not permalink:
         raise InstagramUploadError(
-            f"Permalink lookup response missing 'permalink' field — response: {data!r}"
+            "Permalink lookup response missing 'permalink' field — response: "
+            f"{_safe(repr(data), access_token)}"
         )
     logger.info("get_media_permalink: media_id=%s", media_id)
     return permalink
@@ -260,7 +314,9 @@ def publish_container(access_token: str, ig_user_id: str, container_id: str) -> 
             timeout=30,
         )
     except requests.exceptions.RequestException as exc:
-        raise InstagramUploadError(f"Publish request failed: {exc}") from exc
+        raise InstagramUploadError(
+            f"Publish request failed: {_safe(exc, access_token)}"
+        ) from exc
 
     data = _json_or_empty(resp)
     _raise_for_api_error(data, "publishing container")
@@ -272,7 +328,8 @@ def publish_container(access_token: str, ig_user_id: str, container_id: str) -> 
         return data["id"]
     except (KeyError, TypeError) as exc:
         raise InstagramUploadError(
-            f"Publish response missing 'id' field: {exc} — response: {data!r}"
+            f"Publish response missing 'id' field: {_safe(exc, access_token)} "
+            f"— response: {_safe(repr(data), access_token)}"
         ) from exc
 
 
@@ -324,18 +381,14 @@ def discover_business_account(page_access_token: str, page_id: str) -> dict:
             not BUSINESS/CREATOR (e.g. still PERSONAL). Actionable setup problem.
         InstagramUploadError — on any other API error, HTTP error, or network failure.
     """
-    url = f"{_GRAPH_BASE}/{page_id}"
     try:
-        resp = requests.get(
-            url,
-            params={
-                "fields": "instagram_business_account{id,username}",
-                "access_token": page_access_token,
-            },
-            timeout=30,
+        resp = _graph_get(
+            page_id, "instagram_business_account{id,username}", page_access_token
         )
     except requests.exceptions.RequestException as exc:
-        raise InstagramUploadError(f"Instagram account discovery request failed: {exc}") from exc
+        raise InstagramUploadError(
+            f"Instagram account discovery request failed: {_safe(exc, page_access_token)}"
+        ) from exc
 
     data = _json_or_empty(resp)
     _raise_for_api_error(data, "discovering Instagram account")
@@ -379,13 +432,11 @@ def _get_account_type(access_token: str, ig_user_id: str) -> str:
     push the failure to publish time instead of setup time.
     """
     try:
-        resp = requests.get(
-            f"{_GRAPH_BASE}/{ig_user_id}",
-            params={"fields": "account_type,username", "access_token": access_token},
-            timeout=30,
-        )
+        resp = _graph_get(ig_user_id, "account_type,username", access_token)
     except requests.exceptions.RequestException as exc:
-        raise InstagramUploadError(f"Instagram account type lookup failed: {exc}") from exc
+        raise InstagramUploadError(
+            f"Instagram account type lookup failed: {_safe(exc, access_token)}"
+        ) from exc
 
     data = _json_or_empty(resp)
     _raise_for_api_error(data, "reading Instagram account type")

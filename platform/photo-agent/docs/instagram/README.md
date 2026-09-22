@@ -97,11 +97,22 @@ Re-running the script against an already-configured client is safe: it updates
 
 ## Step 2 — Install the cron entry
 
+> **This step is not optional, and FieldKit will not let you skip it.** Until this
+> cron entry is running, approving a video queues **nothing** for Instagram, and
+> the owner is told why. See "If the cron is missing" below.
+
 `upload_instagram.py` is cron-invoked, on the same cadence as
 `upload_facebook.py`. Add it to `crontab -e` alongside the existing entries:
 
 ```cron
 * * * * * /usr/local/bin/python3 /path/to/fieldkit/platform/photo-agent/scripts/upload_instagram.py --source cron >> /path/to/fieldkit/logs/cron.log 2>&1
+```
+
+Verify it is really running before relying on it — one minute after saving the
+crontab, this file should exist and carry a recent `instagram` timestamp:
+
+```bash
+cat "$FIELDKIT_DATA_DIR/photo-agent/worker_health.json"
 ```
 
 The two upload scripts are independent: separate state files, separate lock
@@ -110,6 +121,35 @@ neither can block, retry, or roll back the other's post.
 
 A tick with nothing to do — no pending job, a claim declined, or Instagram not
 configured for this client — exits `0` silently and costs nothing.
+
+### If the cron is missing
+
+Setting `IG_BUSINESS_ACCOUNT_ID` and installing this crontab entry are two
+separate acts, and nothing in a git repository can make them atomic — a repo
+cannot install a crontab entry, and an entry can be removed again afterwards. So
+FieldKit detects the gap at runtime instead of assuming it away.
+
+Every tick of either upload cron stamps a heartbeat in
+`$FIELDKIT_DATA_DIR/photo-agent/worker_health.json` (see
+`tools/worker_health.py`). A heartbeat is proof the cron entry exists and fires —
+a different fact from the platform being switched on in `.env`. Two things read it:
+
+- **`check_approval.py` refuses to enqueue an Instagram job** when
+  `IG_BUSINESS_ACCOUNT_ID` is set but no fresh Instagram heartbeat exists. It logs
+  `IG_NOWORKER` and alerts the admin naming the missing step. The Facebook enqueue
+  and the approval itself are unaffected (FR-013).
+- **`tools/upload_cleanup.py` stops waiting on a platform whose worker has gone
+  quiet**, so a cron removed *after* a job was queued cannot strand the shared
+  local video indefinitely either.
+
+Why refuse rather than queue and hope: a job nothing drains never publishes, and
+it used to make `upload_facebook.py` retain the shared local video forever waiting
+on it. Refusing means no job, no retained video, and — the point that matters most
+— **no temporary public Drive link is ever created without a running worker able to
+revoke it.**
+
+Both directions self-heal with no other action: install the cron and the next
+approval goes through; remove it and the gap is noticed within the hour.
 
 ---
 
@@ -124,7 +164,7 @@ All in `clients/<client>/src/photo-agent/.env`:
 | `FB_PAGE_ID` | Read by `check_instagram_connection.py` | 003 |
 | `TELEGRAM_BOT_TOKEN`, `ADMIN_TELEGRAM_CHAT_ID` | Success/failure notifications | 001/002 |
 | `DRIVE_ROOT_FOLDER_ID` | Where the temporary share link's file is uploaded | 002 |
-| `FIELDKIT_DATA_DIR` | Holds `instagram_state.json` and `upload_instagram.lock` | platform |
+| `FIELDKIT_DATA_DIR` | Holds `instagram_state.json`, `upload_instagram.lock`, and `worker_health.json` | platform |
 | `FIELDKIT_LOG_DIR` | Holds `photo-agent.log` | platform |
 
 ---
@@ -166,6 +206,27 @@ host for client-approved media. The exposure is deliberately bounded:
   is never re-processed or re-encoded for Instagram
 - the link is created immediately before the container call and revoked on
   **every** exit path: success, transient failure, and token expiry
+- the permission is `{"role": "reader", "type": "anyone"}` with
+  `allowFileDiscovery` unset, so it is link-access, not search-discoverable
+- the cleanup obligation is recorded **before the file is made public**, not after
+  the share call returns
+
+**Why the obligation is recorded first.** `drive.create_temporary_share_link()`
+hands the caller the new file's ID through an `on_file_id` hook the moment the
+file is uploaded and *before* any permission is granted. Recording it afterwards
+left one unrecoverable case: if the permission call succeeds on Google's side and
+its response is then lost to a timeout or a crash, the link is real, the call
+raises, and a caller that only learns the ID from the returned URL holds nothing to
+revoke — an untracked public link, forever. Registering first means the ID is
+written down regardless of how that call turns out, and revoking a file that never
+actually became public is a harmless no-op.
+
+This is also *the* time bound on the exposure, because Drive cannot provide one.
+The Drive API's `permissions.expirationTime` is restricted to user and group
+permissions — an `anyone` permission cannot carry one — so there is no server-side
+way to make an anonymous link self-destruct. Enforcement is FieldKit's, and it is
+enforced before the exposure exists: worst case, one attempt plus one cron tick,
+even if the process is killed at the worst possible moment.
 
 **If a revoke fails**, it is never written off as success. The Drive file ID is
 recorded durably in `instagram_state.json` under `pending_share_cleanups`, the
@@ -207,7 +268,24 @@ delete the video out from under a still-pending Instagram job, which would then 
 the file missing and terminally fail — publishing nothing and alerting nobody.
 
 Each script records its own terminal state *before* checking the other's, which is
-what makes the check race-free.
+what makes the check free of the **concurrency** race: if both resolve at nearly the
+same moment, each one's resolution is already durable before it reads the other's, so
+at least one must observe the other as terminal and delete.
+
+That ordering does **not** give crash safety, and no ordering of two independent
+processes can. If a script records its terminal state and is killed before it
+consults the other, both records are clear, no later job will run cleanup for that
+key, and the file is leaked. So there is a recovery pass rather than a claim that it
+cannot happen: `upload_cleanup.sweep_orphaned_videos()` runs on **every tick of both
+crons** and deletes any video in `VIDEO_TMP_DIR` that
+
+- is older than 48 hours (comfortably longer than an overnight approval), **and**
+- is not referenced by a pending approval, **and**
+- is not referenced by an outstanding upload job on any platform.
+
+Running it from both crons is what keeps the sweep alive when only one of the two
+platforms is deployed. A video awaiting a human's approval has no upload job at all,
+which is why the pending-approval check is there and not optional.
 
 ---
 
@@ -221,9 +299,53 @@ in the script:
 - After the 3rd failure: the job is marked failed, `IG_EXHAUSTED` is logged, and
   the owner gets `⚠️ Instagram upload failed for <project> after 3 attempts`
 - **Token expiry is terminal after one attempt** — retrying can't fix it, so the
-  owner is alerted immediately to reconnect the Page
+  owner is alerted immediately to reconnect the Page. If the token died at or after
+  the publish step, the alert additionally says the Reel may be live: reconciliation
+  is impossible there (asking Instagram is the very call that just failed), so the
+  owner is the only remaining check
 - A container stuck in processing past 300s is treated as an ordinary transient
   failure and retried
+
+### Duplicate publication (FR-011)
+
+`publish_container()` is the irreversible external side effect; `mark_published()`
+is the durable record of it. A crash, a kill, or a lost HTTP response *between the
+two* leaves Meta holding a live Reel that FieldKit has no record of — and the
+re-entrancy lock cannot help, because the process holding it is already dead.
+
+So the container ID is persisted and **survives across attempts**, and no attempt
+publishes anything while a previous container's fate is unknown. Before acting, the
+script asks Instagram what became of it:
+
+| `status_code` | Action |
+|---|---|
+| `PUBLISHED` | Already live. Recorded via `record_recovered_publish()`, logged `IG_RECOVER`, owner told the Reel is up. **Never republished.** |
+| `FINISHED` | Ingested, not published. That same container is published — the duplicate-free way to finish. |
+| `ERROR`, `EXPIRED` | Definitively never published and unusable. A fresh container is safe. |
+| anything else, or unreachable | Treated as a retryable failure. Not knowing a container's fate is never grounds for creating a second one. |
+
+The same check runs when the attempt budget is exhausted, because the final attempt
+can crash after publishing exactly like any other — and by then the pending record is
+already cleared, so this is the last chance to notice.
+
+A recovered publish records `ig_post_id: null` and the container ID instead. The
+media ID is genuinely unknowable after the fact: the Graph API offers no
+container → media lookup, and guessing from the account's recent media could just as
+easily match something a human posted. The Telegram message says so rather than
+inventing a link.
+
+If reconciliation is impossible and the job gives up, the alert says the Reel **may
+already be live** and to check the account *before* re-approving — because an owner
+who believes nothing was posted will re-approve, and that is precisely how a
+duplicate Reel lands on a client's account.
+
+### The account a job publishes to
+
+The target account is the one recorded **on the job at approval time**, not whatever
+`IG_BUSINESS_ACCOUNT_ID` holds when the cron happens to run. If the two disagree the
+job is cancelled and the owner is alerted naming both values — neither can be shown
+to be the intended one, so nothing is published. Reconfiguring a client between
+approval and publish must not be able to post their video to a different account.
 
 ---
 
@@ -235,10 +357,12 @@ as every other pipeline event, in the same pipe-delimited format:
 | Event | Meaning |
 |---|---|
 | `IG_ENQUEUED` | An approval enqueued an Instagram job |
+| `IG_NOWORKER` | An enqueue was **refused**: Instagram is configured but its cron is not running |
 | `IG_STARTED` | An upload attempt began (with attempt number) |
 | `IG_CONT_NEW` | Media container created |
 | `IG_CONT_RDY` | Container finished processing, ready to publish |
 | `IG_PUBLISHED` | Reel published (with post ID) |
+| `IG_RECOVER` | A container was found **already published** after an interrupted run; recorded without republishing |
 | `IG_FAILED` | One attempt failed (retryable, with error detail) |
 | `IG_EXHAUSTED` | All 3 attempts consumed — terminal |
 | `IG_TOKEN_EXP` | Page token invalid/expired — reconnect needed |

@@ -62,7 +62,32 @@ def lock_mock(mocker):
 
 
 @pytest.fixture
-def base(mocker, env):
+def isolated_worker_health(tmp_path, monkeypatch):
+    """Redirect worker_health's heartbeat file, and mark BOTH workers as deployed.
+
+    Two reasons, and the second is the same one the state mocks below exist for.
+
+    First, isolation: worker_health resolves its file path from FIELDKIT_DATA_DIR at
+    IMPORT time, and check_approval.py loads the real client .env at import — so an
+    unpatched test reads, and can create, a file in the developer's actual checkout.
+
+    Second, determinism: the Instagram enqueue now depends on upload_instagram.py having
+    heartbeated recently. Left to the ambient environment, whether a test enqueues would
+    depend on whether that machine happens to run the cron. Both workers deployed is the
+    normal state and the baseline these tests are written against; the refusal path gets
+    its own explicit tests.
+    """
+    import tools.worker_health as wh
+    data_dir = tmp_path / "health"
+    monkeypatch.setattr(wh, "DATA_DIR", data_dir)
+    monkeypatch.setattr(wh, "HEALTH_FILE", data_dir / "worker_health.json")
+    wh.record_heartbeat("facebook")
+    wh.record_heartbeat("instagram")
+    return wh
+
+
+@pytest.fixture
+def base(mocker, env, isolated_worker_health):
     """Mocks common to all tests: env loading, state, and all external calls."""
     mocker.patch("scripts.check_approval._load_env")
     # Simulate successfully acquiring the check_approval.lock.
@@ -825,3 +850,113 @@ def test_instagram_enqueue_log_failure_does_not_abort_approve_flow(base_ig, mock
     )
     main(_APPROVE_ARGS)
     ca.state.clear_pending_approval.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# The Instagram enqueue is gated on its cron worker actually running
+# ---------------------------------------------------------------------------
+#
+# Setting IG_BUSINESS_ACCOUNT_ID and installing upload_instagram.py's crontab entry
+# are two separate acts, and nothing can make them atomic. Do the first without the
+# second and a queued job is never drained: the Reel never publishes, upload_facebook.py
+# retains the shared local video indefinitely waiting on a job that cannot resolve, and
+# any temporary public Drive link the job would have created would have had no code path
+# left to revoke it. Refusing the enqueue means none of that can start.
+
+@pytest.fixture
+def ig_worker_absent(base_ig, isolated_worker_health, tmp_path, monkeypatch):
+    """Instagram configured, but its cron has never run on this machine."""
+    monkeypatch.setattr(
+        isolated_worker_health, "HEALTH_FILE", tmp_path / "health" / "absent.json"
+    )
+    return base_ig
+
+
+def test_instagram_enqueue_is_refused_when_its_cron_is_not_running(ig_worker_absent):
+    """Nothing is queued, so nothing can be stranded."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_a_refused_instagram_enqueue_alerts_the_admin(ig_worker_absent):
+    """Silence here would be the whole bug: a feature that looks on and does nothing.
+
+    The message has to name the missing deployment step, because that is the only thing
+    the owner can actually act on.
+    """
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    texts = [c.args[0] for c in ca._notify_admin.call_args_list]
+    assert any("cron is not running" in t for t in texts)
+    assert any("upload_instagram.py" in t for t in texts)
+    assert any("NOT queued" in t for t in texts)
+
+
+def test_a_refused_instagram_enqueue_is_recorded_in_the_activity_log(ig_worker_absent, mocker):
+    """The gap belongs in the same per-client log as everything else."""
+    import scripts.check_approval as ca
+    blocked = mocker.patch("scripts.check_approval.instagram_logger.log_enqueue_blocked")
+    main(_APPROVE_ARGS)
+    blocked.assert_called_once_with(_PROJECT)
+
+
+def test_a_refused_instagram_enqueue_does_not_block_facebook(ig_worker_absent):
+    """FR-013: an Instagram deployment gap must not cost the owner their Facebook post."""
+    import scripts.check_approval as ca
+    main(_APPROVE_ARGS)
+    ca.facebook_state.set_pending_upload.assert_called_once()
+
+
+def test_a_refused_instagram_enqueue_still_completes_the_approval(ig_worker_absent, capsys):
+    """The owner's approval is theirs; a platform problem must never swallow it."""
+    main(_APPROVE_ARGS)
+    assert "Approved:" in capsys.readouterr().out
+
+
+def test_the_enqueue_resumes_once_the_cron_starts_running(base_ig, isolated_worker_health):
+    """Self-healing: installing the cron is the entire fix, with no change here.
+
+    Pinning this matters because the alternative designs (refuse forever, or require a
+    flag to be flipped back) would turn a one-line deployment step into a support issue.
+    """
+    import scripts.check_approval as ca
+    isolated_worker_health.record_heartbeat("instagram")
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_called_once()
+
+
+def test_a_stale_instagram_heartbeat_is_treated_as_not_running(base_ig, isolated_worker_health,
+                                                              monkeypatch):
+    """A cron that was removed later is as undeployed as one never installed."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    import scripts.check_approval as ca
+    old = datetime.now(timezone.utc) - timedelta(
+        seconds=isolated_worker_health.STALE_AFTER_SECONDS + 60
+    )
+    isolated_worker_health.HEALTH_FILE.write_text(
+        json.dumps({"instagram": {"last_seen_at": old.isoformat()}})
+    )
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+
+
+def test_a_disabled_client_is_not_alerted_about_a_missing_cron(base, mocker, monkeypatch,
+                                                               isolated_worker_health, tmp_path):
+    """FR-016: a client without Instagram configured is not misconfigured.
+
+    _construction_co has no IG_BUSINESS_ACCOUNT_ID and must stay completely untouched by
+    this feature — including by its alerts. The enable switch is checked first for exactly
+    this reason.
+    """
+    import scripts.check_approval as ca
+    monkeypatch.setenv("FB_PAGE_ID", _FB_PAGE_ID)
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.setattr(
+        isolated_worker_health, "HEALTH_FILE", tmp_path / "health" / "absent.json"
+    )
+    main(_APPROVE_ARGS)
+    ca.instagram_state.set_pending_upload.assert_not_called()
+    texts = [c.args[0] for c in ca._notify_admin.call_args_list]
+    assert not any("cron is not running" in t for t in texts)

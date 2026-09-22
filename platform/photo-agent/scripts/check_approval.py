@@ -112,6 +112,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 from tools import drive, paths, state
 from tools import facebook_state
 from tools import instagram_logger, instagram_state
+from tools import upload_cleanup, worker_health
 from tools import logger as activity_log
 from tools import telegram_api
 
@@ -259,6 +260,16 @@ def _enqueue_instagram_upload(
     the whole per-client enable switch (FR-016), which is why _construction_co needs
     no client-name special-casing here to stay untouched by this feature.
 
+    Skipped LOUDLY — logged and alerted, not silently — when Instagram is configured but
+    upload_instagram.py is not actually running. Setting the env var and installing the
+    cron are two separate acts and nothing can make them atomic, so this checks the second
+    rather than assuming it. Queueing a job no worker will ever drain is not a harmless
+    no-op: the Reel never publishes, upload_facebook.py retains the shared local video
+    indefinitely waiting on a job that cannot resolve, and any temporary public Drive link
+    the job would have created would have had no code path left to revoke it. Refusing the
+    enqueue means none of that can start. It is also self-healing — install the cron and
+    the next approval goes through, with no change here.
+
     Failure is logged as an error but does NOT abort the approve flow or the Facebook
     enqueue (FR-013): the two platforms' outcomes are independent, so an Instagram
     problem must never cost the owner their approval or their Facebook post. The
@@ -266,6 +277,23 @@ def _enqueue_instagram_upload(
     """
     ig_business_account_id = os.environ.get("IG_BUSINESS_ACCOUNT_ID", "")
     if not ig_business_account_id:
+        return
+    if not worker_health.is_deployed(upload_cleanup.INSTAGRAM):
+        _log.error(
+            "IG upload NOT enqueued for project=%s — IG_BUSINESS_ACCOUNT_ID is set but "
+            "upload_instagram.py has not run recently; install its crontab entry",
+            project_name,
+        )
+        try:
+            instagram_logger.log_enqueue_blocked(project_name)
+        except (OSError, ValueError) as exc:
+            _log.error("could not log the blocked IG enqueue: %s", exc)
+        _notify_admin(
+            f"⚠️ Instagram is enabled for {project_name} but its upload cron is not "
+            "running, so this video was NOT queued for Instagram. Facebook is "
+            "unaffected. Install the upload_instagram.py crontab entry, then re-approve "
+            "to post this video to Instagram."
+        )
         return
     idem_key = str(telegram_message_id)
     try:

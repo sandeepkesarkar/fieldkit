@@ -106,6 +106,7 @@ from tools import (
     paths,
     telegram_api,
     upload_cleanup,
+    worker_health,
 )
 from tools.facebook_api import FacebookTokenError, FacebookUploadError
 
@@ -202,6 +203,12 @@ def main(argv=None) -> None:
     page_id = os.environ.get("FB_PAGE_ID", "")
     chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
 
+    # Stamp liveness before the config gate below: the heartbeat attests that this cron
+    # ENTRY exists and fired, which is separate from whether Facebook is configured for
+    # this client. tools/upload_cleanup.py consults it before retaining a shared video on
+    # this platform's behalf, and check_approval.py before queueing a job for it.
+    worker_health.record_heartbeat(upload_cleanup.FACEBOOK)
+
     if not page_token or not page_id:
         _log.error("FB_PAGE_ACCESS_TOKEN and FB_PAGE_ID are required")
         sys.exit(1)
@@ -211,6 +218,13 @@ def main(argv=None) -> None:
         _log.debug("another upload_facebook instance is running — exiting")
         return
     try:
+        # Recovery sweep for approved videos no live record can still be waiting on.
+        # Deliberately unconditional and ahead of the pending-job check: it exists to catch
+        # files the coordinated delete could not, and those by definition have no job left
+        # to carry them. Running it from BOTH cron workers is what keeps the sweep alive
+        # when only one of the two is deployed.
+        upload_cleanup.sweep_orphaned_videos()
+
         record = facebook_state.get_pending_upload()
         if record is None:
             _log.debug("no pending facebook upload — exiting")

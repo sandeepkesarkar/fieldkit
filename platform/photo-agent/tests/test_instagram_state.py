@@ -243,14 +243,42 @@ def test_release_claim_resets_status_to_pending(valid_record):
     assert record["attempt_count"] == 1
 
 
-def test_release_claim_clears_container_id(valid_record):
-    """release_claim() clears container_id — a fresh container is made per attempt."""
+def test_release_claim_keeps_container_id_for_reconciliation(valid_record):
+    """release_claim() PRESERVES container_id — it is the evidence FR-011 depends on.
+
+    This asserts the opposite of what it originally did. Clearing container_id per attempt
+    was the bug: publish_container() is the irreversible side effect and mark_published()
+    is the durable record of it, so a crash in between leaves a live Reel unrecorded — and
+    discarding the container id threw away the only handle that could reveal it, letting
+    the next attempt publish the same video a second time. The next attempt must be able to
+    ask Instagram what became of this container before it publishes anything.
+    """
     ig_state.set_pending_upload(valid_record)
     _claim("42")
     ig_state.set_container_id("42", "container_abc")
     assert ig_state.get_pending_upload()["container_id"] == "container_abc"
     ig_state.release_claim("42")
-    assert ig_state.get_pending_upload()["container_id"] is None
+    assert ig_state.get_pending_upload()["container_id"] == "container_abc"
+    assert ig_state.get_pending_upload()["status"] == "pending"
+
+
+def test_claim_keeps_container_id_from_an_abandoned_attempt(valid_record):
+    """A reclaimed abandoned attempt keeps its container id, for the same reason.
+
+    The abandoned-claim path is precisely the crash path: whatever killed the previous
+    attempt may have killed it after Instagram published. claim_pending_upload() used to
+    reset container_id to None here, which is the same loss of evidence from the other
+    direction.
+    """
+    ig_state.set_pending_upload(valid_record)
+    _claim("42")
+    ig_state.set_container_id("42", "container_abc")
+    # Reclaim after the lease expires, as an abandoned attempt would be.
+    claim = ig_state.claim_pending_upload(
+        "42", cooldown_seconds=0, max_attempts=5, lease_seconds=0
+    )
+    assert claim == "claimed"
+    assert ig_state.get_pending_upload()["container_id"] == "container_abc"
 
 
 def test_release_claim_ignores_mismatched_key(valid_record):
@@ -608,3 +636,140 @@ def test_share_cleanups_survive_job_resolution(valid_record):
     ig_state.record_share_cleanup("file_1", "kitchen_remodel")
     ig_state.mark_published("42", "post_1")
     assert len(ig_state.list_share_cleanups()) == 1
+
+
+# ---------------------------------------------------------------------------
+# record_share_intent — the cleanup obligation registered before exposure exists
+# ---------------------------------------------------------------------------
+
+def test_record_share_intent_registers_a_cleanup_obligation():
+    """A file id written down before the file is ever made public."""
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    entries = ig_state.list_share_cleanups()
+    assert [e["file_id"] for e in entries] == ["drive_file_1"]
+    assert entries[0]["project_name"] == "kitchen_remodel"
+
+
+def test_record_share_intent_does_not_count_as_a_failed_attempt():
+    """Nothing has gone wrong yet, so it must not look like a failure.
+
+    attempts starts at 0 and last_alerted_at at None, which is what keeps the admin
+    from being alerted about a link that is about to be revoked in the normal way
+    moments later — and what makes the FIRST genuine revoke failure still alert.
+    """
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    entry = ig_state.list_share_cleanups()[0]
+    assert entry["attempts"] == 0
+    assert entry["last_alerted_at"] is None
+    assert entry["last_attempt_at"] is None
+
+
+def test_the_first_real_failure_after_an_intent_still_alerts():
+    """The intent must not swallow the alert a genuine revoke failure has to produce."""
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    alert = ig_state.record_share_cleanup("drive_file_1", "kitchen_remodel")
+    assert alert is not None
+    assert alert["attempts"] == 1
+
+
+def test_record_share_intent_is_idempotent():
+    """A retry that re-registers the same file must not duplicate or reset it."""
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    ig_state.record_share_cleanup("drive_file_1", "kitchen_remodel")   # attempts -> 1
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    entries = ig_state.list_share_cleanups()
+    assert len(entries) == 1
+    assert entries[0]["attempts"] == 1        # history preserved, not reset
+
+
+def test_an_intent_is_cleared_by_a_successful_revoke():
+    """The normal path: registered, revoked, retired — no residue."""
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    assert ig_state.clear_share_cleanup("drive_file_1") is True
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_intents_for_different_files_coexist():
+    """Two attempts in flight across ticks must not overwrite each other."""
+    ig_state.record_share_intent("drive_file_1", "kitchen_remodel")
+    ig_state.record_share_intent("drive_file_2", "bathroom")
+    assert {e["file_id"] for e in ig_state.list_share_cleanups()} == {"drive_file_1", "drive_file_2"}
+
+
+# ---------------------------------------------------------------------------
+# record_recovered_publish — FR-011 across a crash
+# ---------------------------------------------------------------------------
+
+def test_record_recovered_publish_retires_the_idempotency_key(valid_record):
+    """The single most important effect: a re-approval can never post a second Reel."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    assert ig_state.is_published("42") is True
+    with pytest.raises(ValueError):
+        ig_state.set_pending_upload(valid_record)
+
+
+def test_record_recovered_publish_clears_a_matching_pending_record(valid_record):
+    """The job is terminal and successful, so it must stop being picked up."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    assert ig_state.get_pending_upload() is None
+
+
+def test_record_recovered_publish_works_with_no_pending_record_at_all():
+    """The case mark_published() cannot serve, and the reason this function exists.
+
+    When the final attempt is the one that crashed, claim_pending_upload() has already
+    cleared the record as "exhausted" before anything gets to reconcile. If recording
+    the publish depended on that record still existing, the key would never be retired
+    and a re-approval would duplicate the Reel.
+    """
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    assert ig_state.is_published("42") is True
+
+
+def test_record_recovered_publish_does_not_disturb_a_different_pending_job(valid_record):
+    """Compare-and-clear, like every other mutator here."""
+    newer = dict(valid_record, idempotency_key="99")
+    ig_state.set_pending_upload(newer)
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    assert ig_state.get_pending_upload()["idempotency_key"] == "99"
+    assert ig_state.is_published("42") is True
+
+
+def test_the_recovered_history_entry_is_honest_about_what_is_unknown(valid_record):
+    """No fabricated post id or permalink — the media id is genuinely unknowable.
+
+    The Graph API offers no container -> media lookup, and guessing from the account's
+    recent media could latch onto something a human posted. The entry records the
+    container it DOES know and flags itself as recovered.
+    """
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    entry = ig_state.find_published("kitchen_remodel")
+    assert entry["ig_post_id"] is None
+    assert entry["ig_permalink"] is None
+    assert entry["ig_container_id"] == "container_abc"
+    assert entry["recovered"] is True
+
+
+def test_a_recovered_publish_makes_a_later_claim_stale_published(valid_record):
+    """Belt and braces: even a record that survives somehow will not be reprocessed."""
+    ig_state.set_pending_upload(valid_record)
+    ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
+    ig_state.set_pending_upload(dict(valid_record, idempotency_key="99"))
+    # Re-point the pending record at the recovered key to simulate a stale file.
+    import json
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    raw["pending_instagram_upload"]["idempotency_key"] = "42"
+    ig_state.STATE_FILE.write_text(json.dumps(raw))
+    assert _claim("42") == "stale_published"
+
+
+def test_recovered_entries_respect_the_history_cap(valid_record):
+    """published_history stays bounded however the entries got there."""
+    for i in range(ig_state._PUBLISH_HISTORY_LIMIT + 10):
+        ig_state.record_recovered_publish(f"key_{i}", "kitchen_remodel", f"container_{i}")
+    import json
+    history = json.loads(ig_state.STATE_FILE.read_text())["published_history"]
+    assert len(history) == ig_state._PUBLISH_HISTORY_LIMIT

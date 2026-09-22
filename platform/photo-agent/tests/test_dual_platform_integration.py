@@ -23,6 +23,7 @@ import pytest
 
 import tools.facebook_state as fb_state
 import tools.instagram_state as ig_state
+import tools.worker_health as wh
 from scripts.check_approval import main as approve_main
 from scripts.upload_facebook import main as fb_main
 from scripts.upload_instagram import main as ig_main
@@ -55,7 +56,15 @@ def real_state(tmp_path, monkeypatch):
     monkeypatch.setattr(fb_state, "STATE_FILE", data_dir / "facebook_state.json")
     monkeypatch.setattr(ig_state, "DATA_DIR", data_dir)
     monkeypatch.setattr(ig_state, "STATE_FILE", data_dir / "instagram_state.json")
+    monkeypatch.setattr(wh, "DATA_DIR", data_dir)
+    monkeypatch.setattr(wh, "HEALTH_FILE", data_dir / "worker_health.json")
     monkeypatch.setenv("FIELDKIT_DATA_DIR", str(tmp_path / "data"))
+    # Both cron workers installed and ticking — the normal deployed state these
+    # end-to-end flows assume. check_approval.py refuses to enqueue an Instagram job
+    # without a fresh Instagram heartbeat, and upload_cleanup.py stops waiting on a
+    # platform whose worker has gone quiet; both behaviours have their own tests.
+    wh.record_heartbeat("facebook")
+    wh.record_heartbeat("instagram")
     monkeypatch.setenv("FIELDKIT_LOG_DIR", str(tmp_path / "logs"))
     return data_dir
 
@@ -135,7 +144,19 @@ def cron(approved, mocker, video):
                  "log_upload_attempt_failed", "log_upload_exhausted", "log_token_expired"):
         mocker.patch.object(uf.facebook_logger, name)
 
-    mocker.patch.object(ui.drive, "create_temporary_share_link", return_value=_SHARE_LINK)
+    # A faithful fake, not a bare return_value: the real
+    # drive.create_temporary_share_link() hands the caller the new file's id through
+    # on_file_id BEFORE it grants the public permission, and upload_instagram.py depends
+    # on that to register its cleanup obligation. A mock that skipped the callback would
+    # make every revoke assertion below pass vacuously against code that never revokes.
+    def _fake_share_link(video_path, on_file_id=None):
+        if on_file_id is not None:
+            on_file_id("drive_file_1")
+        return _SHARE_LINK
+
+    mocker.patch.object(
+        ui.drive, "create_temporary_share_link", side_effect=_fake_share_link
+    )
     mocker.patch.object(ui.drive, "revoke_share_link")
     mocker.patch.object(ui.instagram_api, "create_media_container", return_value=_CONTAINER_ID)
     mocker.patch.object(ui.instagram_api, "get_container_status", return_value="FINISHED")

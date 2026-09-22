@@ -213,3 +213,107 @@ def test_import_without_fieldkit_log_dir_raises(monkeypatch):
         importlib.reload(ig_logger)
     monkeypatch.undo()
     importlib.reload(ig_logger)
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction — the durable-persistence end of the token leak path
+# ---------------------------------------------------------------------------
+#
+# log_upload_attempt_failed() writes an arbitrary exception string to a file that
+# is never rotated away by this code. A requests connection/redirect/timeout
+# exception renders the PREPARED URL, query string included, so "no function here
+# takes a token argument" was never sufficient on its own. These tests pin the last
+# line of defence; tools/instagram_api.py keeps the token out of the URL in the
+# first place, and tests/test_instagram_api.py pins that.
+
+_LEAKED_TOKEN = "EAABsbCS1iHgBO7ZAZCxyzQWERTY1234567890abcdefGHIJKLmnop"
+
+
+def test_a_token_bearing_url_in_an_error_never_reaches_the_log():
+    """THE regression test: the exact leak path, end to end through the writer.
+
+    A requests exception carrying a Graph API URL with access_token in its query
+    string is folded into an InstagramUploadError and handed to this function. The
+    token must not appear in the file that results.
+    """
+    error = (
+        "HTTPSConnectionPool(host='graph.facebook.com', port=443): Max retries "
+        "exceeded with url: /v25.0/17841400000000000/media?fields=status_code"
+        f"&access_token={_LEAKED_TOKEN} (Caused by ConnectTimeoutError)"
+    )
+    log_upload_attempt_failed("kitchen_remodel", 1, error)
+    written = ig_logger.LOG_FILE.read_text()
+    assert _LEAKED_TOKEN not in written
+    assert "***REDACTED***" in written
+
+
+def test_a_bearer_header_in_an_error_never_reaches_the_log():
+    """Moving the credential to a header does not help if the header is printed."""
+    log_upload_attempt_failed(
+        "kitchen_remodel", 2, f"request headers {{'Authorization': 'Bearer {_LEAKED_TOKEN}'}}"
+    )
+    assert _LEAKED_TOKEN not in ig_logger.LOG_FILE.read_text()
+
+
+def test_redaction_still_leaves_a_diagnosable_line():
+    """Redaction that destroyed the error would push people toward turning it off."""
+    log_upload_attempt_failed(
+        "kitchen_remodel", 1,
+        f"Container status poll request failed: timeout for /v25.0/c_1?access_token={_LEAKED_TOKEN}",
+    )
+    line = _line()
+    assert "IG_FAILED" in line
+    assert "project=kitchen_remodel" in line
+    assert "attempt=1" in line
+    assert "Container status poll request failed" in line
+    assert _LEAKED_TOKEN not in line
+
+
+def test_redaction_runs_before_the_delimiter_sanitising():
+    """Order matters: redact the untouched text, then protect the log format.
+
+    Sanitising first could rewrite characters around a credential and stop the
+    redaction patterns from matching the shape they were written in. Here the
+    error contains both a pipe (which must be neutralised) and a token (which must
+    be removed), and both have to hold at once.
+    """
+    log_upload_attempt_failed(
+        "kitchen_remodel", 1, f'bad | pipe and "quote" with ?access_token={_LEAKED_TOKEN}'
+    )
+    line = _line()
+    assert _LEAKED_TOKEN not in line
+    assert line.count("|") == 2       # only the two real column delimiters
+    assert '"' in line                # the error field's own quoting survives
+
+
+def test_log_enqueue_blocked_writes_a_well_formed_line():
+    """IG_NOWORKER records an enqueue refused because the cron is not installed."""
+    ig_logger.log_enqueue_blocked("kitchen_remodel")
+    assert _line() == "2026-08-31 14:00 | IG_NOWORKER  | project=kitchen_remodel"
+
+
+def test_log_upload_recovered_writes_a_well_formed_line():
+    """IG_RECOVER records a publish discovered after the fact, naming the container."""
+    ig_logger.log_upload_recovered("kitchen_remodel", "container_99")
+    assert _line() == (
+        "2026-08-31 14:00 | IG_RECOVER   | project=kitchen_remodel container_id=container_99"
+    )
+
+
+def test_recovered_is_distinct_from_published():
+    """The two are operationally different and must not be confused in the log.
+
+    IG_PUBLISHED means FieldKit watched the publish happen and knows the media id.
+    IG_RECOVER means it did not, and can only name the container.
+    """
+    ig_logger.log_upload_recovered("kitchen_remodel", "container_99")
+    line = _line()
+    assert "IG_RECOVER" in line
+    assert "IG_PUBLISHED" not in line
+    assert "post_id" not in line
+
+
+def test_new_event_tags_fit_the_shared_column_width():
+    """Every tag is <= 12 chars or the combined per-client log stops aligning."""
+    for tag in ("IG_NOWORKER", "IG_RECOVER"):
+        assert len(tag) <= 12

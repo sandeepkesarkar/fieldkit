@@ -25,6 +25,9 @@ from tools.instagram_api import (
     InstagramTokenError,
     InstagramUploadError,
 )
+# Bound at import time, BEFORE any fixture replaces the module attribute with a mock —
+# the end-to-end redaction test needs the genuine writer, not base's stand-in.
+from tools.instagram_logger import log_upload_attempt_failed as _real_log_attempt_failed
 
 _PROJECT = "test_project"
 _IG_ACCOUNT_ID = "17841400000000000"
@@ -49,6 +52,21 @@ _PENDING_RECORD = {
     "container_id": None,
     "ig_post_id": None,
 }
+
+
+@pytest.fixture(autouse=True)
+def isolated_worker_health(tmp_path, monkeypatch):
+    """Keep heartbeats out of the developer's real client data directory.
+
+    worker_health resolves its file path from FIELDKIT_DATA_DIR at IMPORT time, and
+    upload_instagram.py loads the real client .env at import — so without this every
+    `main([])` in this file would write a heartbeat into the actual checkout.
+    """
+    import tools.worker_health as wh
+    data_dir = tmp_path / "health"
+    monkeypatch.setattr(wh, "DATA_DIR", data_dir)
+    monkeypatch.setattr(wh, "HEALTH_FILE", data_dir / "worker_health.json")
+    return wh
 
 
 @pytest.fixture
@@ -96,7 +114,19 @@ def base(mocker, env):
     # thing end to end.
     mocker.patch.object(ui.upload_cleanup, "other_platforms_pending", return_value=[])
     mocker.patch.object(ui, "_delete_local_file")
-    mocker.patch.object(ui.drive, "create_temporary_share_link", return_value=_SHARE_LINK)
+    # A faithful fake, not a bare return_value: the real
+    # drive.create_temporary_share_link() hands the caller the new file's id through
+    # on_file_id BEFORE it grants the public permission, and upload_instagram.py depends
+    # on that to register its cleanup obligation. A mock that skipped the callback would
+    # make every revoke assertion below pass vacuously against code that never revokes.
+    def _fake_share_link(video_path, on_file_id=None):
+        if on_file_id is not None:
+            on_file_id(_SHARE_FILE_ID)
+        return _SHARE_LINK
+
+    mocker.patch.object(
+        ui.drive, "create_temporary_share_link", side_effect=_fake_share_link
+    )
     mocker.patch.object(ui.drive, "revoke_share_link")
     mocker.patch.object(ui.instagram_api, "create_media_container", return_value=_CONTAINER_ID)
     mocker.patch.object(ui.instagram_api, "get_container_status", return_value="FINISHED")
@@ -265,7 +295,8 @@ def test_happy_path_runs_the_full_container_flow(with_pending):
     """Share link -> container -> poll -> publish, in order."""
     import scripts.upload_instagram as ui
     main([])
-    ui.drive.create_temporary_share_link.assert_called_once_with(with_pending["video_local_path"])
+    ui.drive.create_temporary_share_link.assert_called_once()
+    assert ui.drive.create_temporary_share_link.call_args[0][0] == with_pending["video_local_path"]
     ui.instagram_api.create_media_container.assert_called_once_with(
         _PAGE_TOKEN, _IG_ACCOUNT_ID, _SHARE_LINK
     )
@@ -397,7 +428,8 @@ def test_happy_path_reuses_the_already_stripped_video(with_pending):
     before = Path(with_pending["video_local_path"]).read_bytes()
     main([])
     assert Path(with_pending["video_local_path"]).read_bytes() == before
-    ui.drive.create_temporary_share_link.assert_called_once_with(with_pending["video_local_path"])
+    ui.drive.create_temporary_share_link.assert_called_once()
+    assert ui.drive.create_temporary_share_link.call_args[0][0] == with_pending["video_local_path"]
 
 
 def test_revoke_failure_does_not_lose_a_successful_publish(with_pending):
@@ -1074,3 +1106,449 @@ def test_missing_video_alerts_instead_of_failing_silently(base):
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "Instagram upload failed" in text
     assert "missing on disk" in text
+
+
+# ---------------------------------------------------------------------------
+# FR-011 — a crash between publish and mark_published must not duplicate a Reel
+# ---------------------------------------------------------------------------
+#
+# publish_container() is the irreversible external side effect; mark_published() is
+# the durable record of it. A crash, kill, or lost HTTP response in between leaves
+# Meta holding a live Reel this system has no record of. The re-entrancy lock cannot
+# help — the holder is already dead. So the container id survives across attempts and
+# is reconciled against Instagram's own view before anything is published.
+
+@pytest.fixture
+def after_interrupted_publish(base, tmp_path):
+    """A pending job left holding the container id of an attempt that was interrupted."""
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    record = dict(
+        _PENDING_RECORD,
+        video_local_path=str(video),
+        container_id=_CONTAINER_ID,
+        attempt_count=1,
+    )
+    ui.instagram_state.get_pending_upload.return_value = record
+    ui.instagram_state.record_recovered_publish = base.MagicMock()
+    ui.instagram_logger.log_upload_recovered = base.MagicMock()
+    return record
+
+
+def test_a_container_already_published_is_never_published_again(after_interrupted_publish):
+    """THE duplicate-post guard. A duplicate Reel on a client account is irreversible."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    main([])
+    ui.instagram_api.publish_container.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
+
+
+def test_an_already_published_container_is_recorded_as_published(after_interrupted_publish):
+    """Not republishing is only half of it — the key must be retired, or a re-approval duplicates."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    main([])
+    ui.instagram_state.record_recovered_publish.assert_called_once_with(
+        _IDEM_KEY, _PROJECT, _CONTAINER_ID
+    )
+    ui.instagram_logger.log_upload_recovered.assert_called_once_with(_PROJECT, _CONTAINER_ID)
+
+
+def test_a_recovered_publish_releases_the_shared_video(after_interrupted_publish):
+    """The job is terminal and successful, so it takes the success path in every respect."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    main([])
+    ui._delete_local_file.assert_called_once()
+
+
+def test_a_recovered_publish_tells_the_owner_the_truth(after_interrupted_publish):
+    """The Reel IS live, and FieldKit cannot link to it — both facts have to be said.
+
+    Claiming a normal success would be a lie (there is no link), and reporting a failure
+    would invite a re-approval, which is exactly how the duplicate gets posted.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "live on Instagram" in text
+    assert "Nothing was posted twice" in text
+
+
+def test_a_finished_container_is_reused_rather_than_rebuilt(after_interrupted_publish):
+    """Ingested but not published: publishing THIS container is the duplicate-free finish."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    main([])
+    ui.instagram_api.create_media_container.assert_not_called()
+    ui.drive.create_temporary_share_link.assert_not_called()
+    ui.instagram_api.publish_container.assert_called_once_with(
+        _PAGE_TOKEN, _IG_ACCOUNT_ID, _CONTAINER_ID
+    )
+
+
+@pytest.mark.parametrize("status", ["ERROR", "EXPIRED"])
+def test_a_dead_container_is_discarded_and_rebuilt(after_interrupted_publish, status):
+    """Definitively never published and no longer usable, so a fresh container is safe."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.side_effect = [status, "FINISHED"]
+    main([])
+    ui.instagram_api.create_media_container.assert_called_once()
+    ui.instagram_state.mark_published.assert_called_once()
+
+
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "SOMETHING_META_ADDED_LATER", None])
+def test_an_undetermined_container_is_never_replaced_by_a_new_one(after_interrupted_publish, status):
+    """The strict reading: not knowing a container's fate is never grounds for a second one.
+
+    An unrecognised status could be a publish state Meta has added since this was written,
+    so treating it as "safe to build a new container" could duplicate a post. Failing the
+    attempt costs a retry from a bounded budget; guessing costs a client a duplicate Reel.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.return_value = status
+    main([])
+    ui.instagram_api.create_media_container.assert_not_called()
+    ui.instagram_api.publish_container.assert_not_called()
+    ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
+
+
+def test_an_unreachable_container_status_fails_the_attempt_instead_of_publishing(
+    after_interrupted_publish,
+):
+    """A network failure reconciling is still "unknown", and unknown must not publish."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("network down")
+    main([])
+    ui.instagram_api.publish_container.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
+
+
+def test_a_job_with_no_prior_container_is_unaffected(with_pending):
+    """The ordinary first attempt must not pay for any of this."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.drive.create_temporary_share_link.assert_called_once()
+    ui.instagram_api.create_media_container.assert_called_once()
+    ui.instagram_state.mark_published.assert_called_once()
+
+
+def test_an_exhausted_job_still_reconciles_its_last_container(base, tmp_path):
+    """The final attempt can crash after publishing exactly like any other.
+
+    claim_pending_upload() has already cleared the record by the time this is reached, so
+    if the check were skipped here a live Reel would go unrecorded and its key unretired —
+    and the owner, told it failed, would re-approve and post a duplicate.
+    """
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    ui.instagram_state.get_pending_upload.return_value = dict(
+        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID, attempt_count=3
+    )
+    ui.instagram_state.claim_pending_upload.return_value = "exhausted"
+    ui.instagram_state.record_recovered_publish = base.MagicMock()
+    ui.instagram_logger.log_upload_recovered = base.MagicMock()
+    ui.instagram_api.get_container_status.return_value = "PUBLISHED"
+
+    main([])
+    ui.instagram_state.record_recovered_publish.assert_called_once_with(
+        _IDEM_KEY, _PROJECT, _CONTAINER_ID
+    )
+    ui.instagram_logger.log_upload_exhausted.assert_not_called()
+
+
+def test_an_exhausted_job_that_cannot_be_reconciled_warns_about_a_possible_live_reel(
+    base, tmp_path
+):
+    """"Failed" and "might be live" call for very different follow-up.
+
+    An owner who believes nothing was posted will re-approve. If the last attempt did
+    reach publish and only lost its response, that re-approval is how the duplicate lands.
+    """
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    ui.instagram_state.get_pending_upload.return_value = dict(
+        _PENDING_RECORD, video_local_path=str(video), container_id=_CONTAINER_ID, attempt_count=3
+    )
+    ui.instagram_state.claim_pending_upload.return_value = "exhausted"
+    ui.instagram_api.get_container_status.side_effect = InstagramUploadError("network down")
+
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" in text
+    assert "before re-approving" in text.lower() or "BEFORE re-approving" in text
+    ui.instagram_logger.log_upload_exhausted.assert_called_once()
+
+
+def test_an_ordinary_exhaustion_does_not_cry_wolf(base, tmp_path):
+    """A job that never reached publish must keep the plain, actionable failure message."""
+    import scripts.upload_instagram as ui
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 64)
+    ui.instagram_state.get_pending_upload.return_value = dict(
+        _PENDING_RECORD, video_local_path=str(video), attempt_count=3
+    )
+    ui.instagram_state.claim_pending_upload.return_value = "exhausted"
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" not in text
+    assert "check logs" in text
+
+
+def test_a_publish_that_loses_its_response_warns_on_the_final_attempt(with_pending):
+    """The ambiguity flag is set BEFORE the irreversible call, not after it returns."""
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2          # this attempt is the third and last
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" in text
+
+
+def test_a_failure_before_publish_does_not_warn_on_the_final_attempt(with_pending):
+    """Only a failure at or after the publish call is ambiguous."""
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2
+    ui.instagram_api.create_media_container.side_effect = InstagramUploadError("HTTP 500")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" not in text
+
+
+# ---------------------------------------------------------------------------
+# The queued account is the one that gets published to
+# ---------------------------------------------------------------------------
+
+def test_a_changed_account_configuration_cancels_the_job(with_pending, monkeypatch):
+    """Reconfiguring a client between approval and publish must not post to a new account.
+
+    The video was approved FOR a specific Instagram account. Publishing it to whatever
+    IG_BUSINESS_ACCOUNT_ID happens to hold at cron time would be a wrong, irreversible
+    post on someone's real account.
+    """
+    import scripts.upload_instagram as ui
+    monkeypatch.setenv("IG_BUSINESS_ACCOUNT_ID", "17841499999999999")
+    main([])
+    ui.instagram_api.create_media_container.assert_not_called()
+    ui.instagram_api.publish_container.assert_not_called()
+
+
+def test_an_account_mismatch_is_terminal_and_alerts(with_pending, monkeypatch):
+    """Failed loudly rather than silently preferring either value.
+
+    Neither value can be shown to be the intended one, so the only correct action is to
+    publish nothing and say so — naming both accounts, since that is what the owner needs
+    in order to decide.
+    """
+    import scripts.upload_instagram as ui
+    monkeypatch.setenv("IG_BUSINESS_ACCOUNT_ID", "17841499999999999")
+    main([])
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "cancelled" in text
+    assert _IG_ACCOUNT_ID in text
+    assert "17841499999999999" in text
+    assert "Nothing was published" in text
+
+
+def test_an_account_mismatch_releases_the_shared_video(with_pending, monkeypatch):
+    """Terminal is terminal: the other platform must not wait on this job forever."""
+    import scripts.upload_instagram as ui
+    monkeypatch.setenv("IG_BUSINESS_ACCOUNT_ID", "17841499999999999")
+    main([])
+    ui._delete_local_file.assert_called_once()
+
+
+def test_a_job_with_no_recorded_account_is_cancelled(with_pending):
+    """A record that cannot name its target account is not safe to publish either."""
+    import scripts.upload_instagram as ui
+    with_pending["ig_business_account_id"] = ""
+    main([])
+    ui.instagram_api.publish_container.assert_not_called()
+    ui.instagram_state.mark_failed.assert_called_once_with(_IDEM_KEY)
+
+
+def test_the_queued_account_is_the_one_published_to(with_pending):
+    """When they agree, it is still the RECORD's value that is used, not the env's."""
+    import scripts.upload_instagram as ui
+    main([])
+    assert ui.instagram_api.create_media_container.call_args.args[1] == _IG_ACCOUNT_ID
+    assert ui.instagram_api.publish_container.call_args.args[1] == _IG_ACCOUNT_ID
+
+
+# ---------------------------------------------------------------------------
+# The share-link cleanup obligation is recorded before the link can exist
+# ---------------------------------------------------------------------------
+
+def test_the_cleanup_obligation_is_registered_before_the_file_is_shared(with_pending, mocker):
+    """drive.create_temporary_share_link hands over the id before granting the permission."""
+    import scripts.upload_instagram as ui
+    intent = mocker.patch.object(ui.instagram_state, "record_share_intent")
+    main([])
+    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+
+
+def test_a_share_call_that_raises_after_creating_the_permission_is_still_revocable(
+    with_pending, mocker
+):
+    """The unrecoverable case, made recoverable.
+
+    If the permission POST succeeds server-side and its response is then lost, the link is
+    real, the call raises, and a caller that only learns the id from the returned URL holds
+    nothing to revoke — an untracked public link, forever. The id arrives through the
+    callback before any of that, so the revoke still happens.
+    """
+    import scripts.upload_instagram as ui
+    intent = mocker.patch.object(ui.instagram_state, "record_share_intent")
+
+    def _share_then_lose_the_response(video_path, on_file_id=None):
+        on_file_id(_SHARE_FILE_ID)                    # file exists, still private
+        raise RuntimeError("Drive share permission request failed: read timed out")
+
+    ui.drive.create_temporary_share_link.side_effect = _share_then_lose_the_response
+    main([])
+    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+    ui.drive.revoke_share_link.assert_called_once_with(_SHARE_FILE_ID)
+
+
+def test_a_successful_revoke_retires_the_obligation(with_pending):
+    """Otherwise the drain would keep retrying a link that is already gone, forever."""
+    import scripts.upload_instagram as ui
+    main([])
+    ui.instagram_state.clear_share_cleanup.assert_called_once_with(_SHARE_FILE_ID)
+
+
+def test_a_failed_revoke_does_not_retire_the_obligation(with_pending):
+    """A link that is still public must stay on the list until it really is not."""
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive revoke failed: HTTP 503")
+    main([])
+    ui.instagram_state.clear_share_cleanup.assert_not_called()
+    ui.instagram_state.record_share_cleanup.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+
+
+def test_an_upload_that_never_shares_anything_records_no_obligation(with_pending, mocker):
+    """No file, no exposure, no entry to clear."""
+    import scripts.upload_instagram as ui
+    intent = mocker.patch.object(ui.instagram_state, "record_share_intent")
+    ui.drive.create_temporary_share_link.side_effect = RuntimeError("Drive upload failed: HTTP 500")
+    main([])
+    intent.assert_not_called()
+    ui.drive.revoke_share_link.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Deployment heartbeat and the orphan sweep
+# ---------------------------------------------------------------------------
+
+def test_every_tick_stamps_a_deployment_heartbeat(base, isolated_worker_health):
+    """The heartbeat attests the cron ENTRY fired — that is what check_approval.py reads."""
+    main([])
+    assert isolated_worker_health.is_deployed("instagram") is True
+
+
+def test_the_heartbeat_is_stamped_even_when_instagram_is_disabled(base, monkeypatch,
+                                                                 isolated_worker_health):
+    """"Deployed" and "enabled" are different facts and must not be collapsed.
+
+    A client with Instagram switched off still proves its cron is installed, so switching
+    the feature ON later works immediately instead of waiting a tick for the first approval
+    to be refused.
+    """
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    main([])
+    assert isolated_worker_health.is_deployed("instagram") is True
+
+
+def test_the_heartbeat_is_stamped_before_the_lock_is_even_attempted(base, mocker,
+                                                                   isolated_worker_health):
+    """A tick that loses the lock race still fired, and still proves deployment."""
+    import scripts.upload_instagram as ui
+    mocker.patch.object(ui, "_try_acquire_upload_lock", return_value=None)
+    main([])
+    assert isolated_worker_health.is_deployed("instagram") is True
+
+
+def test_every_tick_runs_the_orphan_sweep(base, mocker):
+    """Recovery for files the coordinated delete could not reach — see tools/upload_cleanup.py."""
+    import scripts.upload_instagram as ui
+    sweep = mocker.patch.object(ui.upload_cleanup, "sweep_orphaned_videos", return_value=[])
+    main([])
+    sweep.assert_called_once()
+
+
+def test_the_sweep_runs_even_when_instagram_is_disabled(base, mocker, monkeypatch):
+    """Like the share-link drain, it exists to catch what no job will ever carry."""
+    import scripts.upload_instagram as ui
+    sweep = mocker.patch.object(ui.upload_cleanup, "sweep_orphaned_videos", return_value=[])
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    main([])
+    sweep.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# End to end: a token can never reach the durable activity log
+# ---------------------------------------------------------------------------
+
+def test_a_token_bearing_api_error_never_reaches_the_activity_log(with_pending, mocker, tmp_path,
+                                                                 caplog):
+    """The whole leak path, through the real logger: exception -> error message -> log file.
+
+    The per-function defences are tested in test_instagram_api.py and
+    test_instagram_logger.py. This one wires the real writer into a real upload failure,
+    because the two could each be correct while the path between them is not.
+    """
+    import scripts.upload_instagram as ui
+    import tools.instagram_logger as ig_logger
+    log_dir = tmp_path / "real_logs"
+    mocker.patch.object(ig_logger, "LOG_DIR", log_dir)
+    mocker.patch.object(ig_logger, "LOG_FILE", log_dir / "photo-agent.log")
+    mocker.patch.object(ui.instagram_logger, "log_upload_attempt_failed",
+                        _real_log_attempt_failed)
+
+    leaked = "EAABsbCS1iHgBO7ZAZCxyzQWERTY1234567890abcdefGHIJKLmnop"
+    ui.instagram_api.create_media_container.side_effect = InstagramUploadError(
+        "Container creation request failed: HTTPSConnectionPool(host='graph.facebook.com', "
+        f"port=443): url /v25.0/media?access_token={leaked}"
+    )
+    main([])
+
+    written = (log_dir / "photo-agent.log").read_text()
+    assert "IG_FAILED" in written            # the failure really was logged
+    assert leaked not in written
+    assert "***REDACTED***" in written
+
+    # The activity log is the durable sink, but it is not the only one: the same
+    # exception text is emitted to stderr, which under cron becomes mail or a captured
+    # job log. Both have to be clean.
+    assert leaked not in caplog.text
+
+
+def test_a_token_that_expires_at_the_publish_step_warns_about_a_possible_live_reel(with_pending):
+    """The one case reconciliation cannot rescue, so the owner becomes the check.
+
+    Asking Instagram what became of the container is exactly the call that just returned
+    "your token is invalid", and mark_failed() then discards the container id — so nothing
+    will ever check again. Telling the owner before they re-approve is all that is left.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_api.publish_container.side_effect = InstagramTokenError("code 190")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "token expired" in text
+    assert "MAY be live" in text
+
+
+def test_a_token_that_expires_before_the_publish_step_does_not_cry_wolf(with_pending):
+    """Nothing was asked of Meta, so there is nothing ambiguous to warn about."""
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = InstagramTokenError("code 190")
+    main([])
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "token expired" in text
+    assert "MAY be live" not in text

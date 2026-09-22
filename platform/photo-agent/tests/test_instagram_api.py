@@ -537,7 +537,11 @@ def test_discover_business_account_queries_the_page_node(mocker):
     args, kwargs = get.call_args_list[0]
     assert args[0].endswith(f"/{_PAGE_ID}")
     assert "instagram_business_account" in kwargs["params"]["fields"]
-    assert kwargs["params"]["access_token"] == _ACCESS_TOKEN
+    # The token authenticates via the Authorization header and must NOT be in the query
+    # string — a requests exception renders the prepared URL, and that text ends up in
+    # the durable activity log. See tools/instagram_api.py's module docstring.
+    assert "access_token" not in kwargs["params"]
+    assert kwargs["headers"]["Authorization"] == f"Bearer {_ACCESS_TOKEN}"
 
 
 def test_discover_business_account_raises_when_nothing_linked(mocker):
@@ -632,7 +636,8 @@ def test_get_media_permalink_returns_the_permalink(mocker):
     args, kwargs = get.call_args
     assert args[0].endswith("/media_1")
     assert kwargs["params"]["fields"] == "permalink"
-    assert kwargs["params"]["access_token"] == _ACCESS_TOKEN
+    assert "access_token" not in kwargs["params"]
+    assert kwargs["headers"]["Authorization"] == f"Bearer {_ACCESS_TOKEN}"
 
 
 def test_get_media_permalink_differs_from_the_media_id(mocker):
@@ -677,3 +682,127 @@ def test_get_media_permalink_never_logs_access_token(mocker, caplog):
     with caplog.at_level("DEBUG"):
         ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
     assert _ACCESS_TOKEN not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Credential handling — the token must never be in a URL, and never in an error
+# ---------------------------------------------------------------------------
+#
+# FB_PAGE_ACCESS_TOKEN is a PERMANENT Page token: a leaked copy stays valid until
+# a human rotates it, and this repo has already had to do that once (issue #27).
+# The leak path these tests close is indirect and easy to miss — a requests
+# connection/redirect/timeout exception renders the PREPARED URL including its
+# query string, and that exception text is folded into an InstagramUploadError
+# which upload_instagram.py then persists to the durable activity log.
+
+_LEAKY_EXC = requests.exceptions.ConnectionError(
+    "HTTPSConnectionPool(host='graph.facebook.com', port=443): Max retries exceeded "
+    "with url: /v25.0/node?fields=status_code&access_token="
+    + _ACCESS_TOKEN
+    + " (Caused by NewConnectionError)"
+)
+
+
+def test_get_container_status_sends_the_token_as_a_header_not_a_query_param(mocker):
+    """The primary fix: nothing to leak, because nothing is in the URL."""
+    get = mocker.patch("requests.get", return_value=_mock_response({"status_code": "FINISHED"}))
+    ig_api.get_container_status(_ACCESS_TOKEN, "container_1")
+    _args, kwargs = get.call_args
+    assert "access_token" not in kwargs["params"]
+    assert kwargs["headers"]["Authorization"] == f"Bearer {_ACCESS_TOKEN}"
+
+
+def test_account_type_lookup_sends_the_token_as_a_header_not_a_query_param(mocker):
+    """The fourth GET — covered too, so no read path is left carrying a token in a URL."""
+    get = mocker.patch("requests.get", side_effect=_discovery_responses(
+        {"id": _IG_USER_ID, "username": "my_business_demo"}
+    ))
+    discover_business_account(_ACCESS_TOKEN, _PAGE_ID)
+    _args, kwargs = get.call_args_list[1]        # the account_type node lookup
+    assert "access_token" not in kwargs["params"]
+    assert kwargs["headers"]["Authorization"] == f"Bearer {_ACCESS_TOKEN}"
+
+
+def test_no_get_in_this_module_puts_a_token_in_the_query_string(mocker):
+    """Belt and braces across every read path at once, so a new one cannot regress it."""
+    get = mocker.patch("requests.get", side_effect=[
+        _mock_response({"status_code": "FINISHED"}),
+        _mock_response({"permalink": "https://www.instagram.com/reel/AbCdEfGhIjK/"}),
+        *_discovery_responses({"id": _IG_USER_ID, "username": "my_business_demo"}),
+    ])
+    ig_api.get_container_status(_ACCESS_TOKEN, "container_1")
+    ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1")
+    discover_business_account(_ACCESS_TOKEN, _PAGE_ID)
+    for _args, kwargs in get.call_args_list:
+        assert "access_token" not in (kwargs.get("params") or {})
+
+
+@pytest.mark.parametrize("call", [
+    lambda: ig_api.get_container_status(_ACCESS_TOKEN, "container_1"),
+    lambda: ig_api.get_media_permalink(_ACCESS_TOKEN, "media_1"),
+    lambda: discover_business_account(_ACCESS_TOKEN, _PAGE_ID),
+])
+def test_a_token_bearing_request_exception_is_redacted_on_every_get(mocker, call):
+    """Defence in depth: even if a URL did carry the token, the error would not."""
+    mocker.patch("requests.get", side_effect=_LEAKY_EXC)
+    with pytest.raises(InstagramUploadError) as excinfo:
+        call()
+    assert _ACCESS_TOKEN not in str(excinfo.value)
+    assert "***REDACTED***" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("call", [
+    lambda: ig_api.create_media_container(_ACCESS_TOKEN, _IG_USER_ID, "https://vid"),
+    lambda: ig_api.publish_container(_ACCESS_TOKEN, _IG_USER_ID, "container_1"),
+])
+def test_a_token_bearing_request_exception_is_redacted_on_every_post(mocker, call):
+    """The POSTs carry the token in the body, but their errors are redacted too."""
+    mocker.patch("requests.post", side_effect=_LEAKY_EXC)
+    with pytest.raises(InstagramUploadError) as excinfo:
+        call()
+    assert _ACCESS_TOKEN not in str(excinfo.value)
+
+
+def test_a_token_echoed_back_in_a_graph_api_error_message_is_redacted(mocker):
+    """Meta chooses what to echo in an error body; it is not text we authored."""
+    mocker.patch("requests.post", return_value=_mock_response({
+        "error": {
+            "code": 100,
+            "message": f"Invalid request: ?access_token={_ACCESS_TOKEN}",
+        }
+    }))
+    with pytest.raises(InstagramUploadError) as excinfo:
+        ig_api.create_media_container(_ACCESS_TOKEN, _IG_USER_ID, "https://vid")
+    assert _ACCESS_TOKEN not in str(excinfo.value)
+
+
+def test_a_token_in_a_malformed_response_body_is_redacted(mocker):
+    """The missing-'id' branches interpolate the whole response body into the error."""
+    mocker.patch("requests.post", return_value=_mock_response(
+        {"debug": f"sent access_token={_ACCESS_TOKEN}"}
+    ))
+    with pytest.raises(InstagramUploadError) as excinfo:
+        ig_api.publish_container(_ACCESS_TOKEN, _IG_USER_ID, "container_1")
+    assert _ACCESS_TOKEN not in str(excinfo.value)
+    assert "missing 'id'" in str(excinfo.value)
+
+
+def test_a_token_expiry_error_is_redacted_too(mocker):
+    """InstagramTokenError is logged and alerted on exactly like the others."""
+    mocker.patch("requests.get", return_value=_mock_response({
+        "error": {"code": 190, "message": f"expired for ?access_token={_ACCESS_TOKEN}"}
+    }))
+    with pytest.raises(InstagramTokenError) as excinfo:
+        ig_api.get_container_status(_ACCESS_TOKEN, "container_1")
+    assert _ACCESS_TOKEN not in str(excinfo.value)
+
+
+def test_redaction_keeps_the_error_diagnosable(mocker):
+    """An unreadable error is an error people route around."""
+    mocker.patch("requests.get", side_effect=_LEAKY_EXC)
+    with pytest.raises(InstagramUploadError) as excinfo:
+        ig_api.get_container_status(_ACCESS_TOKEN, "container_1")
+    message = str(excinfo.value)
+    assert "Container status poll request failed" in message
+    assert "graph.facebook.com" in message
+    assert "fields=status_code" in message
