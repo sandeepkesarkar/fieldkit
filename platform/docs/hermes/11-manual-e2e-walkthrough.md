@@ -32,7 +32,7 @@ client's name, its `DRIVE_ROOT_FOLDER_ID`, and its Telegram bot everywhere
 fieldkit repo root. Set it explicitly once, rather than assuming a fixed
 clone location:
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ~/src/fieldkit)"
+cd "$(git rev-parse --show-toplevel)"   # run from inside the fieldkit checkout
 ```
 
 ## 0. Pre-flight — confirm the install is actually ready for this

@@ -3,6 +3,17 @@
 One-time setup procedure for a new Mac Mini. Run every step in order.
 Estimated time: 25–30 minutes.
 
+> **Paths in this guide.** `$FIELDKIT_ROOT` stands for this machine's fieldkit
+> checkout. Set it once in the shell you run these steps in, and every command
+> below works regardless of where the repo lives:
+>
+> ```bash
+> export FIELDKIT_ROOT="$(git -C /path/to/fieldkit rev-parse --show-toplevel)"
+> ```
+>
+> Do not substitute a literal path back into this guide — a hardcoded
+> home-relative checkout path here is what issue #74 was.
+
 ---
 
 ## Architecture overview
@@ -32,8 +43,8 @@ python3 scripts/check_email.py
 > OpenClaw-shaped surface in email-agent.
 
 The script is deterministic — no LLM involvement beyond dispatching the single
-bash command. All configuration lives in `.env`. Logs go to `~/src/fieldkit/logs/`,
-state to `~/src/fieldkit/data/email-agent/`.
+bash command. All configuration lives in `.env`. Logs go to `$FIELDKIT_ROOT/logs/`,
+state to `$FIELDKIT_ROOT/data/email-agent/`.
 
 ---
 
@@ -105,9 +116,9 @@ Follow the prompts — it opens Google Cloud Console in the browser and walks yo
 ## 5 — Populate `.env`
 
 ```bash
-cp ~/src/fieldkit/platform/email-agent/.env.example \
-   ~/src/fieldkit/platform/email-agent/.env
-chmod 600 ~/src/fieldkit/platform/email-agent/.env
+cp "$FIELDKIT_ROOT/platform/email-agent/.env.example" \
+   "$FIELDKIT_ROOT/platform/email-agent/.env"
+chmod 600 "$FIELDKIT_ROOT/platform/email-agent/.env"
 ```
 
 Edit `.env` and fill in all variables:
@@ -147,7 +158,7 @@ A browser window opens. **Sign in with the agent Gmail account** (`$AGENT_EMAIL`
 ## 7 — Create runtime directories
 
 ```bash
-mkdir -p ~/src/fieldkit/data/email-agent ~/src/fieldkit/logs
+mkdir -p "$FIELDKIT_ROOT/data/email-agent" "$FIELDKIT_ROOT/logs"
 ```
 
 ---
@@ -161,12 +172,11 @@ cache. Add `platform/email-agent/skills` alongside the existing
 does not list yet, even if `process-photos`/`check-approval` are already
 installed):
 
-```yaml
-skills:
-  external_dirs:
-    - ~/src/fieldkit/platform/photo-agent/skills
-    - ~/src/fieldkit/platform/email-agent/skills
-```
+The exact `hermes config set` command, with the current absolute paths, is
+maintained in one place — see
+`platform/docs/hermes/12-skill-path-resolution.md`. It is a **deployment
+prerequisite**: until `platform/email-agent/skills` is listed there,
+`/check_email` is not registered as a command at all.
 
 Restart the gateway to pick it up:
 
@@ -186,19 +196,19 @@ Run each check in order. All must pass before registering the cron job.
 
 ```bash
 # gws can reach Gmail
-source ~/src/fieldkit/platform/email-agent/.env
+source "$FIELDKIT_ROOT/platform/email-agent/.env"
 gws gmail users messages list --params '{"userId": "me", "q": "is:unread"}'
 # Must return JSON (empty messages list is fine)
 
 # Runtime directories exist
-ls ~/src/fieldkit/data/email-agent ~/src/fieldkit/logs
+ls "$FIELDKIT_ROOT/data/email-agent" "$FIELDKIT_ROOT/logs"
 
 # Skill is registered and ready
 hermes skills list --source local | grep check-email
 # Must show check-email, source local, status enabled
 
 # Script runs without error (dry run — safe to run with no unread mail)
-cd ~/src/fieldkit/platform/email-agent
+cd "$FIELDKIT_ROOT/platform/email-agent"
 python3 scripts/check_email.py --source cron
 # Must exit cleanly with no Python traceback. If inbox is empty, no output expected.
 ```
@@ -218,13 +228,13 @@ The `--source cron` flag suppresses the "No new emails." reply on silent runs.
 PYTHON3=$(which python3)
 crontab -l 2>/dev/null | grep -v check_email > /tmp/mycron
 cat >> /tmp/mycron << EOF
-*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'date && ${PYTHON3} ${HOME}/src/fieldkit/platform/email-agent/scripts/check_email.py --source cron' >> ${HOME}/src/fieldkit/logs/cron.log 2>&1
+*/5 * * * * env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin bash -c 'date && ${PYTHON3} ${FIELDKIT_ROOT}/platform/email-agent/scripts/check_email.py --source cron' >> ${FIELDKIT_ROOT}/logs/cron.log 2>&1
 EOF
 crontab /tmp/mycron && rm /tmp/mycron
 crontab -l | grep check_email
 ```
 
-> **Run this command as the user who will own the cron job** (typically your regular account, not root). The unquoted heredoc expands `$HOME` and `$PYTHON3` in your shell — if run via `sudo`, `$HOME` resolves to `/root` and the paths will be wrong.
+> **Run this command as the user who will own the cron job** (typically your regular account, not root), in the same shell where you exported `$FIELDKIT_ROOT` above. The unquoted heredoc expands `$FIELDKIT_ROOT` and `$PYTHON3` in your shell, so the crontab stores absolute paths — verify them with the `crontab -l` line before moving on. If `$FIELDKIT_ROOT` is unset (or you run this via `sudo`, which does not inherit it), the entry is written with a broken path.
 > Change `*/5` to `*/N` to adjust the polling interval. To update the interval later, remove the entry (`crontab -e`) and re-run this step.
 > `PYTHON3=$(which python3)` is baked in at registration time to avoid selecting the wrong interpreter on a machine with multiple Python versions.
 > `date` prepends a timestamp to every entry in `cron.log` so you can see when each run fired.
@@ -234,8 +244,11 @@ crontab -l | grep check_email
 > would revert to cron's minimal PATH. `env` sets the PATH for `python3` and all
 > processes it spawns.
 > `gws` lives in `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel).
-> `$HOME` and `$PYTHON3` are expanded by your shell when you run this command,
-> so the crontab stores the literal values.
+> `$FIELDKIT_ROOT` and `$PYTHON3` are expanded by your shell when you run this
+> command, so the crontab stores the literal values. Re-run this step after
+> moving the checkout — the crontab holds absolute paths and does not follow a
+> move (this is why the cron legs survived the 2026-08-31 move while the skills
+> did not; see `platform/docs/hermes/12-skill-path-resolution.md`).
 > As of Part 1 of #14, `check_email.py` no longer shells out to `openclaw` — the
 > cron PATH only needs to resolve `gws` and `python3`.
 
@@ -249,7 +262,7 @@ To confirm the cron path is correct end-to-end, wait up to 5 minutes for the fir
 automatic run and check the cron log:
 
 ```bash
-tail -f ~/src/fieldkit/logs/cron.log
+tail -f "$FIELDKIT_ROOT/logs/cron.log"
 ```
 
 ---
@@ -272,4 +285,4 @@ tail -f ~/src/fieldkit/logs/cron.log
 | `gws binary not found` in cron.log | gws is not on cron PATH. Remove the crontab entry (`crontab -e`) and re-run Step 10. |
 | `check_email: AGENT_EMAIL is not set` in Telegram | `.env` is missing `AGENT_EMAIL`. Check Step 5. |
 | `RuntimeError: TELEGRAM_BOT_TOKEN is not set` | `.env` is missing `TELEGRAM_BOT_TOKEN`. Check Step 5. |
-| Script exits with lock error | Check if another instance is still running: `pgrep -af check_email.py`. If a process is found, wait for it to finish. If no process is found but the error persists, the lock file is stale — delete it: `rm ~/src/fieldkit/data/email-agent/run.lock`. |
+| Script exits with lock error | Check if another instance is still running: `pgrep -af check_email.py`. If a process is found, wait for it to finish. If no process is found but the error persists, the lock file is stale — delete it: `rm "$FIELDKIT_ROOT/data/email-agent/run.lock"`. |
