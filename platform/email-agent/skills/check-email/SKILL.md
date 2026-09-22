@@ -76,9 +76,9 @@ block immediately:
 # quotes a path containing $, $(...) or a backtick would still expand or
 # execute, and inside single quotes a path containing a single quote would
 # break out of the quoting. A quoted heredoc (<<'DELIM') expands nothing at
-# all, so the path arrives as literal data whatever it contains. Never
-# hardcode an absolute repo path here either — a moved checkout silently
-# broke every command for three weeks that way (issue #74).
+# all, which removes those classes — but NOT the delimiter collision described
+# next. Never hardcode an absolute repo path here either — a moved checkout
+# silently broke every command for three weeks that way (issue #74).
 # Residual, documented rather than papered over: a pathname containing a
 # newline followed by a line exactly equal to the delimiter below ends the
 # heredoc early, and the rest of the pathname is then arbitrary shell source

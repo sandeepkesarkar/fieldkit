@@ -99,10 +99,12 @@ not on any claim about blast radius.
 ### What the mitigations actually buy
 
 - The delimiter is long and improbable
-  (`__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__`), so accidental or realistic
-  collision is nil. This is protection against a coincidence, not against an
-  adversary — an adversary reads the delimiter out of this file. A regression
-  test fails if anyone shortens it back to a guessable string.
+  (`__FIELDKIT_SKILL_DIR_EOF_9c1f4b7e2a5d__`), so an accidental collision is
+  extremely unlikely. This is protection against a coincidence, not against an
+  adversary — an adversary reads the delimiter out of this file. What the
+  regression test actually establishes is narrower than "unlikely": it fails
+  if anyone shortens the delimiter back to a guessable string, which is the
+  part that can be tested.
 - A newline *without* a matching delimiter line truncates the value and fails
   closed, as does every other malformed shape.
 
@@ -194,9 +196,13 @@ tail -f ~/.hermes/logs/gateway.log
 
 ## Failure modes and what they mean
 
-Every failure prints one `ERROR:` line, names the Hermes setting involved, and
-stops. These are diagnostics **for the operator** — the agent's role is limited
-to relaying them; it does not change configuration or restart the gateway.
+Every guard prints exactly one line beginning `ERROR:` and exits 1 —
+`test_every_guard_branch_reports_one_error_line` pins that for each branch
+below. Two of them name the Hermes setting at fault (`skills.template_vars`
+and `skills.external_dirs`); the rest name the offending path instead, because
+no setting is to blame for it. These are diagnostics **for the operator** —
+the agent's role is limited to relaying them; it does not change configuration
+or restart the gateway.
 
 | `ERROR:` line | Cause | Operator action |
 |---|---|---|

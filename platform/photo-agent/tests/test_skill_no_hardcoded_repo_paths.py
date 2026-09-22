@@ -265,20 +265,37 @@ def _fake_checkout(root: Path, dirname: str, skill_md: Path) -> Path:
     scripts = agent_dir / "scripts"
     scripts.mkdir(exist_ok=True)
     (scripts / _script_name(_dispatch_block(skill_md))).write_text("# stub\n")
+    # The real SKILL.md, so the same fake checkout can be driven either through
+    # the substitution model or through Hermes's own builder (mechanism=...).
+    (skill_dir / "SKILL.md").write_text(
+        skill_md.read_text(encoding="utf-8"), encoding="utf-8"
+    )
     return skill_dir
 
 
-def _run_as_dispatched(skill_md: Path, skill_dir: Path, cwd: Path, invocation: str = "pwd"):
-    """Substitute the token with *skill_dir* exactly as Hermes does, then run.
+def _run_as_dispatched(
+    skill_md: Path,
+    skill_dir: Path,
+    cwd: Path,
+    invocation: str = "pwd",
+    mechanism: str = "model",
+):
+    """Produce the dispatch block for *skill_dir* and run it.
 
-    Hermes performs a plain textual replacement of the bare `${HERMES_SKILL_DIR}`
-    token (`agent/skill_preprocessing.py::substitute_template_vars`), which is
-    what makes the substituted text shell source in the first place; modelling
-    it as a textual replace here keeps the test hermetic (no Hermes import)
-    while reproducing the property under test.
+    Two mechanisms, because the distinction matters to what a test may claim:
+
+    * ``"model"`` — replace the bare `${HERMES_SKILL_DIR}` token textually,
+      which is exactly what `substitute_template_vars` does, and is what makes
+      the result shell source in the first place. Hermetic: no Hermes needed.
+    * ``"hermes"`` — call the installed Hermes's real `_build_skill_message()`
+      and take the block it produces. Slower and skipped when Hermes is
+      absent, but it pins live dispatch behaviour rather than a model of it.
     """
-    script = _resolution_only(_dispatch_block(skill_md), invocation)
-    script = script.replace(_SKILL_DIR_TOKEN, str(skill_dir))
+    if mechanism == "hermes":
+        script = _resolution_only(_dispatch_block_via_hermes(skill_dir), invocation)
+    else:
+        script = _resolution_only(_dispatch_block(skill_md), invocation)
+        script = script.replace(_SKILL_DIR_TOKEN, str(skill_dir))
     return subprocess.run(
         ["/bin/bash", "-c", script],
         # USER is deliberately absent: an expanded `$USER` then collapses to
@@ -480,7 +497,10 @@ def test_delimiter_text_inside_a_path_component_resolves(tmp_path, skill_md):
 
 
 @pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
-def test_delimiter_collision_permits_arbitrary_shell_source(tmp_path, skill_md):
+@pytest.mark.parametrize("mechanism", ["model", "hermes"])
+def test_delimiter_collision_permits_arbitrary_shell_source(
+    tmp_path, skill_md, mechanism
+):
     """Pin the residual as it actually is: a full guard bypass is possible.
 
     This test asserts the LIMITATION, not a guarantee. Once a pathname
@@ -497,18 +517,32 @@ def test_delimiter_collision_permits_arbitrary_shell_source(tmp_path, skill_md):
     claim did not generalise, and the accepted risk is documented in
     platform/docs/hermes/12-skill-path-resolution.md instead.
 
-    If this test ever FAILS, the limitation may have been closed (for instance
-    Hermes began passing the skill directory as an environment variable). That
-    is good news, and the disclosure in doc 12 and the PR body must then be
-    updated to match — do not simply delete this test.
+    Runs under both mechanisms, so the disclosure can name the one that backs
+    it: ``model`` always runs, and ``hermes`` drives the installed Hermes's
+    real `_build_skill_message()` so the documented behaviour is pinned as
+    live dispatch behaviour, not only as a property of the substitution model.
+
+    If this test FAILS, do not assume the limitation has been fixed: it may
+    have been closed upstream (for instance Hermes passing the skill directory
+    as an environment variable), OR a regression may have changed this block's
+    behaviour — check the other tests in this file before concluding which. If
+    it really is fixed, update the disclosure in doc 12 and the PR body to
+    match rather than deleting this test.
     """
+    if mechanism == "hermes" and not _HERMES_PYTHON.is_file():
+        pytest.skip("Hermes is not installed on this machine")
+
     delimiter = _heredoc_delimiter(_dispatch_block(skill_md))
     skill_dir = _fake_checkout(
         tmp_path, _payload(delimiter, "cd ..", "exit 0"), skill_md
     )
 
     result = _run_as_dispatched(
-        skill_md, skill_dir, cwd=tmp_path, invocation=f"echo {_REACHED}"
+        skill_md,
+        skill_dir,
+        cwd=tmp_path,
+        invocation=f"echo {_REACHED}",
+        mechanism=mechanism,
     )
     combined = result.stdout + result.stderr
 
@@ -527,6 +561,171 @@ def test_delimiter_collision_permits_arbitrary_shell_source(tmp_path, skill_md):
         f"{skill_md}: the injected `exit 0` should have short-circuited the "
         f"block before dispatch.\nstdout: {result.stdout}"
     )
+
+
+# ---------------------------------------------------------------------------
+# One test per guard branch (PR #75 round-5 review, item 1)
+# ---------------------------------------------------------------------------
+# Rounds 1–4 of this review kept finding claims that outran their tests. Both
+# round-5 reviewers then found the inverse gap: several guard branches were
+# correct but had no dedicated test, while the PR claimed coverage of them. The
+# guards below were verified by hand; these tests make the claim true, so the
+# coverage statement stands on the suite rather than on a manual check.
+#
+# Each case drives the block's own code — no hand-copied expectation of it.
+
+# Every distinct abort branch, with the text that identifies it. `condition`
+# builds the skill directory that triggers it, given a tmp root and the skill.
+_GUARD_BRANCHES = (
+    ("empty", "empty or blank"),
+    ("whitespace-only", "empty or blank"),
+    ("unsubstituted-placeholder", "reached the shell unsubstituted"),
+    ("metacharacter", "contains a shell metacharacter"),
+    ("outside-platform-parent", "not a fieldkit platform agent directory"),
+    ("missing-script", "not found under"),
+)
+
+
+def _skill_dir_for_branch(branch: str, tmp_path: Path, skill_md: Path) -> str | None:
+    """The substituted value that drives *branch*, or None to leave it raw."""
+    if branch == "empty":
+        return ""
+    if branch == "whitespace-only":
+        return "   "
+    if branch == "unsubstituted-placeholder":
+        return None  # leave the token in place
+    if branch == "metacharacter":
+        return str(_fake_checkout(tmp_path, "repo$USER", skill_md))
+    if branch == "outside-platform-parent":
+        # Mirrors a skill copied into Hermes's own skills directory, where two
+        # levels up is the Hermes profile rather than an agent directory.
+        hermes_skill = tmp_path / ".hermes" / "skills" / skill_md.parent.name
+        hermes_skill.mkdir(parents=True, exist_ok=True)
+        return str(hermes_skill)
+    if branch == "missing-script":
+        # Correct layout, but scripts/ is absent — a mispointed external_dirs.
+        skill_dir = tmp_path / "repo" / "platform" / skill_md.parents[2].name / "skills" / skill_md.parent.name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        return str(skill_dir)
+    raise AssertionError(f"unknown branch {branch!r}")
+
+
+def _run_branch(skill_md: Path, tmp_path: Path, branch: str):
+    substitute = _skill_dir_for_branch(branch, tmp_path, skill_md)
+    script = _resolution_only(_dispatch_block(skill_md))
+    if substitute is not None:
+        script = script.replace(_SKILL_DIR_TOKEN, substitute)
+    return subprocess.run(
+        ["/bin/bash", "-c", script],
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+@pytest.mark.parametrize(
+    "branch,expected_text",
+    _GUARD_BRANCHES,
+    ids=[b for b, _ in _GUARD_BRANCHES],
+)
+def test_each_guard_branch_aborts_with_its_own_diagnostic(
+    tmp_path, skill_md, branch, expected_text
+):
+    """Each abort branch must fire, exit 1, and say which condition it was.
+
+    Covers items (a), (b) and (c) of the round-5 list — empty/whitespace-only,
+    resolution outside a `platform/` parent, and a missing dispatched script —
+    alongside the two branches earlier rounds already exercised, so all six
+    live in one matrix rather than being covered unevenly.
+    """
+    result = _run_branch(skill_md, tmp_path, branch)
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 1, (
+        f"{skill_md}: branch {branch!r} exited {result.returncode}, expected 1"
+        f"\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert expected_text in combined, (
+        f"{skill_md}: branch {branch!r} did not report its own diagnostic "
+        f"({expected_text!r}) — a misidentified cause sends the operator to "
+        f"the wrong setting.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+@pytest.mark.parametrize(
+    "branch", [b for b, _ in _GUARD_BRANCHES], ids=[b for b, _ in _GUARD_BRANCHES]
+)
+def test_every_guard_branch_reports_one_error_line(tmp_path, skill_md, branch):
+    """Pins doc 12's statement that a guard prints exactly ONE `ERROR:` line.
+
+    That document previously claimed every failure also "names the Hermes
+    setting involved", which is false — only the two configuration-caused
+    branches do, and the statement has been narrowed to match. This test pins
+    the part that is true of all of them.
+    """
+    result = _run_branch(skill_md, tmp_path, branch)
+    combined = result.stdout + result.stderr
+    error_lines = [l for l in combined.splitlines() if l.startswith("ERROR:")]
+
+    assert len(error_lines) == 1, (
+        f"{skill_md}: branch {branch!r} printed {len(error_lines)} ERROR "
+        f"lines, expected exactly 1.\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+_SETTING_NAMING_BRANCHES = {
+    "unsubstituted-placeholder": "skills.template_vars",
+    "missing-script": "skills.external_dirs",
+}
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+@pytest.mark.parametrize(
+    "branch,setting",
+    sorted(_SETTING_NAMING_BRANCHES.items()),
+    ids=sorted(_SETTING_NAMING_BRANCHES),
+)
+def test_configuration_branches_name_the_hermes_setting(
+    tmp_path, skill_md, branch, setting
+):
+    """The two branches doc 12 says name a setting must actually name it."""
+    result = _run_branch(skill_md, tmp_path, branch)
+    combined = result.stdout + result.stderr
+    assert setting in combined, (
+        f"{skill_md}: branch {branch!r} should point the operator at "
+        f"{setting!r}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+def test_path_containing_the_placeholder_name_is_not_mistaken_for_it(
+    tmp_path, skill_md
+):
+    """Item (d): a real path may contain the text HERMES_SKILL_DIR.
+
+    The guard compares against the literal `${HERMES_SKILL_DIR}` placeholder,
+    not a substring, so a checkout that happens to include that name resolves
+    normally. An earlier revision matched `*HERMES_SKILL_DIR*` and would have
+    misreported this as "template_vars is disabled" — a wrong diagnosis that
+    sends the operator to change a setting that was never the problem.
+    """
+    skill_dir = _fake_checkout(tmp_path, "HERMES_SKILL_DIR_repo", skill_md)
+    result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
+
+    assert result.returncode == 0, (
+        f"{skill_md}: a legitimate path containing the placeholder's NAME was "
+        f"rejected.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "unsubstituted" not in (result.stdout + result.stderr), (
+        f"{skill_md}: misdiagnosed a real path as an unsubstituted "
+        f"placeholder.\nstdout: {result.stdout}"
+    )
+    landed = Path(result.stdout.strip().splitlines()[-1]).resolve()
+    assert landed == skill_dir.parents[1].resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -557,18 +756,35 @@ _DATED_RECORDS = {
 }
 
 
+def _tracked_markdown() -> list[str]:
+    """Repo-relative paths of every git-TRACKED markdown file.
+
+    Deliberately `git ls-files` rather than a filesystem walk. A walk also
+    picks up whatever untracked directories happen to sit in a developer's
+    checkout — `.claude/`, `.worktrees/`, scratch copies of these very docs —
+    each carrying its own stale paths, which turned this test red for reasons
+    that had nothing to do with the repo's contents. Only tracked files are
+    this repo's responsibility, so only tracked files are asserted on.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "ls-files", "-z", "--", "*.md"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"git ls-files failed: {result.stderr}"
+    return [p for p in result.stdout.split("\0") if p]
+
+
 def _current_docs() -> list[Path]:
-    """Every markdown doc that is current instructions rather than history."""
+    """Every tracked markdown doc that is current instructions, not history."""
     docs = []
-    for path in sorted(_REPO_ROOT.rglob("*.md")):
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        # .specify/ holds per-feature spec history; .worktrees/ holds other
-        # checkouts of this same repo.
-        if ".specify/" in rel or rel.startswith(".worktrees/") or "/.worktrees/" in rel:
+    for rel in sorted(_tracked_markdown()):
+        # .specify/ holds per-feature spec history.
+        if ".specify/" in rel:
             continue
         if rel in _DATED_RECORDS:
             continue
-        docs.append(path)
+        docs.append(_REPO_ROOT / rel)
     return docs
 
 
@@ -687,6 +903,28 @@ print(sys.argv[4])
 '''
 
 
+def _dispatch_block_via_hermes(skill_dir: Path) -> str:
+    """The dispatch block Hermes's own builder produces for *skill_dir*.
+
+    Reads `SKILL.md` from *skill_dir*, so it works for the real skills and for
+    a fake checkout built by `_fake_checkout` alike. Requires Hermes; callers
+    must skip when `_HERMES_PYTHON` is absent.
+    """
+    extract = subprocess.run(
+        [
+            str(_HERMES_PYTHON), "-c", _EXTRACT_VIA_HERMES,
+            str(_HERMES_AGENT_DIR), str(skill_dir), _BLOCK_START, _BLOCK_END,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert extract.returncode == 0, (
+        f"could not build the dispatch message via Hermes for {skill_dir}:\n"
+        f"{extract.stderr}"
+    )
+    return extract.stdout.split(_BLOCK_START, 1)[1].split(_BLOCK_END, 1)[0].strip("\n")
+
+
 @pytest.mark.skipif(
     not _HERMES_PYTHON.is_file(), reason="Hermes is not installed on this machine"
 )
@@ -694,18 +932,7 @@ print(sys.argv[4])
 def test_real_hermes_builder_substitutes_and_resolves(skill_md):
     """Hermes's real builder must substitute the token, and the block it
     produces must execute and land on this checkout's agent directory."""
-    extract = subprocess.run(
-        [
-            str(_HERMES_PYTHON), "-c", _EXTRACT_VIA_HERMES,
-            str(_HERMES_AGENT_DIR), str(skill_md.parent), _BLOCK_START, _BLOCK_END,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert extract.returncode == 0, (
-        f"could not build the dispatch message via Hermes:\n{extract.stderr}"
-    )
-    block = extract.stdout.split(_BLOCK_START, 1)[1].split(_BLOCK_END, 1)[0].strip("\n")
+    block = _dispatch_block_via_hermes(skill_md.parent)
 
     # Hermes really did the substitution: no placeholder survives into the
     # content the agent receives.
