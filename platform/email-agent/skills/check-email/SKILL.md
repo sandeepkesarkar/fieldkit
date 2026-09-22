@@ -70,15 +70,40 @@ intake cycle. Do not ask the user any clarifying questions — always run this
 block immediately:
 
 ```bash
-# Repo location is derived from this skill file's own directory: Hermes
-# substitutes HERMES_SKILL_DIR with the absolute skill directory before the
-# agent sees this block (skills.template_vars, on by default). Never hardcode
-# an absolute repo path here — a moved checkout silently broke every command
-# for three weeks that way (issue #74).
-SKILL_DIR="${HERMES_SKILL_DIR}"
-[ -n "$SKILL_DIR" ] || { echo "ERROR: skill directory unresolved — HERMES_SKILL_DIR was neither substituted nor exported. Enable skills.template_vars in the Hermes config and restart the gateway."; exit 1; }
+# Repo location is derived from this skill file's own directory. Hermes
+# substitutes HERMES_SKILL_DIR into this block TEXTUALLY, before Bash parses
+# it, so the substituted path is shell SOURCE, not shell data: inside double
+# quotes a path containing $, $(...) or a backtick would still expand or
+# execute, and inside single quotes a path containing a single quote would
+# break out of the quoting. A quoted heredoc (<<'DELIM') expands nothing at
+# all, so the path arrives as literal data whatever it contains. Never
+# hardcode an absolute repo path here either — a moved checkout silently
+# broke every command for three weeks that way (issue #74).
+IFS= read -r SKILL_DIR <<'FIELDKIT_SKILL_DIR_EOF'
+${HERMES_SKILL_DIR}
+FIELDKIT_SKILL_DIR_EOF
+# An unsubstituted placeholder arrives as the literal token (the heredoc does
+# not expand it), so test for that text rather than for an empty value.
+case "$SKILL_DIR" in
+  ""|*HERMES_SKILL_DIR*) echo "ERROR: FieldKit skill directory unresolved — the HERMES_SKILL_DIR placeholder reached the shell unsubstituted, which points at Hermes's skills.template_vars setting."; exit 1 ;;
+esac
+# Defence in depth behind the heredoc: a checkout path carrying a shell
+# metacharacter is pathological, and refusing it loudly is safer than
+# interpolating it correctly here and having it re-parsed somewhere else.
+case "$SKILL_DIR" in
+  *'$'*|*'`'*|*'"'*|*"'"*|*'\'*) echo "ERROR: FieldKit refusing to run — the skill directory contains a shell metacharacter (a dollar sign, backtick, quote or backslash) and cannot be used safely: $SKILL_DIR"; exit 1 ;;
+esac
 AGENT_DIR="$(cd "$SKILL_DIR/../.." 2>/dev/null && pwd)" || { echo "ERROR: cannot resolve the email-agent directory two levels above the skill directory: $SKILL_DIR"; exit 1; }
-[ -f "$AGENT_DIR/scripts/check_email.py" ] || { echo "ERROR: scripts/check_email.py not found under $AGENT_DIR — this skill is not installed from a fieldkit checkout; check skills.external_dirs in the Hermes config."; exit 1; }
+# The two-levels-up step assumes the fieldkit layout <repo>/platform/<agent>/
+# skills/<skill>. Hermes also supports skills kept in its own skills
+# directory, where two levels up is Hermes's profile rather than an agent
+# directory; this refuses that case instead of relying on the script check
+# below to notice.
+case "$AGENT_DIR" in
+  */platform/*) ;;
+  *) echo "ERROR: resolved directory is not a fieldkit platform agent directory: $AGENT_DIR"; exit 1 ;;
+esac
+[ -f "$AGENT_DIR/scripts/check_email.py" ] || { echo "ERROR: scripts/check_email.py not found under $AGENT_DIR — this skill is not running from a complete fieldkit checkout, which points at Hermes's skills.external_dirs setting."; exit 1; }
 cd "$AGENT_DIR" || { echo "ERROR: cannot enter $AGENT_DIR"; exit 1; }
 python3 scripts/check_email.py
 ```
@@ -87,6 +112,11 @@ python3 scripts/check_email.py
 > skill file's own directory, substituted into the block above by Hermes at
 > dispatch time. Moving or renaming the checkout needs no edit here — do NOT
 > replace this with an absolute path.
+
+If the block prints a line beginning `ERROR:`, relay that line and stop. Those
+conditions are Hermes configuration or checkout-layout problems that the
+operator resolves; the agent's role is limited to reporting them, not to
+changing configuration, editing files, or restarting the gateway.
 
 Do not improvise or read emails yourself. The script handles everything: Gmail
 polling, allowlist enforcement, Telegram acknowledgements, stale alerts, and

@@ -31,6 +31,10 @@ Same discovery mechanism as `process-photos` (#7) — Hermes's
 `~/src/fieldkit/platform/photo-agent/skills`, this skill's parent directory,
 so no config change was needed:
 
+> ⚠️ **Dated record.** The `external_dirs` path below is as-of-then and is now
+> stale. The current config command lives in
+> `platform/docs/hermes/12-skill-path-resolution.md`.
+
 ```yaml
 skills:
   external_dirs:

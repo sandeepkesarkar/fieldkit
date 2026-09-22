@@ -23,6 +23,10 @@ shipped — this skill lands in a **new** parent directory,
 `platform/email-agent/skills`, that the live `~/.hermes/config.yaml` does
 not yet list:
 
+> ⚠️ **Dated record.** The `external_dirs` path below is as-of-then and is now
+> stale. The current config command lives in
+> `platform/docs/hermes/12-skill-path-resolution.md`.
+
 ```yaml
 skills:
   external_dirs:

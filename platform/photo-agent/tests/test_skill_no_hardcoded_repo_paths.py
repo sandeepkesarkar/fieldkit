@@ -19,8 +19,8 @@ actually lives in — whatever that is.
 
 These tests cover EVERY skill under `platform/*/skills/*/SKILL.md`, not a
 hardcoded list of four, so a future skill in either agent is guarded the day
-it is added. Three angles, because a static substring check alone is not
-enough to prove a shell block works:
+it is added. A static substring check alone cannot prove a shell block works,
+so most of these execute the block's own code:
 
 1. `test_no_hardcoded_repo_path` — static: no home-relative or absolute
    machine path anywhere in the instructions, and every `cd` target is a
@@ -33,6 +33,15 @@ enough to prove a shell block works:
    actionable message. Fail closed, never degrade into running against the
    wrong directory — issue #59 was a cross-client data leak caused by exactly
    that kind of silent fallback.
+4. `test_shell_metacharacter_in_path_fails_closed` /
+   `test_benign_path_shapes_still_resolve` — dynamic: the substituted path is
+   shell source, so prove a metacharacter-bearing checkout path neither
+   executes nor silently resolves elsewhere, while a path containing a space
+   still works. See the section comment below for the full reasoning.
+5. `test_no_stale_repo_path_in_current_docs` — static, and not about the
+   skills: an operator following a stale runbook reintroduces the same
+   breakage by hand, so current operator docs must not name the pre-move
+   checkout location either.
 """
 
 import re
@@ -202,3 +211,219 @@ def test_unresolved_skill_dir_fails_closed(skill_md):
         f"operator knows what to fix.\nstdout: {result.stdout}\n"
         f"stderr: {result.stderr}"
     )
+# ---------------------------------------------------------------------------
+# Substitution-as-shell-source injection (PR #75 review, blocking 1)
+# ---------------------------------------------------------------------------
+# Hermes substitutes the skill directory TEXTUALLY into the block before Bash
+# parses it, so the path is shell *source*, not shell *data*. Double quotes do
+# not protect it: `$VAR` and `$(...)` still expand inside them. The original
+# fix interpolated the token in double quotes, which meant a checkout path
+# containing `$`, `$(...)` or a backtick either executed during the
+# assignment or collapsed onto a DIFFERENT real checkout and ran there at
+# exit 0 — reintroducing the exact silent-wrong-directory shape of issue #59
+# that the guards exist to prevent.
+#
+# Each case below builds a fake checkout whose directory name carries the
+# payload, PLUS a decoy checkout at the name the payload collapses to if it
+# were expanded, so an implementation that expands cannot quietly pass by
+# landing somewhere that happens to exist.
+
+_INJECTION_CASES = [
+    # (label, directory name carrying the payload, name it collapses to if expanded)
+    ("dollar-var", "repo$USER", "repo"),
+    ("cmd-subst", "repo$(printf INJECTED)", "repoINJECTED"),
+    ("backtick", "repo`printf INJECTED`", "repoINJECTED"),
+    ("double-quote", 'repo"x', None),
+    ("single-quote", "repo'x", None),
+    # $(touch PWNED) leaves a file behind in the working directory if the
+    # substitution is ever evaluated — a direct, positive proof of execution
+    # rather than an inference from the resolved path.
+    ("rce-sentinel", "repo$(touch PWNED)", "repo"),
+]
+
+# Path shapes that are unusual but legitimate and MUST keep working: quoting
+# already handles a space, and rejecting one would be a capability regression.
+_BENIGN_CASES = [("plain", "repo"), ("space", "repo with spaces")]
+
+
+def _script_name(block: str) -> str:
+    match = re.search(r"python3 scripts/(\S+\.py)", block)
+    assert match, "no `python3 scripts/*.py` invocation found"
+    return match.group(1)
+
+
+def _fake_checkout(root: Path, dirname: str, skill_md: Path) -> Path:
+    """Create <root>/<dirname>/platform/<agent>/skills/<skill>/ with a stub script.
+
+    Mirrors the real layout so the block's own resolution and its
+    target-script guard are exercised against a complete, plausible checkout
+    — the payload is carried only in the directory name.
+    """
+    agent_dir = root / dirname / "platform" / skill_md.parents[2].name
+    skill_dir = agent_dir / "skills" / skill_md.parent.name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    scripts = agent_dir / "scripts"
+    scripts.mkdir(exist_ok=True)
+    (scripts / _script_name(_dispatch_block(skill_md))).write_text("# stub\n")
+    return skill_dir
+
+
+def _run_as_dispatched(skill_md: Path, skill_dir: Path, cwd: Path):
+    """Substitute the token with *skill_dir* exactly as Hermes does, then run.
+
+    Hermes performs a plain textual replacement of the bare `${HERMES_SKILL_DIR}`
+    token (`agent/skill_preprocessing.py::substitute_template_vars`), which is
+    what makes the substituted text shell source in the first place; modelling
+    it as a textual replace here keeps the test hermetic (no Hermes import)
+    while reproducing the property under test.
+    """
+    script = _resolution_only(_dispatch_block(skill_md))
+    script = script.replace(_SKILL_DIR_TOKEN, str(skill_dir))
+    return subprocess.run(
+        ["/bin/bash", "-c", script],
+        # USER is deliberately absent: an expanded `$USER` then collapses to
+        # the empty string, which is how a `$`-bearing path silently lands on
+        # a neighbouring checkout.
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+@pytest.mark.parametrize(
+    "dirname,collapsed",
+    [case[1:] for case in _INJECTION_CASES],
+    ids=[case[0] for case in _INJECTION_CASES],
+)
+def test_shell_metacharacter_in_path_fails_closed(tmp_path, skill_md, dirname, collapsed):
+    """A checkout path carrying shell metacharacters must abort loudly — never
+    execute the path and never resolve to a different directory."""
+    skill_dir = _fake_checkout(tmp_path, dirname, skill_md)
+    if collapsed is not None:
+        # A complete, working checkout at the collapsed name, so expansion
+        # would silently succeed instead of erroring.
+        decoy = _fake_checkout(tmp_path, collapsed, skill_md).parents[1]
+    else:
+        decoy = None
+
+    result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
+    combined = result.stdout + result.stderr
+    landed = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+
+    assert not (tmp_path / "PWNED").exists(), (
+        f"{skill_md}: the substituted path was EXECUTED — `$(touch PWNED)` in "
+        f"the checkout directory name ran. The skill directory must be "
+        f"interpolated as data, not as shell source."
+    )
+    if decoy is not None:
+        assert landed != str(decoy), (
+            f"{skill_md}: silently resolved to a DIFFERENT checkout "
+            f"({decoy}) because the path was expanded — this is the "
+            f"issue #59 silent-wrong-directory shape, at exit "
+            f"{result.returncode}."
+        )
+    assert result.returncode != 0, (
+        f"{skill_md}: exited 0 on a metacharacter-bearing path.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ERROR" in combined, (
+        f"{skill_md}: aborted without an actionable ERROR message (a raw Bash "
+        f"syntax error is not actionable).\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("skill_md", _SKILL_MDS, ids=_ids)
+@pytest.mark.parametrize(
+    "dirname", [case[1] for case in _BENIGN_CASES], ids=[case[0] for case in _BENIGN_CASES]
+)
+def test_benign_path_shapes_still_resolve(tmp_path, skill_md, dirname):
+    """Hardening must not cost legitimate path shapes — a space in the
+    checkout path is already handled by quoting and must keep working."""
+    skill_dir = _fake_checkout(tmp_path, dirname, skill_md)
+    result = _run_as_dispatched(skill_md, skill_dir, cwd=tmp_path)
+    assert result.returncode == 0, (
+        f"{skill_md}: a legitimate path containing {dirname!r} was rejected.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    landed = Path(result.stdout.strip().splitlines()[-1]).resolve()
+    assert landed == skill_dir.parents[1].resolve()
+# ---------------------------------------------------------------------------
+# Stale-path guard for operator-facing docs (PR #75 review, non-blocking 2)
+# ---------------------------------------------------------------------------
+# The skills are fixed, but an operator following a stale runbook reintroduces
+# the same breakage by hand. `platform/email-agent/SETUP.md` still carried
+# pre-move `~/src/fieldkit` paths three weeks after the move, including a
+# crontab template that would have registered a broken cron entry.
+
+_REPO_ROOT = _PLATFORM_DIR.parent
+_STALE_PATHS = ("~/src/fieldkit", "/Users/sandeep_a_k/src/fieldkit", "${HOME}/src/fieldkit")
+
+# Dated records, deliberately exempt: these document what was configured or
+# run at a specific past date, and the numbered Hermes docs are cited
+# elsewhere as evidence of past verification runs. Rewriting their transcripts
+# would falsify the record, so each instead carries a pointer to doc 12, the
+# single current location. Nothing new belongs on this list — a new doc with a
+# stale path is a test failure, which is the point.
+_DATED_RECORDS = {
+    "platform/docs/cross-review.md",
+    "platform/docs/hermes/03-process-photos-skill.md",
+    "platform/docs/hermes/04-check-approval-skill.md",
+    "platform/docs/hermes/05-cron-verification.md",
+    "platform/docs/hermes/06-openclaw-removal.md",
+    "platform/docs/hermes/08-check-email-skill.md",
+    "platform/docs/hermes/10-text-based-approval-migration.md",
+}
+
+
+def _current_docs() -> list[Path]:
+    """Every markdown doc that is current instructions rather than history."""
+    docs = []
+    for path in sorted(_REPO_ROOT.rglob("*.md")):
+        rel = path.relative_to(_REPO_ROOT).as_posix()
+        # .specify/ holds per-feature spec history; .worktrees/ holds other
+        # checkouts of this same repo.
+        if ".specify/" in rel or rel.startswith(".worktrees/") or "/.worktrees/" in rel:
+            continue
+        if rel in _DATED_RECORDS:
+            continue
+        docs.append(path)
+    return docs
+
+
+def test_current_docs_are_not_discoverable_as_empty():
+    docs = _current_docs()
+    assert len(docs) > 10, f"doc discovery looks broken, found {len(docs)}"
+
+
+def test_no_stale_repo_path_in_current_docs():
+    """An operator-facing doc must not name the pre-move checkout location."""
+    offenders = []
+    for path in _current_docs():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for stale in _STALE_PATHS:
+            if stale in text:
+                line = text[: text.index(stale)].count("\n") + 1
+                offenders.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{line} contains {stale!r}"
+                )
+    assert not offenders, (
+        "Stale pre-move repo paths in current operator docs — an operator "
+        "following these reintroduces issue #74 by hand:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nUse a path derived at run time (e.g. `$(git rev-parse "
+        "--show-toplevel)` or an exported $FIELDKIT_ROOT). If the file is a "
+        "dated record rather than current instructions, add it to "
+        "_DATED_RECORDS with a pointer to doc 12."
+    )
+
+
+def test_dated_records_point_at_the_current_location():
+    """Every exempt file must still exist, so the list cannot rot silently."""
+    for rel in sorted(_DATED_RECORDS):
+        assert (_REPO_ROOT / rel).is_file(), (
+            f"_DATED_RECORDS lists {rel}, which no longer exists — remove it "
+            f"from the exemption list."
+        )
