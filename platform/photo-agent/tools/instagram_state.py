@@ -50,16 +50,30 @@ reads them as proof. Before that refusal existed, a caller could supply
 publish_settled_at itself and _preserve_unresolved_obligation() would accept it as
 an answer, releasing an unresolved publish with no Meta involvement at all.
 
-VERIFICATION BOUNDARY. Several guarantees here are enforced by tests that parse
-THIS FILE's source — that _write() is called from one place, that the settlement
-stamp is written by three named transitions, that the module defines no class
-other than _Transaction. Those scans are scope-aware: module level, functions,
-nested functions, classes, methods and lambdas. They were not always — an earlier
-version inspected only top-level statements, so a method on a module-level class
-could call _write() directly and every guard stayed green. They still cannot see
-anything outside this file, so a caller in another module that misuses a public
-verb is beyond them; tests/test_upload_instagram.py pins the permitted call sites
-for the verbs that assert Meta answered.
+VERIFICATION BOUNDARY, stated precisely because overstating it has been a
+recurring mistake here.
+
+The write chokepoint is enforced at RUNTIME. _write() and _open_for_write() refuse
+to run without an authorisation token that only _transaction() holds
+(_WriteAuthorisation). That is what makes the guarantee independent of how a call
+is spelled: an alias, a globals() lookup, a method on a class, or anything else
+still has to invoke the real function object and hand it the token.
+
+There are ALSO source-parsing tests — that _write() is called from one place, that
+the settlement stamp is written by three named transitions, that this module
+defines no unexpected class. Those are a tripwire, not the guarantee. They match
+calls by literal syntactic NAME and are therefore blind to aliasing: `_w = _write`
+followed by a call to `_w` is invisible to them, which a reviewer demonstrated.
+They are kept because they fail early and name the offending scope, but nothing
+rests on them alone.
+
+Outside this file nothing can be enforced structurally. The verbs that assert Meta
+answered — mark_publish_settled(), clear_publish_reconciliation() — instead require
+the CALLER to name the container and the observed Graph status, both of which are
+checked here, so an aliased or accidentally-refactored call cannot assert an answer
+by arriving with too few arguments. That narrows the accidental routes; it does not
+prove Meta was consulted, and nothing in this module can, because that fact lives
+in the caller's control flow.
 
 container_id is Instagram-specific and has no Facebook counterpart: the Graph
 API's video publish is a two-phase create-container → publish flow, so an
@@ -152,6 +166,14 @@ _REQUIRED_UPLOAD_KEYS = frozenset({
 # answer itself and _preserve_unresolved_obligation() would believe it.
 _PROVENANCE_KEYS = frozenset({"publish_attempted_at", "publish_settled_at"})
 
+# The Graph API container statuses that mean "this container did NOT publish". Settling an
+# open publish requires naming one of them, so the claim is carried BY THE CALL rather than
+# implied by where it was made — an alias or a refactored caller cannot settle by accident,
+# and PUBLISHED can never be mistaken for a settlement.
+_NON_PUBLISHED_STATUSES = frozenset({"FINISHED", "ERROR", "EXPIRED"})
+# Every status that resolves a quarantine, in either direction.
+_DEFINITIVE_STATUSES = _NON_PUBLISHED_STATUSES | {"PUBLISHED"}
+
 _DEFAULTS = {
     "pending_instagram_upload": None,
     "published_idempotency_keys": [],
@@ -182,6 +204,27 @@ _PUBLISH_RECONCILE_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
 # Every top-level key this module writes. A state file that parses but carries none of
 # them is not a state file — see _read().
 _KNOWN_TOP_LEVEL_KEYS = frozenset(_DEFAULTS)
+
+
+class _WriteAuthorisation:
+    """The capability to write the state file. Constructed exactly once, below.
+
+    A RUNTIME chokepoint, replacing a purely syntactic one. The guard tests used to scan
+    this module's source for calls to _write() by name, which meant they saw a call only
+    when it was spelled that way: `_aliased_write = _write` followed by a call to the
+    alias, or `globals()["_write"](...)`, was invisible to all of them, and a reviewer
+    demonstrated both wiping a marker-bearing record with the whole suite green.
+
+    That was not an incomplete scan, it was the wrong mechanism — no syntactic check can
+    see what OBJECT flows to a call. Every indirection, however it is named, still has to
+    invoke the real function at runtime and hand it this token. _transaction() is the only
+    thing that holds one, so a bypass no longer depends on how it is spelled.
+    """
+
+    __slots__ = ()
+
+
+_WRITE_AUTHORISATION = _WriteAuthorisation()
 
 
 def _read(file_obj) -> dict:
@@ -235,8 +278,20 @@ def _read(file_obj) -> dict:
     return data
 
 
-def _write(file_obj, data: dict) -> None:
-    """Overwrite instagram_state.json via an open, locked file object."""
+def _write(file_obj, data: dict, authorisation=None) -> None:
+    """Overwrite instagram_state.json via an open, locked file object.
+
+    Refuses to write without _transaction()'s authorisation token. Writing outside a
+    transaction skips _preserve_unresolved_obligation(), which is what carries an
+    unresolved publish across a record being removed or replaced — the invariant six
+    rounds of review have been about. See _WriteAuthorisation.
+    """
+    if authorisation is not _WRITE_AUTHORISATION:
+        raise RuntimeError(
+            "_write() called outside _transaction(). Every write to instagram_state.json "
+            "must go through _transaction(), which is what enforces the unresolved-publish "
+            "invariant on the way out."
+        )
     content = json.dumps(data, indent=2)
     file_obj.seek(0)
     file_obj.write(content)
@@ -245,8 +300,11 @@ def _write(file_obj, data: dict) -> None:
     os.fsync(file_obj.fileno())
 
 
-def _open_for_write():
+def _open_for_write(authorisation=None):
     """Open instagram_state.json for read+write. Returns (file, created_by_us).
+
+    Authorised the same way as _write(), one level down: taking the exclusive lock outside
+    a transaction is the first half of a bypass, so it is refused for the same reason.
 
     O_EXCL rather than plain O_CREAT so the caller can tell a file it just created from
     one that was already there. _read() refuses a present-but-empty file, so a
@@ -262,6 +320,10 @@ def _open_for_write():
     the defaults. Recorded here so the next reader recognises it as a startup race rather
     than mistaking it for corruption.
     """
+    if authorisation is not _WRITE_AUTHORISATION:
+        raise RuntimeError(
+            "_open_for_write() called outside _transaction() — see _WriteAuthorisation."
+        )
     try:
         fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
@@ -325,7 +387,7 @@ def _transaction():
     write pattern. Tracked as issue #79 rather than bolted on here.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    f, created = _open_for_write()
+    f, created = _open_for_write(_WRITE_AUTHORISATION)
     with f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -336,7 +398,7 @@ def _transaction():
                 # _read() refuses one. Writing the defaults here is what keeps "present but
                 # empty" a genuine anomaly rather than an ordinary first-run leftover.
                 data = copy.deepcopy(_DEFAULTS)
-                _write(f, data)
+                _write(f, data, _WRITE_AUTHORISATION)
             else:
                 data = _read(f)
             incoming = data.get("pending_instagram_upload")
@@ -346,7 +408,7 @@ def _transaction():
             if not txn._committed:
                 return
             _preserve_unresolved_obligation(incoming, data)
-            _write(f, data)
+            _write(f, data, _WRITE_AUTHORISATION)
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -1179,7 +1241,9 @@ def has_unresolved_publish(idempotency_key: str) -> bool:
         return False
 
 
-def mark_publish_settled(idempotency_key: str) -> None:
+def mark_publish_settled(
+    idempotency_key: str, container_id: str, observed_status: str
+) -> None:
     """Clear the unresolved-publish marker: Instagram has said this container never published.
 
     The counterpart to mark_publish_attempted(), and what keeps the invariant in
@@ -1196,18 +1260,51 @@ def mark_publish_settled(idempotency_key: str) -> None:
     same is how the same-key escape got in. A settlement says so on the record; an erasure
     does not, and gets quarantined.
 
-    container_id stays, because it is still the handle for the container this job used and
-    remains useful for debugging and for a retry's own reconciliation.
+    container_id stays on the record, because it is still the handle for the container this
+    job used and remains useful for debugging and for a retry's own reconciliation.
+
+    Takes the EVIDENCE, not just the key. The caller must name the container it is settling
+    and the Graph API status it actually observed, and both are checked: the status must be
+    one that means "did not publish", and the container must be the one the record is
+    holding. That is a runtime replacement for trusting the call site — a source scan only
+    sees calls spelled `mark_publish_settled(...)`, so an alias assigned in another module
+    was invisible to the call-site guard, and a reviewer used exactly that to forge a
+    settlement and lose an obligation. Requiring the evidence means an aliased or
+    accidentally-refactored call cannot settle at all (wrong arity), and no call can settle
+    a container other than the one in play.
+
+    What this does NOT do is prove Meta was consulted; nothing inside this module can,
+    because that fact lives in the caller's control flow. It removes the accidental routes
+    and confines the deliberate one to a call that has to state what it saw.
 
     Compare-and-update: a no-op if the current pending record's idempotency_key no longer matches.
     """
+    if observed_status not in _NON_PUBLISHED_STATUSES:
+        raise ValueError(
+            f"mark_publish_settled: {observed_status!r} does not mean the container failed "
+            f"to publish; expected one of {sorted(_NON_PUBLISHED_STATUSES)}"
+        )
     now = datetime.now(timezone.utc).isoformat()
+    mismatched = []
 
     def _update(record, data):
+        if record.get("container_id") != container_id:
+            # Settling a container the record is not holding would clear the marker for a
+            # question that was never asked about that container.
+            mismatched.append(record.get("container_id"))
+            return
         record["publish_attempted_at"] = None
         record["publish_settled_at"] = now
     _update_pending(idempotency_key, _update)
-    logger.info("mark_publish_settled: key=%s", idempotency_key)
+    if mismatched:
+        raise ValueError(
+            f"mark_publish_settled: asked to settle container {container_id!r} but the "
+            f"pending record holds {mismatched[0]!r}"
+        )
+    logger.info(
+        "mark_publish_settled: key=%s container_id=%s status=%s",
+        idempotency_key, container_id, observed_status,
+    )
 
 
 def record_publish_reconciliation(
@@ -1292,7 +1389,7 @@ def list_publish_reconciliations() -> list[dict]:
         return []
 
 
-def clear_publish_reconciliation(container_id: str) -> bool:
+def clear_publish_reconciliation(container_id: str, observed_status: str) -> bool:
     """Drop container_id from the unresolved list once Instagram has been definitive.
 
     Call this ONLY on a definitive answer — PUBLISHED (record it via
@@ -1301,8 +1398,17 @@ def clear_publish_reconciliation(container_id: str) -> bool:
     idempotency key while the Reel's fate is still unknown, which is the whole thing this
     list exists to prevent.
 
+    Requires the observed status for the same reason mark_publish_settled() does: lifting a
+    block asserts that Instagram answered, and a call-site guard cannot see an aliased call.
+    Naming the status makes the assertion part of the call rather than of its location.
+
     Returns True if an entry was removed, False if there was nothing recorded for it.
     """
+    if observed_status not in _DEFINITIVE_STATUSES:
+        raise ValueError(
+            f"clear_publish_reconciliation: {observed_status!r} is not a definitive "
+            f"container status; expected one of {sorted(_DEFINITIVE_STATUSES)}"
+        )
     with _transaction() as txn:
         data = txn.data
         pending = data.get("pending_publish_reconciliations", [])
@@ -1311,5 +1417,8 @@ def clear_publish_reconciliation(container_id: str) -> bool:
             return False
         data["pending_publish_reconciliations"] = remaining
         txn.commit()
-        logger.info("clear_publish_reconciliation: container_id=%s resolved", container_id)
+        logger.info(
+            "clear_publish_reconciliation: container_id=%s resolved status=%s",
+            container_id, observed_status,
+        )
         return True

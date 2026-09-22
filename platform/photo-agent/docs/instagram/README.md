@@ -464,6 +464,24 @@ entries keep blocking, so that is reported rather than silent: each one alerts (
 same daily schedule, without counting as a check that never happened) naming
 `FB_PAGE_ACCESS_TOKEN` as the reason and the reconnect as the fix.
 
+**If the Instagram cron stops entirely**, that is a different matter and worth stating
+plainly. Every revocation path lives in `upload_instagram.py`: the per-attempt revoke, the
+`pending_share_cleanups` drain, and the daily reminder about a link still dangling. So a
+worker that dies *mid-attempt* — after creating a link and before revoking it — leaves the
+link public, the obligation correctly recorded, and nothing running that would act on
+either. The heartbeat does not help here and is not meant to: the worker was genuinely
+alive when it created the link.
+
+What the heartbeat's one-hour staleness window does **not** do is create this situation.
+The only production caller of `drive.create_temporary_share_link()` is
+`upload_instagram._process_upload`, reached only from that script's `main()` — the very
+worker whose absence is in question. A link's only creator is the thing that is dead, so
+"heartbeat wrongly fresh" and "a link was created" cannot both hold. During that window an
+approval queues an inert job, and `upload_cleanup` retains the shared video until the
+heartbeat goes stale; no public link is created. Recovering the dangling-link case needs a
+revocation path that survives this worker, which is tracked separately rather than bolted
+on here.
+
 ### Resolving a quarantine by hand
 
 Normally you do nothing — the drain resolves entries by itself once Instagram answers.

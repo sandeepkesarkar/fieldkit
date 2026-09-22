@@ -417,7 +417,9 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
     try:
         container_id = None
         if prior_container_id:
-            outcome = _classify_prior_container(page_token, prior_container_id)
+            outcome, observed_status = _classify_prior_container(
+                page_token, prior_container_id
+            )
             if outcome == "published":
                 _log.warning(
                     "container was already published by Instagram — recovering instead of "
@@ -440,7 +442,9 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
             # instagram_state's chokepoint quarantining a container Instagram has already
             # cleared; an erased marker and a settled one are deliberately not the same thing
             # there. (The "published" case returned above and needs no settlement.)
-            instagram_state.mark_publish_settled(idem_key)
+            instagram_state.mark_publish_settled(
+                idem_key, prior_container_id, observed_status
+            )
             publish_attempted = False
 
         if container_id is None:
@@ -614,14 +618,19 @@ def _classify_prior_container(page_token: str, container_id: str) -> str:
 
     Network and API failures propagate for the same reason: not knowing a container's fate
     is never grounds for publishing another one.
+
+    Returns (category, raw_status). The raw status is carried out rather than discarded
+    because instagram_state's answer-asserting verbs now require the caller to NAME the
+    status it observed — the claim travels with the call instead of being implied by where
+    the call was made, which is what an aliased call could previously fake.
     """
     status = instagram_api.get_container_status(page_token, container_id)
     if status == "PUBLISHED":
-        return "published"
+        return "published", status
     if status == "FINISHED":
-        return "reusable"
+        return "reusable", status
     if status in ("ERROR", "EXPIRED"):
-        return "restart"
+        return "restart", status
     raise InstagramUploadError(
         f"Container {container_id} is in state {status!r}; refusing to create a second "
         "container until its fate is known (FR-011)"
@@ -748,7 +757,8 @@ def _settle_terminal_container(
     if not container_id:
         return "unpublished"
     try:
-        if _classify_prior_container(page_token, container_id) == "published":
+        outcome, observed_status = _classify_prior_container(page_token, container_id)
+        if outcome == "published":
             return "published"
     except (InstagramTokenError, InstagramUploadError) as exc:
         _log.error(
@@ -758,7 +768,7 @@ def _settle_terminal_container(
         )
         _quarantine_unresolved_publish(container_id, project_name, idem_key, chat_id)
         return "unresolved"
-    instagram_state.mark_publish_settled(idem_key)
+    instagram_state.mark_publish_settled(idem_key, container_id, observed_status)
     return "unpublished"
 
 
@@ -804,7 +814,7 @@ def _reconcile_quarantined_container(
     idem_key = entry.get("idempotency_key", "")
 
     try:
-        outcome = _classify_prior_container(page_token, container_id)
+        outcome, observed_status = _classify_prior_container(page_token, container_id)
     except (InstagramTokenError, InstagramUploadError) as exc:
         _log.error(
             "publish outcome still unresolved: project=%s container_id=%s error=%s",
@@ -823,15 +833,15 @@ def _reconcile_quarantined_container(
         # filed under a container id that key no longer matches.
         instagram_state.record_recovered_publish(idem_key, project_name, container_id)
         instagram_logger.log_upload_recovered(project_name, container_id)
-        instagram_state.clear_publish_reconciliation(container_id)
+        instagram_state.clear_publish_reconciliation(container_id, observed_status)
         if announce:
             _send_confirmation(chat_id, _recovered_message(project_name))
         return "published"
 
-    # "reusable" (FINISHED) and "restart" (ERROR/EXPIRED) all mean: never published.
-    status = "FINISHED" if outcome == "reusable" else "ERROR_OR_EXPIRED"
-    instagram_state.clear_publish_reconciliation(container_id)
-    instagram_logger.log_publish_resolved(project_name, container_id, status)
+    # "reusable" (FINISHED) and "restart" (ERROR/EXPIRED) all mean: never published. The
+    # raw status goes to both the state module and the log, so neither has to re-derive it.
+    instagram_state.clear_publish_reconciliation(container_id, observed_status)
+    instagram_logger.log_publish_resolved(project_name, container_id, observed_status)
     if announce:
         _send_alert(chat_id, _not_published_message(project_name))
     return "unpublished"

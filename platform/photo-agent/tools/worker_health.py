@@ -30,10 +30,37 @@ own: install the cron and the next tick (within a minute) makes the platform
 healthy again; remove it and the system notices within the stale window.
 
 Heartbeats live in $FIELDKIT_DATA_DIR/photo-agent/worker_health.json, per client,
-alongside the state files. They are pure operational telemetry: no credential,
-no PII, and nothing here is load-bearing for a job's correctness — a lost or
-deleted heartbeat file degrades to "not deployed", which is the SAFE direction
-(refuse to enqueue, don't wait on it), never to a silent duplicate or a leak.
+alongside the state files. No credential, no PII. A lost or deleted heartbeat
+file degrades to "not deployed", which is the SAFE direction — refuse to enqueue,
+don't wait on it — never a silent duplicate or a leak.
+
+What a heartbeat IS and IS NOT load-bearing for, because the distinction matters
+and an earlier version of this docstring flattened it:
+
+  - NOT load-bearing for duplicate publication (FR-011). Nothing here decides
+    whether a Reel may be published twice; that is entirely the quarantine and
+    idempotency machinery in tools/instagram_state.py, which does not consult
+    heartbeats at all. A wrong heartbeat cannot produce a duplicate.
+  - LOAD-BEARING for the public-link exposure. The IG_NOWORKER refusal in
+    check_approval.py is gated on is_deployed(), and that refusal is what keeps a
+    job from being queued for a worker that will never drain it.
+
+On that second point, one thing is worth stating precisely rather than leaving to
+inference. STALE_AFTER_SECONDS is an hour, so for up to an hour after the cron
+dies a heartbeat still reads fresh and approvals still enqueue. That window does
+NOT create an unrevoked public Drive link: the only production caller of
+drive.create_temporary_share_link() is upload_instagram._process_upload, which is
+reached only from that script's main() — the very worker that is dead. A link's
+only creator is the thing whose absence is in question, so "heartbeat wrongly
+fresh" and "a link was created" cannot both hold. What the window actually
+produces is an inert queued job, and a shared video retained by
+tools/upload_cleanup.py until the heartbeat does go stale.
+
+The real single point of failure is elsewhere and is not a heartbeat problem: if
+the worker dies mid-attempt, after creating a link and before revoking it, the
+link is public and the obligation is recorded — but the drain that would revoke
+it, and the daily alert that would report it, both live in that same stopped
+worker. See docs/instagram/README.md.
 """
 
 import fcntl

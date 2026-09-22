@@ -1726,7 +1726,9 @@ def test_the_drain_resolves_a_container_instagram_reports_as_published(with_quar
     ui.instagram_state.record_recovered_publish.assert_called_once_with(
         _IDEM_KEY, _PROJECT, _CONTAINER_ID
     )
-    ui.instagram_state.clear_publish_reconciliation.assert_called_once_with(_CONTAINER_ID)
+    ui.instagram_state.clear_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, "PUBLISHED"
+    )
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "IS live" in text
     assert "posted twice" in text
@@ -1738,7 +1740,9 @@ def test_the_drain_releases_a_container_that_never_published(with_quarantine, st
     ui = with_quarantine
     ui.instagram_api.get_container_status.return_value = status
     main([])
-    ui.instagram_state.clear_publish_reconciliation.assert_called_once_with(_CONTAINER_ID)
+    ui.instagram_state.clear_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, status
+    )
     ui.instagram_state.record_recovered_publish.assert_not_called()
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "NOT published" in text
@@ -2008,7 +2012,9 @@ def test_a_definitively_unpublished_container_clears_its_marker(with_pending):
     ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
     ui.instagram_api.get_container_status.return_value = "FINISHED"
     main([])
-    ui.instagram_state.mark_publish_settled.assert_called_once_with(_IDEM_KEY)
+    ui.instagram_state.mark_publish_settled.assert_called_once_with(
+        _IDEM_KEY, _CONTAINER_ID, "FINISHED"
+    )
     ui.instagram_state.record_publish_reconciliation.assert_not_called()
 
 

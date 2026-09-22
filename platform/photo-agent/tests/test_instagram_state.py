@@ -838,14 +838,14 @@ def test_clearing_the_quarantine_releases_the_key(valid_record):
     ig_state.record_publish_reconciliation(
         "container_abc", project_name="kitchen_remodel", idempotency_key="42"
     )
-    assert ig_state.clear_publish_reconciliation("container_abc") is True
+    assert ig_state.clear_publish_reconciliation("container_abc", "EXPIRED") is True
     assert ig_state.has_unresolved_publish("42") is False
     ig_state.set_pending_upload(valid_record)             # must not raise
 
 
 def test_clearing_an_unknown_container_reports_false():
     """Distinguishes "resolved it" from "there was nothing there"."""
-    assert ig_state.clear_publish_reconciliation("never_recorded") is False
+    assert ig_state.clear_publish_reconciliation("never_recorded", "EXPIRED") is False
 
 
 def test_recording_a_publish_recovery_also_permanently_retires_the_key(valid_record):
@@ -854,7 +854,7 @@ def test_recording_a_publish_recovery_also_permanently_retires_the_key(valid_rec
         "container_abc", project_name="kitchen_remodel", idempotency_key="42"
     )
     ig_state.record_recovered_publish("42", "kitchen_remodel", "container_abc")
-    ig_state.clear_publish_reconciliation("container_abc")
+    ig_state.clear_publish_reconciliation("container_abc", "PUBLISHED")
     assert ig_state.has_unresolved_publish("42") is False
     with pytest.raises(ValueError, match="already in published_idempotency_keys"):
         ig_state.set_pending_upload(valid_record)
@@ -917,7 +917,7 @@ def test_quarantines_for_different_containers_coexist():
     )
     assert ig_state.has_unresolved_publish("1") is True
     assert ig_state.has_unresolved_publish("2") is True
-    ig_state.clear_publish_reconciliation("container_a")
+    ig_state.clear_publish_reconciliation("container_a", "EXPIRED")
     assert ig_state.has_unresolved_publish("1") is False
     assert ig_state.has_unresolved_publish("2") is True
 
@@ -1099,7 +1099,7 @@ def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_recor
     Instagram has just confirmed was never posted — trading one failure mode for another.
     """
     _store_unresolved(valid_record, attempts=0)
-    ig_state.mark_publish_settled("42")
+    ig_state.mark_publish_settled("42", "container_abc", "FINISHED")
     ig_state.mark_failed("42")
     assert ig_state.list_publish_reconciliations() == []
     ig_state.set_pending_upload(valid_record)            # re-approvable again
@@ -1108,7 +1108,7 @@ def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_recor
 def test_mark_publish_settled_keeps_the_container_id(valid_record):
     """Only the open question is closed; the handle stays for debugging and retries."""
     _store_unresolved(valid_record, attempts=0)
-    ig_state.mark_publish_settled("42")
+    ig_state.mark_publish_settled("42", "container_abc", "FINISHED")
     record = ig_state.get_pending_upload()
     assert record["publish_attempted_at"] is None
     assert record["container_id"] == "container_abc"
@@ -1370,7 +1370,7 @@ def test_the_module_defines_no_unexpected_classes():
 
     tree = ast.parse(inspect.getsource(ig_state))
     classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
-    assert classes == {"_Transaction"}
+    assert classes == {"_Transaction", "_WriteAuthorisation"}
 
 
 # --- mechanical: the invariant holds across EVERY mutation entry point ---
@@ -1397,11 +1397,15 @@ _MUTATORS = {
         "42", "kitchen_remodel", "container_abc"
     ),
     "mark_publish_attempted": lambda r: ig_state.mark_publish_attempted("42"),
-    "mark_publish_settled": lambda r: ig_state.mark_publish_settled("42"),
+    "mark_publish_settled": lambda r: ig_state.mark_publish_settled(
+        "42", "container_abc", "FINISHED"
+    ),
     "record_publish_reconciliation": lambda r: ig_state.record_publish_reconciliation(
         "container_other", project_name="other", idempotency_key="99"
     ),
-    "clear_publish_reconciliation": lambda r: ig_state.clear_publish_reconciliation("nope"),
+    "clear_publish_reconciliation": lambda r: ig_state.clear_publish_reconciliation(
+        "nope", "EXPIRED"
+    ),
     "record_share_intent": lambda r: ig_state.record_share_intent("file_1", "kitchen_remodel"),
     "record_share_cleanup": lambda r: ig_state.record_share_cleanup("file_1", "kitchen_remodel"),
     "clear_share_cleanup": lambda r: ig_state.clear_share_cleanup("file_1"),
@@ -1456,7 +1460,9 @@ def test_no_mutation_entry_point_can_destroy_an_unresolved_obligation(
     """
     _store_marker_bearing(valid_record)
     if meta_answered:
-        ig_state.mark_publish_settled("42")          # the TEST performed the settlement
+        ig_state.mark_publish_settled(                # the TEST performed the settlement
+            "42", "container_abc", "FINISHED"
+        )
 
     _MUTATORS[name](valid_record)
 
@@ -1823,8 +1829,10 @@ def test_the_chokepoints_trust_in_the_stamp_is_a_stated_dependency():
     (test_a_caller_supplied_settlement_stamp_is_refused and
     test_the_settlement_stamp_is_written_from_exactly_one_place).
 
-    This exists so that if either guard is ever removed, what it was holding up is written
-    down in plain sight rather than inferred.
+    This test DOCUMENTS that dependency; it does not detect the guards being removed, and
+    would keep passing if they were. The two named tests above are what fail in that case.
+    It exists so the thing they hold up is written down in plain sight rather than inferred
+    from their absence.
     """
     data = {
         "pending_instagram_upload": {
@@ -1856,3 +1864,135 @@ def test_the_record_ingress_api_is_the_only_way_in():
         if "record" in inspect.signature(getattr(ig_state, name)).parameters
     ]
     assert writers == ["set_pending_upload"]
+
+
+# ---------------------------------------------------------------------------
+# The write chokepoint is enforced at RUNTIME, not by reading the source
+# ---------------------------------------------------------------------------
+#
+# The AST guards above match calls by literal syntactic name. They therefore see a
+# call only when it is spelled that way, and a reviewer demonstrated three bypasses
+# with the whole suite green: a module-level alias (`_aliased = _write`), a
+# globals() lookup, and a cross-module alias of an answer-asserting verb. That was
+# not an incomplete scan but the wrong mechanism — no source scan can see which
+# OBJECT flows to a call.
+#
+# These test the replacement. Every indirection, however it is spelled, still has
+# to invoke the real function at runtime and hand it a token only _transaction()
+# holds, so the bypass no longer depends on how it is named. The AST guards are
+# kept as a cheaper tripwire that names the offending scope, but they are no longer
+# what the guarantee rests on.
+
+def test_writing_outside_a_transaction_is_refused():
+    """The guarantee, stated directly: no write without _transaction()'s authorisation."""
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        ig_state._write(None, {})
+
+
+def test_opening_for_write_outside_a_transaction_is_refused():
+    """The first half of a bypass — taking the lock — is refused for the same reason."""
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        ig_state._open_for_write()
+
+
+def test_an_aliased_write_is_refused(valid_record):
+    """The exact bypass that passed every AST guard.
+
+    `_aliased_write = ig_state._write` is invisible to a name-based scan. It is not
+    invisible to the function itself.
+    """
+    _store_unresolved(valid_record, container="container_A")
+    aliased_write = ig_state._write
+    aliased_open = ig_state._open_for_write
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        aliased_open()
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        aliased_write(None, {})
+    # And the obligation it was trying to wipe is untouched.
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
+
+
+def test_a_globals_lookup_write_is_refused():
+    """The second demonstrated shape. Same object, same refusal."""
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        vars(ig_state)["_write"](None, {})
+
+
+def test_a_forged_authorisation_object_is_refused():
+    """Identity, not duck-typing: a look-alike token does not authorise anything."""
+    class _LooksLikeOne:
+        __slots__ = ()
+
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        ig_state._write(None, {}, _LooksLikeOne())
+
+
+def test_the_sanctioned_path_still_writes(valid_record):
+    """The guard must not be so tight that the real path stops working."""
+    ig_state.set_pending_upload(valid_record)
+    assert ig_state.get_pending_upload()["idempotency_key"] == "42"
+
+
+# --- the answer-asserting verbs carry their evidence ---
+
+def test_settling_requires_a_non_published_status(valid_record):
+    """PUBLISHED can never be mistaken for a settlement."""
+    _store_unresolved(valid_record, container="container_A")
+    with pytest.raises(ValueError, match="does not mean the container failed to publish"):
+        ig_state.mark_publish_settled("42", "container_A", "PUBLISHED")
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
+
+
+def test_settling_requires_a_recognised_status(valid_record):
+    """A transitional or invented status is not an answer."""
+    _store_unresolved(valid_record, container="container_A")
+    with pytest.raises(ValueError):
+        ig_state.mark_publish_settled("42", "container_A", "IN_PROGRESS")
+
+
+def test_settling_the_wrong_container_is_refused(valid_record):
+    """A settlement names the container it settles, and it has to be the one in play.
+
+    Otherwise a stale or mistaken call could clear the marker for a question that was
+    never asked about that container.
+    """
+    _store_unresolved(valid_record, container="container_A")
+    with pytest.raises(ValueError, match="but the pending record holds"):
+        ig_state.mark_publish_settled("42", "container_SOMETHING_ELSE", "FINISHED")
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
+
+
+def test_an_aliased_settlement_cannot_forge_an_answer(valid_record):
+    """The cross-module exploit, closed by requiring the evidence rather than the caller.
+
+    A source scan cannot see `_settle = instagram_state.mark_publish_settled` in another
+    module. What it CAN no longer do is settle without naming a container and a status —
+    so the aliased call fails on arity, and the obligation survives into a quarantine
+    instead of vanishing.
+    """
+    _store_unresolved(valid_record, container="container_A")
+    aliased_settle = ig_state.mark_publish_settled
+    with pytest.raises(TypeError):
+        aliased_settle("42")                    # the shape the exploit used
+    ig_state.mark_failed("42")
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+def test_clearing_a_quarantine_requires_a_definitive_status():
+    """Lifting a block asserts Instagram answered; the call has to say what it said."""
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    with pytest.raises(ValueError, match="not a definitive container status"):
+        ig_state.clear_publish_reconciliation("container_abc", "IN_PROGRESS")
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+def test_a_settlement_with_real_evidence_still_works(valid_record):
+    """The sanctioned path: named container, non-published status, marker cleared."""
+    _store_unresolved(valid_record, container="container_A")
+    ig_state.mark_publish_settled("42", "container_A", "EXPIRED")
+    record = ig_state.get_pending_upload()
+    assert record["publish_attempted_at"] is None
+    assert record["publish_settled_at"] is not None
+    assert record["container_id"] == "container_A"
