@@ -28,6 +28,10 @@ env/
 # by `omnigent run --harness codex` invocations in this directory
 .codex-tmp/
 
+# Omnigent project config — machine-local because default_agent must be an
+# absolute path. Copy .omnigent/config.example.yaml to create it.
+.omnigent/config.yaml
+
 
 # Editor
 .vscode/
