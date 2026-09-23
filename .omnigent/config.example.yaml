@@ -1,0 +1,11 @@
+# Copy to .omnigent/config.yaml (git-ignored, machine-local) and set an
+# ABSOLUTE path to this repo's agent-dev-kit submodule:
+#
+#   cp .omnigent/config.example.yaml .omnigent/config.yaml
+#
+# Why absolute: the background Omnigent server resolves a relative
+# default_agent against its OWN working directory, not this repo's. A
+# relative `.agents/agent-dev-kit` silently fails to resolve there and
+# Omnigent falls back to its built-in example Polly — whose roster
+# includes workers (e.g. hermes, pi) that can bill per-token API keys.
+default_agent: /ABSOLUTE/PATH/TO/fieldkit/.agents/agent-dev-kit
