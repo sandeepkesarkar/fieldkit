@@ -899,3 +899,265 @@ def test_retryable_failure_keeps_the_file(with_pending, mocker, monkeypatch):
     main([])
     uf.facebook_state.release_claim.assert_called_once()
     assert Path(with_pending["video_local_path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #78 — a lost FINISH response must never become a second post.
+#
+# These run the REAL facebook_api (sessionized upload + status read) and the REAL
+# facebook_state against a tmp state file. Only HTTP (requests.post/get inside
+# facebook_api), Telegram and the activity log are mocked. FakeMeta models the Page:
+# it publishes on FINISH, and can then lose the response.
+# ---------------------------------------------------------------------------
+
+import requests as _requests  # noqa: E402
+
+
+class FakeMeta:
+    """A minimal stand-in for the Graph API's Page video endpoints."""
+
+    def __init__(self):
+        self.next_video = 0
+        self.sessions = {}          # upload_session_id -> video_id
+        self.published = []         # video_ids that went live, in order
+        self.finish_mode = "ok"     # "ok" | "lost" | "token" | "crash"
+        self.status_mode = "truth"  # "truth" | "unreachable" | "processing" | "error"
+        self.phases = []
+
+    def post(self, url, data=None, files=None, headers=None, timeout=None):
+        assert "access_token" not in url and "access_token" not in (data or {})
+        assert headers == {"Authorization": f"OAuth {_PAGE_TOKEN}"}
+        phase = data["upload_phase"]
+        self.phases.append(phase)
+        if phase == "start":
+            self.next_video += 1
+            vid, sid = f"vid{self.next_video}", f"sess{self.next_video}"
+            self.sessions[sid] = vid
+            return self._resp({"upload_session_id": sid, "video_id": vid,
+                               "start_offset": "0", "end_offset": data["file_size"]})
+        if phase == "transfer":
+            size = len(files["video_file_chunk"][1]) + int(data["start_offset"])
+            return self._resp({"start_offset": str(size), "end_offset": str(size)})
+        assert phase == "finish"
+        if self.finish_mode == "token":
+            return self._resp({"error": {"code": 190, "message": "expired"}})
+        vid = self.sessions[data["upload_session_id"]]
+        self.published.append(vid)  # Meta has published it...
+        if self.finish_mode == "lost":
+            raise _requests.exceptions.ConnectionError("connection reset by peer")
+        if self.finish_mode == "crash":
+            raise KeyboardInterrupt("process killed mid-FINISH")
+        return self._resp({"success": True})
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        assert headers == {"Authorization": f"OAuth {_PAGE_TOKEN}"}
+        assert params == {"fields": "status"}
+        vid = url.rsplit("/", 1)[1]
+        if self.status_mode == "unreachable":
+            raise _requests.exceptions.Timeout("read timed out")
+        if self.status_mode == "processing":
+            return self._resp({"status": {"video_status": "processing",
+                                          "publishing_phase": {"publish_status": "draft"}}})
+        if self.status_mode == "error":
+            return self._resp({"status": {"video_status": "error"}})
+        if vid in self.published:
+            return self._resp({"status": {"video_status": "ready", "publishing_phase": {
+                "status": "complete", "publish_status": "published"}}})
+        return self._resp({"status": {"video_status": "upload_failed"}})
+
+    @staticmethod
+    def _resp(body):
+        r = type("R", (), {})()
+        r.ok, r.status_code, r.json = True, 200, (lambda: body)
+        return r
+
+
+@pytest.fixture
+def meta(real_state, mocker, monkeypatch, tmp_path):
+    """real_state, but with the REAL facebook_api talking to FakeMeta over mocked HTTP."""
+    import scripts.upload_facebook as uf
+    import tools.facebook_api as fb_api
+    fake = FakeMeta()
+    # real_state mocked upload_video; put the real one back.
+    monkeypatch.setattr(uf.facebook_api, "upload_video", _REAL_UPLOAD_VIDEO)
+    mocker.patch.object(fb_api.requests, "post", side_effect=fake.post)
+    mocker.patch.object(fb_api.requests, "get", side_effect=fake.get)
+    for name in ("log_upload_recovered", "log_publish_unresolved", "log_publish_resolved"):
+        mocker.patch.object(uf.facebook_logger, name)
+    monkeypatch.setattr(uf, "_COOLDOWN_SECONDS", 0)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x07" * 64)
+    real_state.set_pending_upload(dict(_PENDING_RECORD, video_local_path=str(video)))
+    fake.video = video
+    return fake
+
+
+import tools.facebook_api as _fb_api_module  # noqa: E402
+_REAL_UPLOAD_VIDEO = _fb_api_module.upload_video
+
+
+def _sent_texts():
+    import scripts.upload_facebook as uf
+    return [c.args[1] for c in uf.telegram_api.send_message.call_args_list]
+
+
+def _reapprove(project=_PROJECT, video_path="/tmp/whatever.mp4"):
+    """Re-approval of the same video: check_approval's real Facebook enqueue path."""
+    import scripts.check_approval as ca
+    ca._enqueue_facebook_upload(project, video_path, int(_IDEM_KEY))
+
+
+def test_issue_78_exact_sequence_never_publishes_twice(meta, real_state):
+    """The issue's sequence: FINISH succeeds at Meta but its response is lost; the job is
+    retried to exhaustion and mark_failed(); the video is then re-approved. Before the fix
+    that re-approval posted the video a second time. Now: one publish, the key quarantined
+    through terminal failure, re-approval refused, and the quarantine lifted only when
+    Facebook reports that specific video published."""
+    meta.finish_mode = "lost"
+    meta.status_mode = "unreachable"
+
+    main([])  # attempt 1: published at Meta, response lost
+    assert meta.published == ["vid1"]
+    rec = real_state.get_pending_upload()
+    assert rec["video_id"] == "vid1" and rec["publish_attempted_at"]
+
+    main([])  # attempt 2: cannot reconcile → blocked, nothing uploaded
+    main([])  # attempt 3: cannot reconcile → quarantined + mark_failed
+    assert real_state.get_pending_upload() is None
+    assert real_state.has_unresolved_publish(_IDEM_KEY)
+    assert meta.phases.count("start") == 1
+    assert meta.phases.count("finish") == 1
+
+    main([])  # later ticks: still no answer, still nothing uploaded
+    _reapprove()  # re-approval is refused and explained
+    assert real_state.get_pending_upload() is None
+    with pytest.raises(ValueError, match="unresolved publish"):
+        real_state.set_pending_upload(dict(_PENDING_RECORD, video_local_path=str(meta.video)))
+    assert any("NOT re-queued" in t for t in _sent_texts())
+    assert meta.published == ["vid1"]
+
+    meta.status_mode = "truth"  # Facebook answers: vid1 is live
+    main([])
+    assert real_state.is_published(_IDEM_KEY)
+    assert real_state.list_publish_reconciliations() == []
+    assert real_state.find_published(_PROJECT)["fb_post_id"] == "vid1"
+    _reapprove()
+    main([])
+    assert meta.published == ["vid1"]  # exactly one post, ever
+    assert meta.phases.count("start") == 1
+
+
+def test_issue_78_ambiguous_status_is_never_treated_as_an_answer(meta, real_state):
+    """"processing"/"draft" is not definitive — the key stays blocked."""
+    meta.finish_mode = "lost"
+    meta.status_mode = "processing"
+    for _ in range(5):
+        main([])
+    assert meta.published == ["vid1"]
+    assert meta.phases.count("start") == 1
+    assert real_state.has_unresolved_publish(_IDEM_KEY)
+    assert not real_state.is_published(_IDEM_KEY)
+
+
+def test_lost_finish_then_reconcile_published_records_without_reuploading(meta, real_state):
+    meta.finish_mode = "lost"
+    main([])
+    meta.finish_mode = "ok"
+    main([])  # next attempt asks about vid1 first: it IS published
+
+    assert meta.published == ["vid1"]
+    assert meta.phases.count("start") == 1
+    assert real_state.is_published(_IDEM_KEY)
+    assert real_state.get_pending_upload() is None
+    assert real_state.list_publish_reconciliations() == []
+    assert any("Nothing was posted twice" in t for t in _sent_texts())
+
+
+def test_lost_finish_then_reconcile_not_published_uploads_afresh(meta, real_state):
+    """Facebook definitively says the first video did not publish → settled, then a
+    fresh session publishes once."""
+    meta.finish_mode = "lost"
+    main([])
+    meta.published.clear()  # model: Meta did NOT actually publish vid1
+    meta.finish_mode = "ok"
+    main([])
+
+    assert meta.published == ["vid2"]
+    assert meta.phases.count("start") == 2
+    assert real_state.is_published(_IDEM_KEY)
+    assert real_state.find_published(_PROJECT)["fb_post_id"] == "vid2"
+    assert real_state.list_publish_reconciliations() == []
+
+
+def test_process_killed_during_finish_is_reconciled_on_reclaim(meta, real_state, monkeypatch):
+    """A kill mid-FINISH (no handler runs at all) still leaves the marker durably written
+    before FINISH, so the reclaimed attempt reconciles instead of re-uploading."""
+    import scripts.upload_facebook as uf
+    monkeypatch.setattr(uf, "_UPLOAD_LEASE_SECONDS", 0)
+    meta.finish_mode = "crash"
+    with pytest.raises(KeyboardInterrupt):
+        main([])
+    assert real_state.get_pending_upload()["publish_attempted_at"]
+
+    meta.finish_mode = "ok"
+    main([])
+    assert meta.published == ["vid1"]
+    assert meta.phases.count("start") == 1
+    assert real_state.is_published(_IDEM_KEY)
+
+
+def test_token_error_after_finish_attempt_quarantines(meta, real_state):
+    """A 190 on FINISH: the token cannot answer the status question either, so the video
+    is quarantined and the alert says it MAY be live."""
+    meta.finish_mode = "token"
+    main([])
+    assert real_state.get_pending_upload() is None
+    assert real_state.has_unresolved_publish(_IDEM_KEY)
+    assert any("MAY already be live" in t for t in _sent_texts())
+
+
+def test_token_error_before_finish_does_not_quarantine(meta, real_state, mocker):
+    import tools.facebook_api as fb_api
+    fb_api.requests.post.side_effect = lambda *a, **k: FakeMeta._resp(
+        {"error": {"code": 190, "message": "expired"}}
+    )
+    main([])
+    assert real_state.get_pending_upload() is None
+    assert real_state.list_publish_reconciliations() == []
+
+
+def test_terminal_failure_with_definitive_not_published_releases_the_key(meta, real_state):
+    """If Facebook says the last video failed, the job fails normally and re-approval works."""
+    meta.finish_mode = "lost"
+    meta.status_mode = "error"
+    for _ in range(3):
+        main([])
+    assert real_state.get_pending_upload() is None
+    assert real_state.list_publish_reconciliations() == []
+    real_state.set_pending_upload(dict(_PENDING_RECORD, video_local_path=str(meta.video)))
+
+
+def test_drain_lifts_quarantine_when_facebook_says_not_published(meta, real_state):
+    meta.finish_mode = "lost"
+    meta.status_mode = "unreachable"
+    for _ in range(3):
+        main([])
+    assert real_state.has_unresolved_publish(_IDEM_KEY)
+
+    meta.published.clear()      # Facebook's answer: vid1 never went live
+    meta.status_mode = "truth"
+    main([])
+    assert not real_state.has_unresolved_publish(_IDEM_KEY)
+    assert not real_state.is_published(_IDEM_KEY)
+    assert any("was NOT published" in t for t in _sent_texts())
+
+
+def test_reconciliation_never_consults_page_video_listing(meta, real_state):
+    """Hard rule from issue #78: the only GETs are to the specific video node."""
+    import tools.facebook_api as fb_api
+    meta.finish_mode = "lost"
+    meta.status_mode = "processing"
+    for _ in range(4):
+        main([])
+    urls = [c.args[0] for c in fb_api.requests.get.call_args_list]
+    assert urls and all(u == "https://graph.facebook.com/v25.0/vid1" for u in urls)

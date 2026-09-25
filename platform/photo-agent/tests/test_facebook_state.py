@@ -709,3 +709,225 @@ def test_a_declining_writer_never_leaves_a_zero_length_file():
     assert fb_state.STATE_FILE.exists()
     assert fb_state.STATE_FILE.stat().st_size > 0
     assert fb_state.get_pending_upload() is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #78 — sessionized-upload handle, publish marker, and quarantine
+# ---------------------------------------------------------------------------
+
+_VID = "vid_1"
+
+
+def _attempted(valid_record, video_id=_VID):
+    """Enqueue valid_record, claim it, record a session and a publish attempt."""
+    fb_state.set_pending_upload(valid_record)
+    key = valid_record["idempotency_key"]
+    assert fb_state.claim_pending_upload(
+        key, cooldown_seconds=0, max_attempts=3, lease_seconds=900
+    ) == "claimed"
+    fb_state.set_upload_session(key, video_id, "sess_1")
+    fb_state.mark_publish_attempted(key, video_id)
+    return key
+
+
+def _state():
+    return json.loads(fb_state.STATE_FILE.read_text())
+
+
+def test_write_is_refused_outside_a_transaction(tmp_path):
+    """The chokepoint is enforced at runtime, not by convention."""
+    with open(tmp_path / "x.json", "w+") as f:
+        with pytest.raises(RuntimeError, match="outside _transaction"):
+            fb_state._write(f, {})
+    with pytest.raises(RuntimeError, match="outside _transaction"):
+        fb_state._open_for_write()
+    aliased = fb_state._write
+    with open(tmp_path / "y.json", "w+") as f:
+        with pytest.raises(RuntimeError):
+            aliased(f, {}, object())
+
+
+@pytest.mark.parametrize("field", ["publish_attempted_at", "publish_settled_at"])
+def test_set_pending_upload_refuses_provenance_fields(valid_record, field):
+    """A caller cannot forge what Meta did."""
+    with pytest.raises(ValueError, match="may not be supplied"):
+        fb_state.set_pending_upload(dict(valid_record, **{field: "2026-01-01T00:00:00+00:00"}))
+
+
+def test_set_upload_session_records_handle_and_clears_marker(valid_record):
+    key = _attempted(valid_record, "vid_old")
+    fb_state.mark_publish_settled(key, "vid_old", "video_status_error")
+    fb_state.set_upload_session(key, "vid_new", "sess_2")
+    rec = fb_state.get_pending_upload()
+    assert rec["video_id"] == "vid_new"
+    assert rec["upload_session_id"] == "sess_2"
+    assert rec["publish_attempted_at"] is None
+    assert rec["publish_settled_at"] is None
+
+
+def test_set_upload_session_raises_without_matching_record():
+    with pytest.raises(RuntimeError, match="no pending record"):
+        fb_state.set_upload_session("42", _VID, "s")
+
+
+def test_mark_publish_attempted_raises_when_not_written(valid_record):
+    """If the marker can't be written, the caller must not send FINISH."""
+    with pytest.raises(RuntimeError, match="refusing to let FINISH proceed"):
+        fb_state.mark_publish_attempted("42", _VID)
+    fb_state.set_pending_upload(valid_record)
+    fb_state.set_upload_session("42", _VID, "s")
+    with pytest.raises(RuntimeError, match="refusing to let FINISH proceed"):
+        fb_state.mark_publish_attempted("42", "some_other_video")
+    assert fb_state.get_pending_upload()["publish_attempted_at"] is None
+
+
+def test_mark_failed_with_open_publish_quarantines_and_blocks_the_key(valid_record):
+    """The terminal-failure half of issue #78: the record goes, the obligation stays."""
+    key = _attempted(valid_record)
+    fb_state.mark_failed(key)
+
+    assert fb_state.get_pending_upload() is None
+    entries = fb_state.list_publish_reconciliations()
+    assert [(e["video_id"], e["idempotency_key"]) for e in entries] == [(_VID, key)]
+    assert fb_state.has_unresolved_publish(key) is True
+    with pytest.raises(ValueError, match="unresolved publish"):
+        fb_state.set_pending_upload(valid_record)
+
+
+def test_mark_failed_without_publish_attempt_does_not_quarantine(valid_record):
+    """A session that never reached FINISH cannot have published."""
+    fb_state.set_pending_upload(valid_record)
+    fb_state.set_upload_session("42", _VID, "s")
+    fb_state.mark_failed("42")
+    assert fb_state.list_publish_reconciliations() == []
+    fb_state.set_pending_upload(valid_record)  # re-approval allowed
+
+
+def test_exhausted_claim_quarantines_in_the_same_write(valid_record):
+    key = _attempted(valid_record)
+    data = _state()
+    data["pending_facebook_upload"]["attempt_count"] = 3
+    data["pending_facebook_upload"]["status"] = "pending"
+    fb_state.STATE_FILE.write_text(json.dumps(data))
+
+    assert fb_state.claim_pending_upload(
+        key, cooldown_seconds=0, max_attempts=3, lease_seconds=0
+    ) == "exhausted"
+    after = _state()
+    assert after["pending_facebook_upload"] is None
+    assert [e["video_id"] for e in after["pending_publish_reconciliations"]] == [_VID]
+
+
+def test_stale_failed_claim_quarantines(valid_record):
+    key = _attempted(valid_record)
+    data = _state()
+    data["pending_facebook_upload"]["status"] = "failed"
+    fb_state.STATE_FILE.write_text(json.dumps(data))
+    assert fb_state.claim_pending_upload(
+        key, cooldown_seconds=0, max_attempts=3, lease_seconds=0
+    ) == "stale_failed"
+    assert fb_state.has_unresolved_publish(key)
+
+
+def test_same_key_replacement_does_not_erase_the_obligation(valid_record):
+    """Replacing a marker-bearing record with a fresh one under the SAME key quarantines
+    the old video — a key comparison alone would have let it through."""
+    key = _attempted(valid_record)
+    fb_state.set_pending_upload(dict(valid_record))  # fresh record, same key, no video_id
+    assert fb_state.has_unresolved_publish(key)
+    assert [e["video_id"] for e in fb_state.list_publish_reconciliations()] == [_VID]
+
+
+def test_new_session_over_an_open_publish_quarantines_the_old_video(valid_record):
+    key = _attempted(valid_record, "vid_old")
+    fb_state.set_upload_session(key, "vid_new", "sess_2")
+    assert [e["video_id"] for e in fb_state.list_publish_reconciliations()] == ["vid_old"]
+
+
+def test_quarantine_survives_terminal_failure_and_same_key_replacement(valid_record):
+    """Once quarantined, neither another failure nor another enqueue can lift it."""
+    key = _attempted(valid_record)
+    fb_state.mark_failed(key)
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            fb_state.set_pending_upload(dict(valid_record))
+        fb_state.mark_failed(key)
+        fb_state.clear_pending_upload(key)
+    assert fb_state.has_unresolved_publish(key)
+
+
+def test_settled_publish_is_not_quarantined(valid_record):
+    key = _attempted(valid_record)
+    fb_state.mark_publish_settled(key, _VID, "video_status_error")
+    fb_state.mark_failed(key)
+    assert fb_state.list_publish_reconciliations() == []
+
+
+@pytest.mark.parametrize("observed", ["publish_status_published", "processing", "", "recent_video_match"])
+def test_mark_publish_settled_requires_a_not_published_observation(valid_record, observed):
+    key = _attempted(valid_record)
+    with pytest.raises(ValueError):
+        fb_state.mark_publish_settled(key, _VID, observed)
+    assert fb_state.get_pending_upload()["publish_attempted_at"] is not None
+
+
+def test_mark_publish_settled_refuses_a_different_video(valid_record):
+    key = _attempted(valid_record)
+    with pytest.raises(ValueError, match="holds"):
+        fb_state.mark_publish_settled(key, "other", "video_status_error")
+    assert fb_state.get_pending_upload()["publish_attempted_at"] is not None
+
+
+def test_stripping_the_marker_is_quarantined_not_accepted(valid_record):
+    """An in-place erasure (marker gone, nothing settled) is treated as removal."""
+    key = _attempted(valid_record)
+
+    def _strip(record, data):
+        record["publish_attempted_at"] = None
+    fb_state._update_pending(key, _strip)
+    assert fb_state.has_unresolved_publish(key)
+
+
+def test_mark_published_retires_the_quarantine(valid_record):
+    key = _attempted(valid_record)
+    with fb_state._transaction() as txn:  # an entry already exists for the key
+        fb_state._add_publish_reconciliation(
+            txn.data, video_id="vid_x", project_name="p", idempotency_key=key, now="t"
+        )
+        txn.commit()
+    fb_state.mark_published(key, _VID)
+    assert fb_state.list_publish_reconciliations() == []
+    assert fb_state.is_published(key)
+
+
+def test_record_recovered_publish_requires_the_published_observation(valid_record):
+    key = _attempted(valid_record)
+    fb_state.mark_failed(key)
+    with pytest.raises(ValueError):
+        fb_state.record_recovered_publish(key, "kitchen_remodel", _VID, "video_status_error")
+    assert not fb_state.is_published(key)
+
+    fb_state.record_recovered_publish(key, "kitchen_remodel", _VID, "publish_status_published")
+    assert fb_state.is_published(key)
+    assert fb_state.list_publish_reconciliations() == []
+    entry = fb_state.find_published("kitchen_remodel")
+    assert entry["fb_post_id"] == _VID and entry["recovered"] is True
+
+
+def test_clear_publish_reconciliation_requires_a_definitive_observation(valid_record):
+    key = _attempted(valid_record)
+    fb_state.mark_failed(key)
+    for observed in ("processing", "draft", "recent_video_match", ""):
+        with pytest.raises(ValueError):
+            fb_state.clear_publish_reconciliation(_VID, observed)
+    assert fb_state.has_unresolved_publish(key)
+    assert fb_state.clear_publish_reconciliation(_VID, "video_status_expired") is True
+    assert not fb_state.has_unresolved_publish(key)
+
+
+def test_record_publish_reconciliation_alerts_first_then_throttles(valid_record):
+    first = fb_state.record_publish_reconciliation(_VID, project_name="p", idempotency_key="42")
+    assert first is not None and first["attempts"] == 1
+    again = fb_state.record_publish_reconciliation(_VID, project_name="p", idempotency_key="42")
+    assert again is None
+    assert fb_state.list_publish_reconciliations()[0]["attempts"] == 2

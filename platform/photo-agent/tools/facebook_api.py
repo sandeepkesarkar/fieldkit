@@ -1,7 +1,12 @@
 """
 Facebook Graph API v25.0 wrapper for the FieldKit photo-video agent.
 
-Handles OAuth token exchange and video upload to a Facebook Page.
+Handles OAuth token exchange, sessionized video upload to a Facebook Page, and
+reading a video's publish status back for reconciliation (issue #78).
+
+The upload and status functions authenticate with an Authorization header, never an
+access_token URL parameter, and strip credentials from every error they raise (see
+tools/redaction.py). The older OAuth helpers above them are unchanged.
 
 Exception hierarchy:
   FacebookTokenError(RuntimeError)  — token invalid/expired (error code 190); skip retries
@@ -17,9 +22,13 @@ from urllib.parse import urlencode
 
 import requests
 
+from tools.redaction import redact_secrets, redact_value
+
 logger = logging.getLogger(__name__)
 
 _GRAPH_BASE = "https://graph.facebook.com/v25.0"
+# Video uploads go to the graph-video host, as in Meta's publishing guide and official SDK.
+_GRAPH_VIDEO_BASE = "https://graph-video.facebook.com/v25.0"
 _OAUTH_DIALOG = "https://www.facebook.com/dialog/oauth"
 
 
@@ -171,49 +180,253 @@ def delete_post(page_access_token: str, post_id: str) -> None:
     logger.info("delete_post: post_id=%s", post_id)
 
 
-def upload_video(page_access_token: str, page_id: str, video_path) -> str:
-    """Upload a video file to a Facebook Page. Returns the Facebook post ID.
+def _safe(detail, access_token: str | None = None) -> str:
+    """Render detail as text with any credential removed.
 
-    Uses non-resumable multipart POST (suitable for files < 100 MB).
-
-    Raises:
-        FacebookTokenError — if the Graph API returns error code 190 (token invalid/expired).
-        FacebookUploadError — on all other API errors, HTTP failures, or network errors.
+    Applied to every exception and response body the upload/reconcile functions below
+    interpolate into an error message — the same two passes as instagram_api._safe():
+    the literal token the caller handed us, and anything merely shaped like a credential.
     """
-    url = f"{_GRAPH_BASE}/{page_id}/videos"
-    video_path = Path(video_path)
+    return redact_value(redact_secrets(str(detail)), access_token)
 
-    try:
-        with open(video_path, "rb") as f:
-            resp = requests.post(
-                url,
-                data={"access_token": page_access_token},
-                files={"source": f},
-                timeout=60,
-            )
-    except requests.exceptions.RequestException as exc:
-        raise FacebookUploadError(f"Video upload request failed: {exc}") from exc
 
+def _auth_header(access_token: str) -> dict:
+    """The Authorization header Meta documents for video uploads (`OAuth <token>`).
+
+    Used instead of an access_token parameter so the permanent Page token is never part of
+    a prepared URL, which a requests exception renders into its str() — see redaction.py.
+    """
+    return {"Authorization": f"OAuth {access_token}"}
+
+
+def _json_or_empty(resp) -> dict:
+    """Return the response's parsed JSON body, or {} if it isn't a JSON object."""
     try:
         data = resp.json()
     except Exception:
-        data = {}
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    # Facebook may return a 2xx HTTP status with an error body (e.g., token expiry).
-    error = data.get("error") if isinstance(data, dict) else None
+
+def _raise_for_graph_error(resp, data: dict, what: str, access_token: str) -> None:
+    """Raise the right exception if resp/data carry a Graph API error.
+
+    Facebook may return a 2xx HTTP status with an error body (e.g. token expiry), so the
+    body is checked before the status.
+    """
+    error = data.get("error")
     if error:
         code = error.get("code") if isinstance(error, dict) else None
         msg = error.get("message", "") if isinstance(error, dict) else str(error)
         if code == 190:
-            raise FacebookTokenError(f"Facebook token invalid/expired: {msg}")
-        raise FacebookUploadError(f"Facebook API error {code}: {msg}")
-
+            raise FacebookTokenError(
+                f"Facebook token invalid/expired during {what}: {_safe(msg, access_token)}"
+            )
+        raise FacebookUploadError(
+            f"Facebook API error {code} during {what}: {_safe(msg, access_token)}"
+        )
     if not resp.ok:
-        raise FacebookUploadError(f"Upload failed: HTTP {resp.status_code}")
+        raise FacebookUploadError(f"{what} failed: HTTP {resp.status_code}")
 
+
+def _upload_post(page_access_token: str, page_id: str, what: str, data: dict, files=None) -> dict:
+    """POST one phase of a sessionized upload to /{page_id}/videos and return its JSON body.
+
+    Network failures and Graph errors are re-raised as FacebookUploadError /
+    FacebookTokenError with any credential stripped from the message.
+    """
     try:
-        return data["id"]
+        resp = requests.post(
+            f"{_GRAPH_VIDEO_BASE}/{page_id}/videos",
+            data=data,
+            files=files,
+            headers=_auth_header(page_access_token),
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise FacebookUploadError(
+            f"Video upload {what} request failed: {_safe(exc, page_access_token)}"
+        ) from None
+    body = _json_or_empty(resp)
+    _raise_for_graph_error(resp, body, f"upload {what}", page_access_token)
+    return body
+
+
+def _offsets(body: dict, what: str) -> tuple[int, int]:
+    """Parse start_offset/end_offset from a start or transfer response."""
+    try:
+        return int(body["start_offset"]), int(body["end_offset"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FacebookUploadError(
+            f"Upload {what} response missing/invalid offsets: {exc!r}"
+        ) from None
+
+
+def upload_video(
+    page_access_token: str,
+    page_id: str,
+    video_path,
+    *,
+    on_session_started,
+    on_before_finish,
+) -> str:
+    """Upload and publish a video to a Facebook Page via the SESSIONIZED upload. Returns the
+    video id (the same value the old one-shot upload returned as its `id`).
+
+    Issue #78. The old implementation was a single multipart POST: it learned no identifier
+    until the response arrived, so a response lost after Meta had published left nothing to
+    reconcile against, and a later re-approval posted the video a second time. The
+    sessionized upload's START phase returns the video_id before any bytes move, which is the
+    durable, pre-known handle that reconciliation needs.
+
+    The protocol, as documented on the Page /videos edge (upload_phase start / transfer /
+    finish, returning upload_session_id, video_id, start_offset, end_offset, success) and as
+    implemented by Meta's official SDK (facebook_business/video_uploader.py), against
+    graph-video.facebook.com:
+
+      start    — file_size                           → upload_session_id, video_id, offsets
+      transfer — upload_session_id, start_offset,
+                 video_file_chunk (repeated until start_offset == end_offset) → next offsets
+      finish   — upload_session_id                   → success
+
+    Nothing is published until FINISH. That is what makes the two callbacks sufficient:
+
+      on_session_started(video_id, upload_session_id) — called after START, before any
+          transfer. The caller persists the handle here. If it raises, the upload stops and
+          nothing was published.
+      on_before_finish() — called immediately before FINISH, the irreversible step. The
+          caller durably records that a publish is being attempted. If it raises, FINISH is
+          never sent.
+
+    Both are REQUIRED keyword arguments so a caller cannot forget the persistence that makes
+    a lost FINISH response reconcilable.
+
+    Raises:
+        FacebookTokenError — Graph API error code 190 (token invalid/expired), any phase.
+        FacebookUploadError — all other API errors, HTTP failures, or network errors. Raised
+            from FINISH (including a response that does not report success) it means the
+            publish outcome is UNKNOWN, not that nothing was published — the caller tells
+            the two apart by whether on_before_finish() ran.
+    """
+    video_path = Path(video_path)
+    try:
+        file_size = video_path.stat().st_size
+    except OSError as exc:
+        raise FacebookUploadError(f"Cannot read video file: {exc.strerror}") from None
+
+    start = _upload_post(
+        page_access_token, page_id, "start",
+        {"upload_phase": "start", "file_size": str(file_size)},
+    )
+    try:
+        session_id = str(start["upload_session_id"])
+        video_id = str(start["video_id"])
     except (KeyError, TypeError) as exc:
         raise FacebookUploadError(
-            f"Upload response missing 'id' field: {exc} — response: {data!r}"
-        ) from exc
+            f"Upload start response missing {exc!r}; keys: {sorted(start)}"
+        ) from None
+    start_offset, end_offset = _offsets(start, "start")
+
+    on_session_started(video_id, session_id)
+
+    try:
+        with open(video_path, "rb") as f:
+            while start_offset != end_offset:
+                f.seek(start_offset)
+                chunk = f.read(end_offset - start_offset)
+                body = _upload_post(
+                    page_access_token, page_id, "transfer",
+                    {
+                        "upload_phase": "transfer",
+                        "upload_session_id": session_id,
+                        "start_offset": str(start_offset),
+                    },
+                    files={"video_file_chunk": (video_path.name, chunk, "application/octet-stream")},
+                )
+                next_start, next_end = _offsets(body, "transfer")
+                if next_start <= start_offset and next_start != next_end:
+                    # Meta did not advance the session. Looping would re-send the same
+                    # chunk forever; a failed attempt costs one retry from a bounded budget.
+                    raise FacebookUploadError(
+                        f"Upload transfer made no progress at offset {start_offset}"
+                    )
+                start_offset, end_offset = next_start, next_end
+    except OSError as exc:
+        raise FacebookUploadError(f"Cannot read video file: {exc.strerror}") from None
+
+    on_before_finish()
+
+    finish = _upload_post(
+        page_access_token, page_id, "finish",
+        {"upload_phase": "finish", "upload_session_id": session_id},
+    )
+    if finish.get("success") is not True:
+        raise FacebookUploadError(
+            f"Upload finish for video {video_id} did not report success; keys: {sorted(finish)}"
+        )
+    return video_id
+
+
+# Values of the Video node's status.video_status that mean the video cannot be (or become)
+# live: processing failed, the upload failed, or the session expired.
+_VIDEO_STATUS_NOT_PUBLISHED = frozenset({"error", "upload_failed", "expired"})
+
+# The `observed` tokens get_video_publish_state() returns with a DEFINITIVE outcome. They
+# are what the caller hands to facebook_state's answer-asserting verbs, which check them
+# against their own copies of these sets.
+OBSERVED_PUBLISHED = "publish_status_published"
+OBSERVED_NOT_PUBLISHED = frozenset(
+    {"publish_status_error"} | {f"video_status_{s}" for s in _VIDEO_STATUS_NOT_PUBLISHED}
+)
+
+
+def get_video_publish_state(page_access_token: str, video_id: str) -> tuple[str, str]:
+    """Ask Meta what became of video_id. Returns (outcome, observed) where outcome is one of:
+
+      "published"     — status.publishing_phase.publish_status == "published".
+                        observed == OBSERVED_PUBLISHED.
+      "not_published" — status.video_status is error / upload_failed / expired, or
+                        status.publishing_phase.publish_status == "error". observed is the
+                        matching member of OBSERVED_NOT_PUBLISHED.
+      "unknown"       — anything else: still processing, draft, scheduled, a value this code
+                        does not recognise, or a status without publishing_phase. observed
+                        is a free-form description for logs only.
+
+    The field and its values are those Meta documents for the Video node's `status` field
+    (GET /{video-id}?fields=status): video_status, and publishing_phase with publish_status
+    (draft, error, published, scheduled). Deliberately STRICT: only the readings above are
+    definitive. In particular this never looks at the Page's recent videos — a created_time
+    match cannot tell FieldKit's upload from one a human posted, so it is not evidence a
+    machine may act on (issue #78).
+
+    Raises FacebookTokenError (code 190) or FacebookUploadError on any failure to get an
+    answer — which the caller must treat as "unknown", never as "not published".
+    """
+    try:
+        resp = requests.get(
+            f"{_GRAPH_BASE}/{video_id}",
+            params={"fields": "status"},
+            headers=_auth_header(page_access_token),
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise FacebookUploadError(
+            f"Video status request failed: {_safe(exc, page_access_token)}"
+        ) from None
+    data = _json_or_empty(resp)
+    _raise_for_graph_error(resp, data, "video status check", page_access_token)
+
+    status = data.get("status")
+    if not isinstance(status, dict):
+        return "unknown", "status absent"
+    publishing = status.get("publishing_phase")
+    publish_status = publishing.get("publish_status") if isinstance(publishing, dict) else None
+    video_status = status.get("video_status")
+
+    if publish_status == "published":
+        return "published", OBSERVED_PUBLISHED
+    if publish_status == "error":
+        return "not_published", "publish_status_error"
+    if video_status in _VIDEO_STATUS_NOT_PUBLISHED:
+        return "not_published", f"video_status_{video_status}"
+    return "unknown", f"video_status={video_status!s} publish_status={publish_status!s}"

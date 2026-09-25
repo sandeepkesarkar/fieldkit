@@ -38,6 +38,29 @@ Retry and failure-recovery logic (US3):
     this one attempt (does not wait for the retry budget to exhaust), and
     alerts the admin to reconnect the Page.
 
+Duplicate-publish reconciliation (issue #78). The upload is SESSIONIZED
+(facebook_api.upload_video()): its start phase returns a video_id before any
+bytes move, and only its finish phase publishes. That video_id is persisted
+(facebook_state.set_upload_session) straight after start, and a publish marker
+(facebook_state.mark_publish_attempted) BEFORE finish is sent. So when finish
+succeeds at Meta but its response is lost — the case that used to end in
+mark_failed() and then a second post on re-approval — the record names the exact
+video to ask about:
+
+  - the next attempt asks Facebook about that video before uploading anything:
+    published → recorded as a recovered publish (key retired, nothing re-posted);
+    definitively not published → settled, then a fresh upload; no definitive
+    answer → the attempt fails WITHOUT uploading;
+  - if the job goes terminal with the answer still unknown, the video is
+    quarantined in facebook_state's pending_publish_reconciliations (the
+    chokepoint does this even if a call site forgets), which blocks re-approval
+    of the key; _drain_publish_reconciliations() re-asks every tick and lifts it
+    only on a definitive answer about that video_id.
+
+Only Facebook's status for that specific video_id is ever treated as an answer.
+Matching the Page's recent videos by time is not, because it cannot tell
+FieldKit's upload from one a human posted.
+
 A resolved job (published, or terminally failed) always clears
 pending_facebook_upload (see tools/facebook_state.py) — claim_pending_upload()
 additionally self-heals a stale or pre-fix state file (an already-published
@@ -109,6 +132,7 @@ from tools import (
     worker_health,
 )
 from tools.facebook_api import FacebookTokenError, FacebookUploadError
+from tools.redaction import redact_secrets
 
 _log = logging.getLogger(__name__)
 
@@ -225,6 +249,12 @@ def main(argv=None) -> None:
         # when only one of the two is deployed.
         upload_cleanup.sweep_orphaned_videos()
 
+        # Unresolved publishes (issue #78) are re-checked every tick, ahead of and
+        # independent of any pending job: a quarantined video may be live on the Page
+        # with nothing recording it, and its idempotency key stays blocked until
+        # Facebook answers.
+        _drain_publish_reconciliations(page_token, chat_id)
+
         record = facebook_state.get_pending_upload()
         if record is None:
             _log.debug("no pending facebook upload — exiting")
@@ -241,17 +271,23 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
 
     record is only a snapshot (from main()'s get_pending_upload()) used here for its immutable
     fields — project_name/video_local_path/page_id/idempotency_key never change across a
-    record's lifetime, only status/attempt_count/last_attempt_at/fb_post_id do. Every decision
-    about whether and how to proceed (staleness, cooldown, attempt budget, claiming) is made by
-    claim_pending_upload() against the CURRENT, freshly-locked state under one exclusive-lock
-    transaction — not by reasoning from this possibly-stale snapshot — so two overlapping
-    invocations of this script can never both observe an unclaimed job and both call the
-    Facebook API (issue #34 follow-up).
+    record's lifetime. Every decision about whether and how to proceed (staleness, cooldown,
+    attempt budget, claiming) is made by claim_pending_upload() against the CURRENT,
+    freshly-locked state under one exclusive-lock transaction — not by reasoning from this
+    possibly-stale snapshot — so two overlapping invocations of this script can never both
+    observe an unclaimed job and both call the Facebook API (issue #34 follow-up).
+
+    video_id / publish_attempted_at are read from the snapshot too, and are NOT immutable:
+    they belong to the PREVIOUS attempt, which is exactly what makes them useful. Reading
+    them before the claim is safe because this whole function runs under
+    upload_facebook.lock, so no other invocation can be mutating them (issue #78).
     """
     project_name = record["project_name"]
     video_path = record["video_local_path"]
     idem_key = record["idempotency_key"]
     attempt_count = record.get("attempt_count", 0)  # pre-claim value; claim() advances it by 1
+    prior_video_id = record.get("video_id")
+    prior_publish_attempted = bool(prior_video_id) and bool(record.get("publish_attempted_at"))
 
     claim = facebook_state.claim_pending_upload(
         idem_key,
@@ -270,18 +306,35 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         )
         return
     if claim == "exhausted":
-        # claim_pending_upload() has already cleared the record, so this job is terminal:
-        # release the shared video too, or a crash during the final attempt would leave it
-        # on disk with nothing left to clean it up.
-        _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
-        facebook_logger.log_upload_exhausted(project_name)
-        _delete_local_file_if_last(video_path, project_name, idem_key)
-        _send_alert(
-            chat_id,
-            f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
+        _handle_exhausted(
+            page_token, prior_video_id if prior_publish_attempted else None,
+            project_name, idem_key, video_path, chat_id,
         )
         return
     assert claim == "claimed", f"unexpected claim outcome: {claim!r}"
+
+    attempt_number = attempt_count + 1
+
+    # A previous attempt sent FINISH and never learned the outcome. Nothing new may be
+    # uploaded until Facebook says what became of THAT video — otherwise a lost response
+    # becomes a second post (issue #78).
+    if prior_publish_attempted:
+        outcome, observed = _classify_video(page_token, prior_video_id, project_name)
+        if outcome == "published":
+            _log.warning(
+                "video was already published by Facebook — recovering instead of "
+                "re-uploading: project=%s video_id=%s", project_name, prior_video_id,
+            )
+            _record_recovered(project_name, idem_key, prior_video_id, observed, video_path, chat_id)
+            return
+        if outcome == "not_published":
+            facebook_state.mark_publish_settled(idem_key, prior_video_id, observed)
+        else:
+            _fail_attempt_unresolved(
+                prior_video_id, project_name, idem_key, video_path, chat_id, attempt_number,
+                f"previous publish of video {prior_video_id} is still unresolved ({observed})",
+            )
+            return
 
     # Video file must exist before we call the API. Checked only after a successful claim — the
     # claim is the single gate against a concurrent duplicate regardless of ordering here, and
@@ -298,36 +351,79 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
         )
         return
 
-    attempt_number = attempt_count + 1
     facebook_logger.log_upload_started(project_name, attempt_number)
 
+    # The video this attempt created, and whether FINISH has been attempted for it. Set by
+    # the callbacks below, each only AFTER its durable state write has succeeded.
+    active_video_id = None
+    publish_attempted = False
+
+    def _on_session_started(video_id: str, upload_session_id: str) -> None:
+        """Persist the pre-known handle before any bytes are transferred."""
+        nonlocal active_video_id
+        facebook_state.set_upload_session(idem_key, video_id, upload_session_id)
+        active_video_id = video_id
+
+    def _on_before_finish() -> None:
+        """Durably mark the publish as attempted BEFORE the irreversible FINISH."""
+        nonlocal publish_attempted
+        facebook_state.mark_publish_attempted(idem_key, active_video_id)
+        publish_attempted = True
+
     try:
-        post_id = facebook_api.upload_video(page_token, page_id, video_path)
+        post_id = facebook_api.upload_video(
+            page_token, page_id, video_path,
+            on_session_started=_on_session_started,
+            on_before_finish=_on_before_finish,
+        )
     except FacebookTokenError as exc:
-        _log.error("Facebook token error: project=%s: %s", project_name, exc)
+        _log.error("Facebook token error: project=%s: %s", project_name, _safe_error(exc))
+        quarantined = False
+        if publish_attempted and active_video_id:
+            # FINISH was sent and the token is what failed, so the status check that would
+            # answer cannot succeed either. Quarantine; the drain keeps asking once the Page
+            # is reconnected.
+            _quarantine_unresolved_publish(active_video_id, project_name, idem_key, chat_id)
+            quarantined = True
         facebook_state.mark_failed(idem_key)
         facebook_logger.log_token_expired(project_name)
         _delete_local_file_if_last(video_path, project_name, idem_key)
-        _send_alert(
-            chat_id,
-            f"⚠️ Facebook token expired for {project_name} — reconnect your Page via generate_auth_link.py",
+        alert = (
+            f"⚠️ Facebook token expired for {project_name} — reconnect your Page via "
+            "generate_auth_link.py"
         )
+        if quarantined:
+            alert += (
+                ". This upload had already reached the publish step, so the video MAY "
+                f"already be live. {_UNRESOLVED_ADVICE}"
+            )
+        _send_alert(chat_id, alert)
         return
     except FacebookUploadError as exc:
-        _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, exc)
-        facebook_logger.log_upload_attempt_failed(project_name, attempt_number, str(exc))
+        detail = _safe_error(exc)
+        _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, detail)
+        facebook_logger.log_upload_attempt_failed(project_name, attempt_number, detail)
         if attempt_number >= _MAX_ATTEMPTS:
+            outcome = "unpublished"
+            if publish_attempted and active_video_id:
+                outcome = _settle_terminal_video(
+                    page_token, active_video_id, project_name, idem_key, chat_id
+                )
+            if outcome == "published":
+                _record_recovered(
+                    project_name, idem_key, active_video_id, facebook_api.OBSERVED_PUBLISHED,
+                    video_path, chat_id,
+                )
+                return
             facebook_state.mark_failed(idem_key)
             facebook_logger.log_upload_exhausted(project_name)
             _delete_local_file_if_last(video_path, project_name, idem_key)
-            _send_alert(
-                chat_id,
-                f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs",
-            )
+            _send_alert(chat_id, _exhausted_alert(project_name, unresolved=outcome == "unresolved"))
         else:
             # A KNOWN, caught failure with retries remaining: release the claim immediately so
             # the next attempt is gated by the short _COOLDOWN_SECONDS, not the much longer
             # _UPLOAD_LEASE_SECONDS a genuinely abandoned/crashed claim would otherwise wait out.
+            # video_id and the publish marker are kept, so the next attempt reconciles first.
             facebook_state.release_claim(idem_key)
         return
 
@@ -338,6 +434,255 @@ def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -
     facebook_logger.log_upload_published(project_name, post_id)
     post_url = f"https://www.facebook.com/{post_id}"
     _send_confirmation(chat_id, f"✅ Video live on Facebook! {post_url}")
+
+
+def _safe_error(exc) -> str:
+    """Render an exception as text with any embedded credential removed.
+
+    facebook_api already redacts what it raises; applied again here because this is where
+    exception text fans out to the durable activity log and stderr. See tools/redaction.py.
+    """
+    return redact_secrets(str(exc))
+
+
+def _classify_video(page_token: str, video_id: str, project_name: str) -> tuple[str, str]:
+    """Ask Facebook what became of video_id. Returns ("published" | "not_published" |
+    "unknown", observed).
+
+    Only facebook_api.get_video_publish_state()'s definitive readings count. Any failure to
+    get an answer — network, Graph error, expired token — is "unknown", never "not
+    published": not knowing a video's fate is never grounds for uploading it again.
+    """
+    try:
+        return facebook_api.get_video_publish_state(page_token, video_id)
+    except (FacebookTokenError, FacebookUploadError) as exc:
+        detail = _safe_error(exc)
+        _log.error(
+            "could not read publish state: project=%s video_id=%s error=%s",
+            project_name, video_id, detail,
+        )
+        return "unknown", detail
+
+
+def _record_recovered(
+    project_name: str, idem_key: str, video_id: str, observed: str, video_path: str, chat_id: str
+) -> None:
+    """Record a publish Facebook reports as live but this system never observed, and take the
+    success path: key retired, shared video released, owner told honestly what happened."""
+    facebook_state.record_recovered_publish(idem_key, project_name, video_id, observed)
+    facebook_logger.log_upload_recovered(project_name, video_id)
+    _delete_local_file_if_last(video_path, project_name, idem_key)
+    _send_confirmation(chat_id, _recovered_message(project_name, video_id))
+
+
+def _fail_attempt_unresolved(
+    video_id: str,
+    project_name: str,
+    idem_key: str,
+    video_path: str,
+    chat_id: str,
+    attempt_number: int,
+    detail: str,
+) -> None:
+    """Count an attempt that could not proceed because a previous publish is unresolved.
+
+    Nothing is uploaded. Below the budget the claim is released and the next tick asks
+    again; on the last attempt the video is quarantined, and mark_failed() drops the job —
+    the quarantine keeps the key blocked.
+    """
+    _log.error("upload blocked: project=%s attempt=%d: %s", project_name, attempt_number, detail)
+    facebook_logger.log_upload_attempt_failed(project_name, attempt_number, detail)
+    if attempt_number < _MAX_ATTEMPTS:
+        facebook_state.release_claim(idem_key)
+        return
+    _quarantine_unresolved_publish(video_id, project_name, idem_key, chat_id)
+    facebook_state.mark_failed(idem_key)
+    facebook_logger.log_upload_exhausted(project_name)
+    _delete_local_file_if_last(video_path, project_name, idem_key)
+    _send_alert(chat_id, _exhausted_alert(project_name, unresolved=True))
+
+
+def _handle_exhausted(
+    page_token: str,
+    attempted_video_id: str | None,
+    project_name: str,
+    idem_key: str,
+    video_path: str,
+    chat_id: str,
+) -> None:
+    """Resolve a job whose attempt budget ran out at claim time.
+
+    claim_pending_upload() has already cleared the record and, if it carried an open
+    publish, quarantined it in the same write. This asks Facebook once, silently, so the
+    single message sent below tells the whole story.
+    """
+    outcome = "unpublished"
+    if attempted_video_id:
+        outcome = _reconcile_quarantined_video(
+            page_token,
+            {"video_id": attempted_video_id, "project_name": project_name, "idempotency_key": idem_key},
+            chat_id,
+            announce=False,
+        )
+    if outcome == "published":
+        _log.warning(
+            "attempt budget exhausted, but the video was already published: project=%s "
+            "video_id=%s", project_name, attempted_video_id,
+        )
+        _delete_local_file_if_last(video_path, project_name, idem_key)
+        _send_confirmation(chat_id, _recovered_message(project_name, attempted_video_id))
+        return
+    if outcome == "unresolved":
+        facebook_logger.log_publish_unresolved(project_name, attempted_video_id)
+
+    # claim_pending_upload() has already cleared the record, so this job is terminal:
+    # release the shared video too, or a crash during the final attempt would leave it
+    # on disk with nothing left to clean it up.
+    _log.error("attempt budget exhausted: project=%s key=%s", project_name, idem_key)
+    facebook_logger.log_upload_exhausted(project_name)
+    _delete_local_file_if_last(video_path, project_name, idem_key)
+    _send_alert(chat_id, _exhausted_alert(project_name, unresolved=outcome == "unresolved"))
+
+
+def _settle_terminal_video(
+    page_token: str, video_id: str, project_name: str, idem_key: str, chat_id: str
+) -> str:
+    """At terminal failure, establish whether video_id went live. The record still exists.
+
+    Returns "published" (caller records it), "unpublished" (Facebook said no; the marker
+    is settled so mark_failed() does not quarantine), or "unresolved" (quarantined with an
+    alert; the key stays blocked).
+    """
+    outcome, observed = _classify_video(page_token, video_id, project_name)
+    if outcome == "published":
+        return "published"
+    if outcome == "not_published":
+        facebook_state.mark_publish_settled(idem_key, video_id, observed)
+        return "unpublished"
+    _quarantine_unresolved_publish(video_id, project_name, idem_key, chat_id)
+    return "unresolved"
+
+
+def _quarantine_unresolved_publish(
+    video_id: str, project_name: str, idem_key: str, chat_id: str
+) -> None:
+    """Durably record that video_id may have published, block its key, and alert.
+
+    facebook_state's chokepoint guarantees the entry exists whenever the job is dropped;
+    this explicit call is what produces a timely alert and the FB_UNKNOWN log line.
+    """
+    entry = facebook_state.record_publish_reconciliation(
+        video_id, project_name=project_name, idempotency_key=idem_key
+    )
+    facebook_logger.log_publish_unresolved(project_name, video_id)
+    if entry:
+        _send_alert(chat_id, _unresolved_publish_alert(entry))
+
+
+def _reconcile_quarantined_video(
+    page_token: str, entry: dict, chat_id: str, *, announce: bool
+) -> str:
+    """Ask Facebook about ONE quarantined video and act only on a definitive answer.
+
+    Returns "published", "unpublished", or "unresolved". announce=False suppresses the
+    Telegram text (the caller sends its own), not the state changes or log lines.
+    """
+    video_id = entry.get("video_id")
+    project_name = entry.get("project_name", "unknown")
+    idem_key = entry.get("idempotency_key", "")
+
+    outcome, observed = _classify_video(page_token, video_id, project_name)
+    if outcome == "published":
+        facebook_state.record_recovered_publish(idem_key, project_name, video_id, observed)
+        facebook_logger.log_upload_recovered(project_name, video_id)
+        facebook_state.clear_publish_reconciliation(video_id, observed)
+        if announce:
+            _send_confirmation(chat_id, _recovered_message(project_name, video_id))
+        return "published"
+    if outcome == "not_published":
+        facebook_state.clear_publish_reconciliation(video_id, observed)
+        facebook_logger.log_publish_resolved(project_name, video_id, observed)
+        if announce:
+            _send_alert(chat_id, _not_published_message(project_name))
+        return "unpublished"
+
+    updated = facebook_state.record_publish_reconciliation(
+        video_id, project_name=project_name, idempotency_key=idem_key
+    )
+    if updated and announce:
+        _send_alert(chat_id, _unresolved_publish_alert(updated))
+    return "unresolved"
+
+
+def _drain_publish_reconciliations(page_token: str, chat_id: str) -> None:
+    """Re-ask Facebook about every quarantined video, every tick, until it is definitive.
+
+    Mirrors upload_instagram.py's drain. Nothing here drops an entry without an answer
+    about that specific video_id — in particular, never on the strength of a recent-video
+    match on the Page (issue #78).
+    """
+    for entry in facebook_state.list_publish_reconciliations():
+        if not entry.get("video_id"):
+            continue
+        _reconcile_quarantined_video(page_token, entry, chat_id, announce=True)
+
+
+# Appended to any alert about a publish whose outcome is unknown, so the promise is worded
+# identically everywhere — and stays true: FieldKit keeps checking, and blocks re-approval.
+_UNRESOLVED_ADVICE = (
+    "FieldKit is still checking with Facebook and will tell you as soon as it knows. "
+    "Re-approving this video is blocked until then, so it cannot be posted twice. "
+    "Do NOT post it manually before you hear back."
+)
+
+
+def _unresolved_publish_alert(entry: dict) -> str:
+    """The admin alert for a publish whose outcome could not be established.
+
+    Names the video id so a person can look at it on the Page themselves — evidence for a
+    human; FieldKit itself only acts on Facebook's status for that id.
+    """
+    project_name = entry.get("project_name", "unknown")
+    video_id = entry.get("video_id", "unknown")
+    attempts = entry.get("attempts", 1)
+    since = entry.get("recorded_at", "unknown")
+    return (
+        f"⚠️ Facebook: the video for {project_name} MAY already be live. FieldKit asked "
+        f"Facebook to publish it but never learned whether it succeeded, and cannot get a "
+        f"definitive answer (video {video_id}, https://www.facebook.com/{video_id}).\n"
+        f"Checks so far: {attempts}, first unresolved: {since}.\n"
+        + _UNRESOLVED_ADVICE
+    )
+
+
+def _recovered_message(project_name: str, video_id: str) -> str:
+    """The confirmation for a publish discovered after the fact."""
+    return (
+        f"✅ Video live on Facebook for {project_name} — an earlier attempt published it "
+        f"but could not confirm it at the time. Nothing was posted twice. "
+        f"https://www.facebook.com/{video_id}"
+    )
+
+
+def _not_published_message(project_name: str) -> str:
+    """The confirmation that a quarantined video never went live."""
+    return (
+        f"✅ Resolved: the Facebook video for {project_name} was NOT published — Facebook "
+        "confirms the upload never went live. You can safely re-approve this video."
+    )
+
+
+def _exhausted_alert(project_name: str, unresolved: bool) -> str:
+    """The terminal-failure alert, distinguishing "did not post" from "may have posted"."""
+    if unresolved:
+        return (
+            f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts, "
+            "and the video MAY already be live — the publish step was reached and Facebook "
+            f"has not confirmed either way. {_UNRESOLVED_ADVICE}"
+        )
+    return (
+        f"⚠️ Facebook upload failed for {project_name} after {_MAX_ATTEMPTS} attempts — check logs"
+    )
 
 
 def _send_confirmation(chat_id: str, text: str) -> None:

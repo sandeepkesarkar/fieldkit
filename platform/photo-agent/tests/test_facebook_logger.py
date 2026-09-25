@@ -177,3 +177,36 @@ def test_log_dir_env_override(tmp_path, monkeypatch):
     log_upload_enqueued("proj")
     assert alt_file.exists()
     assert "FB_ENQUEUED" in alt_file.read_text()
+
+
+# --- Issue #78 reconciliation lines ---
+
+def test_log_upload_recovered_format(monkeypatch):
+    monkeypatch.setattr(fb_logger, "_now", lambda: "2026-09-25 10:00")
+    fb_logger.log_upload_recovered("kitchen_remodel", "123456")
+    assert fb_logger.LOG_FILE.read_text().strip() == (
+        "2026-09-25 10:00 | FB_RECOVER   | project=kitchen_remodel video_id=123456"
+    )
+
+
+def test_log_publish_unresolved_format(monkeypatch):
+    monkeypatch.setattr(fb_logger, "_now", lambda: "2026-09-25 10:01")
+    fb_logger.log_publish_unresolved("kitchen_remodel", "123456")
+    assert fb_logger.LOG_FILE.read_text().strip() == (
+        "2026-09-25 10:01 | FB_UNKNOWN   | project=kitchen_remodel video_id=123456"
+    )
+
+
+def test_log_publish_resolved_format(monkeypatch):
+    monkeypatch.setattr(fb_logger, "_now", lambda: "2026-09-25 10:02")
+    fb_logger.log_publish_resolved("kitchen_remodel", "123456", "video_status_error")
+    assert fb_logger.LOG_FILE.read_text().strip() == (
+        "2026-09-25 10:02 | FB_RESOLVED  | project=kitchen_remodel video_id=123456 "
+        "observed=video_status_error"
+    )
+
+
+@pytest.mark.parametrize("bad", ["a|b", "x y", "a=b"])
+def test_reconciliation_lines_reject_pipe_breaking_video_ids(bad):
+    with pytest.raises(ValueError):
+        fb_logger.log_publish_unresolved("kitchen_remodel", bad)
