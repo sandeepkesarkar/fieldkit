@@ -98,3 +98,44 @@ def log_token_expired(project_name: str) -> None:
     _validate_token(project_name, "project_name")
     logger.error("FB_TOKEN_EXP project=%s", project_name)
     _append(f"{_now()} | {'FB_TOKEN_EXP':<12} | project={project_name}")
+
+
+def log_upload_recovered(project_name: str, video_id: str) -> None:
+    """Append an FB_RECOVER line when an interrupted publish is found already live.
+
+    Distinct from FB_PUBLISHED: FieldKit did not observe this publish happen — a later
+    reconciliation read the video's status back from Facebook (issue #78).
+    """
+    _validate_token(project_name, "project_name")
+    _validate_token(video_id, "video_id")
+    logger.warning("FB_RECOVER project=%s video_id=%s", project_name, video_id)
+    _append(f"{_now()} | {'FB_RECOVER':<12} | project={project_name} video_id={video_id}")
+
+
+def log_publish_unresolved(project_name: str, video_id: str) -> None:
+    """Append an FB_UNKNOWN line when a publish outcome cannot be established.
+
+    Facebook was asked to publish video_id and FieldKit never learned whether it did, so
+    the video may be live with nothing recording it. Written once, when quarantined.
+    """
+    _validate_token(project_name, "project_name")
+    _validate_token(video_id, "video_id")
+    logger.error("FB_UNKNOWN project=%s video_id=%s", project_name, video_id)
+    _append(f"{_now()} | {'FB_UNKNOWN':<12} | project={project_name} video_id={video_id}")
+
+
+def log_publish_resolved(project_name: str, video_id: str, observed: str) -> None:
+    """Append an FB_RESOLVED line when a quarantined video turns out never to have published.
+
+    Carries the observation Facebook reported, so an audit can see which answer it was.
+    """
+    _validate_token(project_name, "project_name")
+    _validate_token(video_id, "video_id")
+    _validate_token(observed, "observed")
+    logger.warning(
+        "FB_RESOLVED project=%s video_id=%s observed=%s", project_name, video_id, observed
+    )
+    _append(
+        f"{_now()} | {'FB_RESOLVED':<12} | project={project_name} video_id={video_id} "
+        f"observed={observed}"
+    )

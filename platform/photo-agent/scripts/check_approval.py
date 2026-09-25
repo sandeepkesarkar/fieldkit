@@ -228,6 +228,23 @@ def _enqueue_facebook_upload(
         return
     idem_key = str(telegram_message_id)
     try:
+        if facebook_state.has_unresolved_publish(idem_key):
+            # An earlier upload of this exact video sent Facebook's publish step and never
+            # learned the outcome (issue #78). is_published() cannot catch that, and
+            # set_pending_upload() refuses it regardless — this is here so the admin is
+            # told why, instead of the refusal surfacing only as a logged enqueue error.
+            _log.error(
+                "FB upload NOT enqueued for project=%s key=%s — a previous publish for this "
+                "video is still unresolved; refusing to risk a duplicate post",
+                project_name, idem_key,
+            )
+            _notify_admin(
+                f"⚠️ Facebook: {project_name} was NOT re-queued. An earlier attempt already "
+                "asked Facebook to publish this video and never learned the outcome, so "
+                "posting it again could duplicate a live post. FieldKit is still checking "
+                "and will unblock this automatically once Facebook answers."
+            )
+            return
         if facebook_state.is_published(idem_key):
             _log.warning("FB upload already published for key=%s — skipping enqueue", idem_key)
             return

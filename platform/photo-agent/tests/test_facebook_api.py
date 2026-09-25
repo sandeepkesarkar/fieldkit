@@ -2,7 +2,8 @@
 Tests for tools/facebook_api.py — the Facebook Graph API v25.0 wrapper.
 
 Covers: build_auth_url, exchange_code_for_token, exchange_for_long_lived_token,
-get_page_access_token, upload_video, and the two custom exception types
+get_page_access_token, the sessionized upload_video, get_video_publish_state,
+and the two custom exception types
 (FacebookTokenError, FacebookUploadError).
 
 All HTTP calls are mocked; no real network calls are made.
@@ -22,6 +23,7 @@ from tools.facebook_api import (
     exchange_code_for_token,
     exchange_for_long_lived_token,
     get_page_access_token,
+    get_video_publish_state,
     upload_video,
 )
 
@@ -199,117 +201,302 @@ def test_get_page_access_token_raises_on_network_error(mocker):
 # upload_video
 # ---------------------------------------------------------------------------
 
-def test_upload_video_returns_post_id(mocker, tmp_path):
-    """upload_video() returns the post_id string on success."""
+_TOKEN = "page_token_SECRET_value_123"
+_SESSION = "sess_1"
+_VIDEO = "vid_987"
+
+
+def _resp(body, ok=True, status=200):
+    """Build a mocked requests.Response returning body as JSON."""
+    r = MagicMock()
+    r.ok = ok
+    r.status_code = status
+    r.json.return_value = body
+    return r
+
+
+def _start(size, end=None):
+    """A START response for a file of `size` bytes, with the first chunk ending at `end`."""
+    return _resp({
+        "upload_session_id": _SESSION,
+        "video_id": _VIDEO,
+        "start_offset": "0",
+        "end_offset": str(size if end is None else end),
+    })
+
+
+def _video_file(tmp_path, size=64):
     video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
-
-    mock_resp = MagicMock()
-    mock_resp.ok = True
-    mock_resp.json.return_value = {"id": "post_id_abc123"}
-    mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
-
-    post_id = upload_video("page_access_token", "123456789", video_file)
-    assert post_id == "post_id_abc123"
+    video_file.write_bytes(bytes(range(256))[:size] if size <= 256 else b"\x01" * size)
+    return video_file
 
 
-def test_upload_video_posts_to_graph_api(mocker, tmp_path):
-    """upload_video() sends a POST to the Graph API videos endpoint for the given page_id."""
-    video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
+def _upload(video_file, **kwargs):
+    """Call upload_video with recording callbacks unless overridden."""
+    kwargs.setdefault("on_session_started", MagicMock())
+    kwargs.setdefault("on_before_finish", MagicMock())
+    return upload_video(_TOKEN, "PAGE_123", video_file, **kwargs)
 
-    mock_resp = MagicMock()
-    mock_resp.ok = True
-    mock_resp.json.return_value = {"id": "post_id_abc"}
-    mock_post = mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
 
-    upload_video("token", "PAGE_123", video_file)
-    url = mock_post.call_args.args[0]
-    assert "PAGE_123" in url
-    assert "videos" in url
-    assert "graph.facebook.com" in url
+def test_upload_video_runs_start_transfer_finish_and_returns_video_id(mocker, tmp_path):
+    """The sessionized protocol: start → transfer → finish, returning the START video_id."""
+    video_file = _video_file(tmp_path, 64)
+    post = mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(64),
+        _resp({"start_offset": "64", "end_offset": "64"}),
+        _resp({"success": True}),
+    ])
+    assert _upload(video_file) == _VIDEO
+
+    phases = [c.kwargs["data"]["upload_phase"] for c in post.call_args_list]
+    assert phases == ["start", "transfer", "finish"]
+    start, transfer, finish = post.call_args_list
+    assert start.kwargs["data"]["file_size"] == "64"
+    assert transfer.kwargs["data"]["upload_session_id"] == _SESSION
+    assert transfer.kwargs["data"]["start_offset"] == "0"
+    assert transfer.kwargs["files"]["video_file_chunk"][1] == video_file.read_bytes()
+    assert finish.kwargs["data"] == {"upload_phase": "finish", "upload_session_id": _SESSION}
+    for call in post.call_args_list:
+        assert call.args[0] == "https://graph-video.facebook.com/v25.0/PAGE_123/videos"
+
+
+def test_upload_video_sends_token_in_authorization_header_never_url_or_body(mocker, tmp_path):
+    """The permanent Page token travels only in the Authorization header."""
+    video_file = _video_file(tmp_path, 8)
+    post = mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(8), _resp({"start_offset": "8", "end_offset": "8"}), _resp({"success": True}),
+    ])
+    _upload(video_file)
+    for call in post.call_args_list:
+        assert call.kwargs["headers"] == {"Authorization": f"OAuth {_TOKEN}"}
+        assert _TOKEN not in call.args[0]
+        assert _TOKEN not in repr(call.kwargs["data"])
+        assert "params" not in call.kwargs
+
+
+def test_upload_video_transfers_in_the_chunks_meta_asks_for(mocker, tmp_path):
+    """Each transfer sends exactly [start_offset, end_offset) and follows Meta's next offsets."""
+    video_file = _video_file(tmp_path, 100)
+    data = video_file.read_bytes()
+    post = mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(100, end=40),
+        _resp({"start_offset": "40", "end_offset": "100"}),
+        _resp({"start_offset": "100", "end_offset": "100"}),
+        _resp({"success": True}),
+    ])
+    _upload(video_file)
+    transfers = [c for c in post.call_args_list if c.kwargs["data"]["upload_phase"] == "transfer"]
+    assert [c.kwargs["data"]["start_offset"] for c in transfers] == ["0", "40"]
+    assert transfers[0].kwargs["files"]["video_file_chunk"][1] == data[0:40]
+    assert transfers[1].kwargs["files"]["video_file_chunk"][1] == data[40:100]
+
+
+def test_upload_video_callbacks_run_in_order_before_transfer_and_before_finish(mocker, tmp_path):
+    """on_session_started gets the handle before any transfer; on_before_finish runs
+    after the last transfer and before FINISH — the ordering issue #78 depends on."""
+    video_file = _video_file(tmp_path, 8)
+    events = []
+
+    def _post(url, data, files=None, headers=None, timeout=None):
+        events.append(("post", data["upload_phase"]))
+        return {
+            "start": _start(8),
+            "transfer": _resp({"start_offset": "8", "end_offset": "8"}),
+            "finish": _resp({"success": True}),
+        }[data["upload_phase"]]
+
+    mocker.patch("tools.facebook_api.requests.post", side_effect=_post)
+    _upload(
+        video_file,
+        on_session_started=lambda vid, sid: events.append(("session", vid, sid)),
+        on_before_finish=lambda: events.append(("before_finish",)),
+    )
+    assert events == [
+        ("post", "start"),
+        ("session", _VIDEO, _SESSION),
+        ("post", "transfer"),
+        ("before_finish",),
+        ("post", "finish"),
+    ]
+
+
+def test_upload_video_does_not_finish_if_before_finish_callback_raises(mocker, tmp_path):
+    """If the publish marker cannot be persisted, FINISH (the publish) is never sent."""
+    video_file = _video_file(tmp_path, 8)
+    post = mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(8), _resp({"start_offset": "8", "end_offset": "8"}),
+    ])
+    with pytest.raises(RuntimeError, match="state write failed"):
+        _upload(video_file, on_before_finish=MagicMock(side_effect=RuntimeError("state write failed")))
+    assert [c.kwargs["data"]["upload_phase"] for c in post.call_args_list] == ["start", "transfer"]
+
+
+def test_upload_video_does_not_transfer_if_session_callback_raises(mocker, tmp_path):
+    """If the handle cannot be persisted, nothing further is sent."""
+    video_file = _video_file(tmp_path, 8)
+    post = mocker.patch("tools.facebook_api.requests.post", side_effect=[_start(8)])
+    with pytest.raises(RuntimeError):
+        _upload(video_file, on_session_started=MagicMock(side_effect=RuntimeError("x")))
+    assert post.call_count == 1
+
+
+def test_upload_video_callbacks_are_required():
+    """The persistence hooks cannot be omitted."""
+    with pytest.raises(TypeError):
+        upload_video(_TOKEN, "PAGE_123", "video.mp4")  # noqa — missing keyword-only args
 
 
 def test_upload_video_raises_facebook_token_error_on_error_code_190(mocker, tmp_path):
-    """upload_video() raises FacebookTokenError when the FB error code is 190 (token invalid)."""
-    video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
-
-    mock_resp = MagicMock()
-    mock_resp.ok = True
-    mock_resp.json.return_value = {
-        "error": {
-            "message": "Invalid OAuth access token",
-            "type": "OAuthException",
-            "code": 190,
-        }
-    }
-    mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
-
+    """FacebookTokenError when the Graph API reports code 190, even on HTTP 200."""
+    video_file = _video_file(tmp_path)
+    mocker.patch("tools.facebook_api.requests.post", return_value=_resp({
+        "error": {"message": "Invalid OAuth access token", "type": "OAuthException", "code": 190}
+    }))
     with pytest.raises(FacebookTokenError):
-        upload_video("expired_token", "123456789", video_file)
+        _upload(video_file)
 
 
 def test_upload_video_raises_facebook_upload_error_on_http_500(mocker, tmp_path):
-    """upload_video() raises FacebookUploadError on HTTP 500 from the Graph API."""
-    video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
-
-    mock_resp = MagicMock()
-    mock_resp.ok = False
-    mock_resp.status_code = 500
-    mock_resp.text = "Internal Server Error"
-    mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
-
+    video_file = _video_file(tmp_path)
+    mocker.patch("tools.facebook_api.requests.post", return_value=_resp({}, ok=False, status=500))
     with pytest.raises(FacebookUploadError):
-        upload_video("token", "123456789", video_file)
-
-
-def test_upload_video_raises_facebook_upload_error_on_network_error(mocker, tmp_path):
-    """upload_video() raises FacebookUploadError on network failure."""
-    video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
-
-    mocker.patch(
-        "tools.facebook_api.requests.post",
-        side_effect=requests.exceptions.RequestException("connection reset"),
-    )
-    with pytest.raises(FacebookUploadError):
-        upload_video("token", "123456789", video_file)
+        _upload(video_file)
 
 
 def test_upload_video_raises_facebook_upload_error_on_non_190_fb_error(mocker, tmp_path):
-    """upload_video() raises FacebookUploadError (not FacebookTokenError) for FB errors other than 190."""
-    video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
-
-    mock_resp = MagicMock()
-    mock_resp.ok = True
-    mock_resp.json.return_value = {
-        "error": {
-            "message": "Video too large",
-            "type": "GraphMethodException",
-            "code": 100,
-        }
-    }
-    mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
-
-    with pytest.raises(FacebookUploadError):
-        upload_video("token", "123456789", video_file)
+    video_file = _video_file(tmp_path)
+    mocker.patch("tools.facebook_api.requests.post", return_value=_resp({
+        "error": {"message": "Video too large", "type": "GraphMethodException", "code": 100}
+    }))
+    with pytest.raises(FacebookUploadError) as excinfo:
+        _upload(video_file)
+    assert not isinstance(excinfo.value, FacebookTokenError)
 
 
-def test_upload_video_raises_facebook_upload_error_when_response_missing_id(mocker, tmp_path):
-    """upload_video() raises FacebookUploadError (not KeyError) when response has no 'id' field."""
-    video_file = tmp_path / "video.mp4"
-    video_file.write_bytes(b"\x00" * 64)
+def test_upload_video_network_error_is_upload_error_with_token_redacted(mocker, tmp_path):
+    """A requests exception whose text carries the token is re-raised without it."""
+    video_file = _video_file(tmp_path)
+    mocker.patch(
+        "tools.facebook_api.requests.post",
+        side_effect=requests.exceptions.ConnectionError(
+            f"https://graph-video.facebook.com/x?access_token={_TOKEN} reset; OAuth {_TOKEN}"
+        ),
+    )
+    with pytest.raises(FacebookUploadError) as excinfo:
+        _upload(video_file)
+    assert _TOKEN not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None  # original (token-bearing) exception not chained
 
-    mock_resp = MagicMock()
-    mock_resp.ok = True
-    mock_resp.json.return_value = {"video_id": "async_12345"}  # async upload path — no 'id'
-    mocker.patch("tools.facebook_api.requests.post", return_value=mock_resp)
 
-    with pytest.raises(FacebookUploadError, match="missing 'id' field"):
-        upload_video("token", "123456789", video_file)
+def test_upload_video_start_missing_video_id_is_upload_error(mocker, tmp_path):
+    video_file = _video_file(tmp_path)
+    mocker.patch("tools.facebook_api.requests.post", return_value=_resp(
+        {"upload_session_id": _SESSION, "start_offset": "0", "end_offset": "64"}
+    ))
+    session = MagicMock()
+    with pytest.raises(FacebookUploadError, match="video_id"):
+        _upload(video_file, on_session_started=session)
+    session.assert_not_called()
+
+
+def test_upload_video_finish_without_success_is_upload_error(mocker, tmp_path):
+    """A FINISH response that does not report success is an error — outcome unknown."""
+    video_file = _video_file(tmp_path, 8)
+    mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(8), _resp({"start_offset": "8", "end_offset": "8"}), _resp({"success": False}),
+    ])
+    with pytest.raises(FacebookUploadError, match="did not report success"):
+        _upload(video_file)
+
+
+def test_upload_video_transfer_without_progress_is_upload_error(mocker, tmp_path):
+    """A transfer that does not advance the offset fails instead of looping forever."""
+    video_file = _video_file(tmp_path, 64)
+    mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(64, end=32),
+        _resp({"start_offset": "0", "end_offset": "32"}),
+    ])
+    before_finish = MagicMock()
+    with pytest.raises(FacebookUploadError, match="no progress"):
+        _upload(video_file, on_before_finish=before_finish)
+    before_finish.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# get_video_publish_state — reconciliation against a pre-known video_id (issue #78)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status, expected", [
+    ({"video_status": "ready", "publishing_phase": {"status": "complete", "publish_status": "published"}},
+     ("published", "publish_status_published")),
+    ({"video_status": "error"}, ("not_published", "video_status_error")),
+    ({"video_status": "upload_failed"}, ("not_published", "video_status_upload_failed")),
+    ({"video_status": "expired"}, ("not_published", "video_status_expired")),
+    ({"video_status": "ready", "publishing_phase": {"publish_status": "error"}},
+     ("not_published", "publish_status_error")),
+])
+def test_get_video_publish_state_definitive(mocker, status, expected):
+    mocker.patch("tools.facebook_api.requests.get", return_value=_resp({"status": status}))
+    assert get_video_publish_state(_TOKEN, _VIDEO) == expected
+
+
+@pytest.mark.parametrize("body", [
+    {"status": {"video_status": "processing", "publishing_phase": {"publish_status": "draft"}}},
+    {"status": {"video_status": "ready", "publishing_phase": {"publish_status": "scheduled"}}},
+    {"status": {"video_status": "ready"}},  # no publishing_phase at all
+    {"status": {"video_status": "upload_complete", "publishing_phase": {"status": "not_started"}}},
+    {"status": {"video_status": "something_new"}},
+    {"status": "weird"},
+    {},
+])
+def test_get_video_publish_state_anything_else_is_unknown(mocker, body):
+    """Only the documented definitive readings count; everything else is unknown."""
+    mocker.patch("tools.facebook_api.requests.get", return_value=_resp(body))
+    assert get_video_publish_state(_TOKEN, _VIDEO)[0] == "unknown"
+
+
+def test_get_video_publish_state_queries_the_video_node_with_header_auth(mocker):
+    get = mocker.patch("tools.facebook_api.requests.get", return_value=_resp({"status": {}}))
+    get_video_publish_state(_TOKEN, _VIDEO)
+    assert get.call_args.args[0] == f"https://graph.facebook.com/v25.0/{_VIDEO}"
+    assert get.call_args.kwargs["params"] == {"fields": "status"}
+    assert get.call_args.kwargs["headers"] == {"Authorization": f"OAuth {_TOKEN}"}
+
+
+def test_get_video_publish_state_never_lists_page_videos(mocker):
+    """Issue #78 hard rule: reconciliation asks about ONE video id, never the Page's
+    recent videos. Only one GET, to the video node itself."""
+    get = mocker.patch("tools.facebook_api.requests.get", return_value=_resp({"status": {}}))
+    get_video_publish_state(_TOKEN, _VIDEO)
+    assert get.call_count == 1
+    assert "/videos" not in get.call_args.args[0]
+
+
+def test_get_video_publish_state_raises_on_failure(mocker):
+    """A failure to get an answer raises — callers must treat it as unknown."""
+    mocker.patch(
+        "tools.facebook_api.requests.get",
+        side_effect=requests.exceptions.Timeout(f"timeout access_token={_TOKEN}"),
+    )
+    with pytest.raises(FacebookUploadError) as excinfo:
+        get_video_publish_state(_TOKEN, _VIDEO)
+    assert _TOKEN not in str(excinfo.value)
+
+
+def test_get_video_publish_state_raises_token_error_on_190(mocker):
+    mocker.patch("tools.facebook_api.requests.get", return_value=_resp(
+        {"error": {"code": 190, "message": "expired"}}
+    ))
+    with pytest.raises(FacebookTokenError):
+        get_video_publish_state(_TOKEN, _VIDEO)
+
+
+def test_observed_tokens_match_facebook_state():
+    """The two copies of the definitive observations must agree."""
+    import tools.facebook_state as fb_state
+    from tools import facebook_api
+    assert facebook_api.OBSERVED_PUBLISHED == fb_state._OBSERVED_PUBLISHED
+    assert facebook_api.OBSERVED_NOT_PUBLISHED == fb_state._OBSERVED_NOT_PUBLISHED
 
 
 def test_facebook_token_error_is_subclass_of_runtime_error():
@@ -395,3 +582,132 @@ def test_delete_post_raises_on_network_error(mocker):
 
     with pytest.raises(FacebookUploadError):
         delete_post("page_token", "post_id_abc")
+
+
+# ---------------------------------------------------------------------------
+# FINISH payload parity with the one-shot upload it replaced (PR #87 review)
+# ---------------------------------------------------------------------------
+
+def _legacy_one_shot_upload(page_access_token, page_id, video_path):
+    """The request made by facebook_api.upload_video() BEFORE issue #78, copied verbatim
+    from base commit 275d9b4 (platform/photo-agent/tools/facebook_api.py:188-196) so the
+    two paths can be compared call-for-call. Response handling is omitted — only what was
+    SENT matters here."""
+    url = f"https://graph.facebook.com/v25.0/{page_id}/videos"
+    video_path = Path(video_path)
+    with open(video_path, "rb") as f:
+        return requests.post(
+            url,
+            data={"access_token": page_access_token},
+            files={"source": f},
+            timeout=60,
+        )
+
+
+# How each path authenticates / carries the file / drives the session protocol. Nothing
+# else in a request is transport; anything left over is post metadata.
+_LEGACY_TRANSPORT = {"access_token", "source"}
+_SESSION_PROTOCOL = {"upload_phase", "upload_session_id", "start_offset", "file_size",
+                     "video_file_chunk"}
+_POST_METADATA_FIELDS = {"title", "description", "published", "caption", "message",
+                         "unpublished_content_type", "scheduled_publish_time", "privacy"}
+
+
+def test_finish_payload_is_exactly_the_protocol_fields(mocker, tmp_path):
+    """FINISH carries the session protocol and nothing else — PUBLISH_METADATA is empty."""
+    from tools import facebook_api
+    assert dict(facebook_api.PUBLISH_METADATA) == {}
+    video_file = _video_file(tmp_path, 8)
+    post = mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(8), _resp({"start_offset": "8", "end_offset": "8"}), _resp({"success": True}),
+    ])
+    _upload(video_file)
+    finish = post.call_args_list[-1]
+    assert finish.kwargs["data"] == {"upload_phase": "finish", "upload_session_id": _SESSION}
+    assert finish.kwargs["files"] is None
+
+
+def test_publish_metadata_parity_between_legacy_and_sessionized_paths(mocker, tmp_path):
+    """Run the OLD request and the NEW upload against mocked HTTP and compare what each
+    sends beyond transport/protocol. Both must send the same post metadata (none), so a
+    normal upload produces the same post as before. Also the file part is named the same."""
+    video_file = _video_file(tmp_path, 8)
+
+    legacy = mocker.patch("tools.facebook_api.requests.post", return_value=_resp({"id": "x"}))
+    _legacy_one_shot_upload(_TOKEN, "PAGE_123", video_file)
+    legacy_call = legacy.call_args
+    legacy_fields = set(legacy_call.kwargs["data"]) | set(legacy_call.kwargs["files"])
+    legacy_metadata = {k: legacy_call.kwargs["data"][k]
+                       for k in legacy_fields - _LEGACY_TRANSPORT}
+    legacy_filename = Path(legacy_call.kwargs["files"]["source"].name).name
+
+    new = mocker.patch("tools.facebook_api.requests.post", side_effect=[
+        _start(8), _resp({"start_offset": "8", "end_offset": "8"}), _resp({"success": True}),
+    ])
+    _upload(video_file)
+    new_metadata = {}
+    for call in new.call_args_list:
+        fields = set(call.kwargs["data"]) | set(call.kwargs["files"] or {})
+        new_metadata.update({k: call.kwargs["data"][k] for k in fields - _SESSION_PROTOCOL})
+    transfer = [c for c in new.call_args_list if c.kwargs["data"]["upload_phase"] == "transfer"]
+    new_filename = transfer[0].kwargs["files"]["video_file_chunk"][0]
+
+    assert legacy_metadata == new_metadata == {}
+    assert not (_POST_METADATA_FIELDS & set(new_metadata))
+    assert legacy_filename == new_filename == "video.mp4"
+
+
+# ---------------------------------------------------------------------------
+# delete_video / video_is_gone — operator quarantine resolution
+# ---------------------------------------------------------------------------
+
+def test_delete_video_sends_delete_to_the_video_node_with_header_auth(mocker):
+    from tools.facebook_api import delete_video
+    d = mocker.patch("tools.facebook_api.requests.delete", return_value=_resp({"success": True}))
+    delete_video(_TOKEN, _VIDEO)
+    assert d.call_args.args[0] == f"https://graph.facebook.com/v25.0/{_VIDEO}"
+    assert d.call_args.kwargs["headers"] == {"Authorization": f"OAuth {_TOKEN}"}
+    assert "params" not in d.call_args.kwargs
+
+
+@pytest.mark.parametrize("body, exc", [
+    ({"success": False}, FacebookUploadError),
+    ({}, FacebookUploadError),
+    ({"error": {"code": 100, "message": "Object does not exist"}}, FacebookUploadError),
+    ({"error": {"code": 190, "message": "expired"}}, FacebookTokenError),
+])
+def test_delete_video_only_returns_on_explicit_success(mocker, body, exc):
+    """Code 100 "does not exist" is NOT success — it can also mean "cannot see it"."""
+    from tools.facebook_api import delete_video
+    mocker.patch("tools.facebook_api.requests.delete", return_value=_resp(body))
+    with pytest.raises(exc):
+        delete_video(_TOKEN, _VIDEO)
+
+
+def test_delete_video_network_error_is_redacted(mocker):
+    from tools.facebook_api import delete_video
+    mocker.patch("tools.facebook_api.requests.delete",
+                 side_effect=requests.exceptions.ConnectionError(f"x?access_token={_TOKEN}"))
+    with pytest.raises(FacebookUploadError) as excinfo:
+        delete_video(_TOKEN, _VIDEO)
+    assert _TOKEN not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("response, gone", [
+    (_resp({"error": {"code": 100, "message": "does not exist"}}, ok=False, status=400), True),
+    (_resp({"id": _VIDEO}), False),
+    (_resp({"error": {"code": 190}}, ok=False, status=400), False),
+    (_resp({"error": {"code": 2, "message": "transient"}}, ok=False, status=500), False),
+    (_resp({}, ok=False, status=500), False),
+])
+def test_video_is_gone_only_on_code_100(mocker, response, gone):
+    from tools.facebook_api import video_is_gone
+    g = mocker.patch("tools.facebook_api.requests.get", return_value=response)
+    assert video_is_gone(_TOKEN, _VIDEO) is gone
+    assert g.call_args.kwargs["headers"] == {"Authorization": f"OAuth {_TOKEN}"}
+
+
+def test_video_is_gone_false_on_network_error(mocker):
+    from tools.facebook_api import video_is_gone
+    mocker.patch("tools.facebook_api.requests.get", side_effect=requests.exceptions.Timeout("t"))
+    assert video_is_gone(_TOKEN, _VIDEO) is False
