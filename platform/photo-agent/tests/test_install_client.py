@@ -80,6 +80,17 @@ if [ "$1" = "-p" ]; then
     esac
     exit 0
   fi
+  if [ "$3" = "auth" ] && [ "$4" = "status" ]; then
+    # Mirrors hermes_cli/auth_commands.py auth_status_command: exit 0 either
+    # way, verdict only in the "<provider>: logged in|logged out" line.
+    # HERMES_STUB_AUTH_LOGGED_IN is a space-separated list of providers the
+    # stub reports as logged in; default: none.
+    case " ${HERMES_STUB_AUTH_LOGGED_IN:-} " in
+      *" $5 "*) echo "$5: logged in" ;;
+      *) echo "$5: logged out (No Codex credentials stored. Run hermes auth to authenticate.)" ;;
+    esac
+    exit "${HERMES_STUB_AUTH_STATUS_EXIT:-0}"
+  fi
   exit 0
 fi
 if [ "$1" = "gateway" ] && [ "$2" = "status" ]; then
@@ -1015,8 +1026,11 @@ def test_failed_config_set_rolls_back_config_yaml_and_touches_zero_live_env_file
     hermes_env.write_text("TELEGRAM_BOT_TOKEN=preexisting-token\n")
 
     _write_client_env(sandbox["fieldkit_root"], "acme")
+    # Seeded live provider differs from the client's (and the key is absent
+    # from the live .env), so issue #89's gate needs --allow-provider-change
+    # to let this reach the rollback path it exists to test.
     result = _run(
-        "acme", sandbox,
+        "acme", sandbox, "--allow-provider-change",
         extra_env={"HERMES_STUB_FAIL_CONFIG_KEY": "model.default"},
     )
     assert result.returncode != 0
@@ -1055,8 +1069,11 @@ def test_failed_config_set_restores_config_yaml_ORIGINAL_mode_not_hermes_rewritt
     os.chmod(config_yaml, 0o640)
 
     _write_client_env(sandbox["fieldkit_root"], "acme")
+    # Seeded live provider differs from the client's (and the key is absent
+    # from the live .env), so issue #89's gate needs --allow-provider-change
+    # to let this reach the rollback path it exists to test.
     result = _run(
-        "acme", sandbox,
+        "acme", sandbox, "--allow-provider-change",
         extra_env={
             "HERMES_STUB_FAIL_CONFIG_KEY": "skills.external_dirs",
             # Simulates model.provider's own `config set` call rewriting
@@ -1067,6 +1084,7 @@ def test_failed_config_set_restores_config_yaml_ORIGINAL_mode_not_hermes_rewritt
         },
     )
     assert result.returncode != 0
+    assert "rolling back" in result.stderr.lower()
     assert config_yaml.read_text() == "model:\n  provider: original-provider\n"
     assert stat.S_IMODE(config_yaml.stat().st_mode) == 0o640, (
         "config.yaml's mode must be restored to its ORIGINAL value (0640), "
@@ -1151,7 +1169,10 @@ def test_second_commit_failure_rolls_back_hermes_env_and_config_yaml_fully(sandb
     subprocess.run(["chflags", "uchg", str(root_env)], check=True)
     try:
         _write_client_env(sandbox["fieldkit_root"], "acme")
-        result = _run("acme", sandbox, "--no-restart")
+        # Seeded live provider differs from the client's (and the key is absent
+        # from the live .env), so issue #89's gate needs --allow-provider-change
+        # to let this reach the rollback path it exists to test.
+        result = _run("acme", sandbox, "--no-restart", "--allow-provider-change")
         assert result.returncode != 0
         assert "rolling both" in result.stderr.lower()
 
@@ -1189,7 +1210,10 @@ def test_first_commit_failure_rolls_back_config_yaml_too(sandbox):
     subprocess.run(["chflags", "uchg", str(hermes_env)], check=True)
     try:
         _write_client_env(sandbox["fieldkit_root"], "acme")
-        result = _run("acme", sandbox, "--no-restart")
+        # Seeded live provider differs from the client's (and the key is absent
+        # from the live .env), so issue #89's gate needs --allow-provider-change
+        # to let this reach the rollback path it exists to test.
+        result = _run("acme", sandbox, "--no-restart", "--allow-provider-change")
         assert result.returncode != 0
         assert "rolling back config.yaml too" in result.stderr.lower()
 
@@ -1916,3 +1940,322 @@ def test_skills_dir_symlinked_outside_platform_is_rejected(tmp_path, sandbox):
     assert not (sandbox["fieldkit_root"] / ".env").exists()
     assert not (sandbox["hermes_home"] / ".env").exists()
     assert _log_calls(sandbox) == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #89: subscription/OAuth providers, and no silent provider/model/
+# credential changes. The live-profile fixtures below reproduce the real
+# 2026-09-25 incident shape: Hermes on the ChatGPT subscription
+# (openai-codex / gpt-5.6-sol) with ANTHROPIC_API_KEY deliberately disabled
+# by a "# disabled <date> ...: ANTHROPIC_API_KEY=..." comment line, and a
+# client .env still carrying anthropic + an API key.
+# ---------------------------------------------------------------------------
+
+_LIVE_CODEX_CONFIG = "model:\n  default: gpt-5.6-sol\n  provider: openai-codex\nterminal:\n  backend: local\n"
+_DISABLED_ANTHROPIC_LINE = (
+    "# disabled 2026-09-22 (use ChatGPT subscription, not Claude API): "
+    "ANTHROPIC_API_KEY=sk-ant-live-disabled-value\n"
+)
+_LIVE_CODEX_ENV = (
+    "# OPENROUTER_API_KEY=\n"
+    "TELEGRAM_BOT_TOKEN=1234:token\n"
+    "TELEGRAM_ALLOWED_USERS=999888777\n"
+    "CLIENT_NAME=_demo\n"
+    + _DISABLED_ANTHROPIC_LINE
+)
+_CODEX_CLIENT = {
+    "HERMES_MODEL_PROVIDER": "openai-codex",
+    "HERMES_MODEL_DEFAULT": "gpt-5.6-sol",
+    "HERMES_PROVIDER_API_KEY": None,  # line omitted entirely
+}
+
+
+def _seed_live_codex_profile(sandbox) -> None:
+    (sandbox["hermes_home"] / "config.yaml").write_text(_LIVE_CODEX_CONFIG)
+    (sandbox["hermes_home"] / ".env").write_text(_LIVE_CODEX_ENV)
+
+
+def _tree_snapshot(*roots: Path) -> dict:
+    """Every file/dir under roots -> (bytes, mode), for byte-exact
+    "nothing changed" assertions."""
+    snap = {}
+    for root in roots:
+        for p in sorted(root.rglob("*")):
+            st = p.lstat()
+            snap[str(p)] = (p.read_bytes() if p.is_file() and not p.is_symlink() else None, st.st_mode)
+    return snap
+
+
+def _active_provider_key_lines(env_text: str) -> list[str]:
+    keys = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
+    out = []
+    for line in env_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        if any(stripped.startswith(k + "=") for k in keys):
+            out.append(line)
+    return out
+
+
+def test_subscription_provider_keeps_codex_and_writes_no_api_key(sandbox):
+    """Issue #89 acceptance: a client configured for openai-codex (no API key)
+    installs cleanly, keeps model.provider openai-codex, writes NO provider
+    API key, and leaves the disabled ANTHROPIC_API_KEY comment untouched."""
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides=_CODEX_CLIENT)
+    result = _run("_demo", sandbox, extra_env={"HERMES_STUB_AUTH_LOGGED_IN": "openai-codex"})
+    assert result.returncode == 0, result.stderr
+
+    calls = _log_calls(sandbox)
+    assert any(c == "STUB_HERMES_CALL: -p default auth status openai-codex" for c in calls), calls
+    assert any("config set model.provider openai-codex" in c for c in calls)
+    assert any("config set model.default gpt-5.6-sol" in c for c in calls)
+    assert not any("config set model.provider anthropic" in c for c in calls)
+
+    hermes_env = (sandbox["hermes_home"] / ".env").read_text()
+    assert _active_provider_key_lines(hermes_env) == []
+    assert _DISABLED_ANTHROPIC_LINE in hermes_env
+    assert "# OPENROUTER_API_KEY=\n" in hermes_env
+    assert "CLIENT_NAME=_demo" in hermes_env
+    assert "provider:" in result.stdout and "openai-codex (unchanged)" in result.stdout
+
+
+def test_subscription_provider_credential_check_runs_before_any_mutation(sandbox):
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides=_CODEX_CLIENT)
+    result = _run("_demo", sandbox, extra_env={"HERMES_STUB_AUTH_LOGGED_IN": "openai-codex"})
+    assert result.returncode == 0, result.stderr
+    calls = _log_calls(sandbox)
+    auth_idx = calls.index("STUB_HERMES_CALL: -p default auth status openai-codex")
+    first_mutation = min(i for i, c in enumerate(calls) if "config set" in c or "profile use" in c or "gateway stop" in c or "gateway start" in c)
+    assert auth_idx < first_mutation
+
+
+def test_subscription_provider_without_hermes_credential_fails_closed(sandbox):
+    """openai-codex selected but Hermes reports logged out -> refuse before
+    touching anything (no lock, no temp file, no config set, no gateway stop)."""
+    _seed_live_codex_profile(sandbox)
+    sandbox["running_marker"].touch()
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides=_CODEX_CLIENT)
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox)  # stub: nobody logged in
+    assert result.returncode != 0
+    assert "no valid 'openai-codex' credential" in result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    calls = _log_calls(sandbox)
+    assert not any("config set" in c or "profile use" in c or "gateway stop" in c or "gateway start" in c for c in calls)
+
+
+def test_subscription_provider_credential_check_nonzero_exit_fails_closed(sandbox):
+    """Even a "logged in" line doesn't count if `hermes auth status` failed."""
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides=_CODEX_CLIENT)
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox, extra_env={
+        "HERMES_STUB_AUTH_LOGGED_IN": "openai-codex",
+        "HERMES_STUB_AUTH_STATUS_EXIT": "3",
+    })
+    assert result.returncode != 0
+    assert "no valid 'openai-codex' credential" in result.stderr
+    assert "exit 3" in result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+
+
+def test_subscription_provider_with_api_key_set_is_refused(sandbox):
+    """A key for an OAuth provider would be written for nothing -- refuse
+    rather than guess, before any hermes command or file write."""
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides={
+        **_CODEX_CLIENT, "HERMES_PROVIDER_API_KEY": "sk-ant-should-not-be-here",
+    })
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox, extra_env={"HERMES_STUB_AUTH_LOGGED_IN": "openai-codex"})
+    assert result.returncode != 0
+    assert "HERMES_PROVIDER_API_KEY is set" in result.stderr
+    assert "sk-ant-should-not-be-here" not in result.stdout + result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    assert _log_calls(sandbox) == []
+
+
+def test_subscription_provider_blank_api_key_line_is_treated_as_absent(sandbox):
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides={**_CODEX_CLIENT, "HERMES_PROVIDER_API_KEY": ""})
+    result = _run("_demo", sandbox, extra_env={"HERMES_STUB_AUTH_LOGGED_IN": "openai-codex"})
+    assert result.returncode == 0, result.stderr
+    assert _active_provider_key_lines((sandbox["hermes_home"] / ".env").read_text()) == []
+
+
+def test_incident_anthropic_client_over_codex_profile_is_refused_without_flag(sandbox):
+    """THE 2026-09-25 INCIDENT: live profile on openai-codex with the Anthropic
+    key disabled; client .env still says anthropic + key. Without the flag,
+    the install must refuse, list every change, and change NOTHING."""
+    _seed_live_codex_profile(sandbox)
+    sandbox["running_marker"].touch()
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides={
+        "HERMES_PROVIDER_API_KEY": "sk-ant-client-secret",
+    })
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox)
+    assert result.returncode != 0
+    assert "model.provider: openai-codex -> anthropic" in result.stderr
+    assert "model.default: gpt-5.6-sol -> claude-sonnet-5" in result.stderr
+    assert "ANTHROPIC_API_KEY: commented-out/disabled" in result.stderr
+    assert "--allow-provider-change" in result.stderr
+    assert "sk-ant-client-secret" not in result.stdout + result.stderr
+    assert "sk-ant-live-disabled-value" not in result.stdout + result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    assert _log_calls(sandbox) == []  # not even gateway status / stop
+
+
+def test_disabled_key_is_not_reenabled_even_when_provider_and_model_match(sandbox):
+    """Provider/model unchanged, but the operator commented the key out --
+    writing it back active is itself a gated change."""
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: anthropic\n  default: claude-sonnet-5\n")
+    (sandbox["hermes_home"] / ".env").write_text("TELEGRAM_BOT_TOKEN=1234:token\n# ANTHROPIC_API_KEY=sk-ant-old\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("acme", sandbox)
+    assert result.returncode != 0
+    assert "ANTHROPIC_API_KEY: commented-out/disabled" in result.stderr
+    assert "model.provider:" not in result.stderr  # provider itself not a change
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+
+
+def test_disabled_key_is_reenabled_only_with_flag(sandbox):
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: anthropic\n  default: claude-sonnet-5\n")
+    (sandbox["hermes_home"] / ".env").write_text("TELEGRAM_BOT_TOKEN=1234:token\n# ANTHROPIC_API_KEY=sk-ant-old\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--allow-provider-change")
+    assert result.returncode == 0, result.stderr
+    assert "WILL be applied" in result.stdout
+    hermes_env = (sandbox["hermes_home"] / ".env").read_text()
+    assert _active_provider_key_lines(hermes_env) == ["ANTHROPIC_API_KEY=sk-ant-test-key"]
+
+
+def test_absent_key_on_configured_profile_is_not_added_without_flag(sandbox):
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: anthropic\n  default: claude-sonnet-5\n")
+    (sandbox["hermes_home"] / ".env").write_text("TELEGRAM_BOT_TOKEN=1234:token\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("acme", sandbox)
+    assert result.returncode != 0
+    assert "ANTHROPIC_API_KEY: absent from" in result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+
+
+def test_provider_change_refused_without_flag(sandbox):
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: openai-api\n  default: gpt-5.5\n")
+    (sandbox["hermes_home"] / ".env").write_text("TELEGRAM_BOT_TOKEN=1234:token\nOPENAI_API_KEY=sk-openai-live\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("acme", sandbox)
+    assert result.returncode != 0
+    assert "model.provider: openai-api -> anthropic" in result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    assert _log_calls(sandbox) == []
+
+
+def test_provider_change_applied_with_flag(sandbox):
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: openai-api\n  default: gpt-5.5\n")
+    (sandbox["hermes_home"] / ".env").write_text("TELEGRAM_BOT_TOKEN=1234:token\nOPENAI_API_KEY=sk-openai-live\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--allow-provider-change")
+    assert result.returncode == 0, result.stderr
+    assert "openai-api -> anthropic  (CHANGE)" in result.stdout
+    assert "OPENAI_API_KEY: active -> removed" in result.stdout
+    calls = _log_calls(sandbox)
+    assert any("config set model.provider anthropic" in c for c in calls)
+    hermes_env = (sandbox["hermes_home"] / ".env").read_text()
+    assert _active_provider_key_lines(hermes_env) == ["ANTHROPIC_API_KEY=sk-ant-test-key"]
+
+
+def test_model_only_change_refused_without_flag(sandbox):
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: anthropic\n  default: claude-opus-5-5\n")
+    (sandbox["hermes_home"] / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-test-key\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox)
+    assert result.returncode != 0
+    assert "model.default: claude-opus-5-5 -> claude-sonnet-5" in result.stderr
+    assert "model.provider:" not in result.stderr
+
+
+def test_codex_to_anthropic_with_flag_applies_the_switch(sandbox):
+    """The flag is the explicit escape hatch for the incident shape too."""
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo")
+    result = _run("_demo", sandbox, "--allow-provider-change")
+    assert result.returncode == 0, result.stderr
+    assert any("config set model.provider anthropic" in c for c in _log_calls(sandbox))
+    hermes_env = (sandbox["hermes_home"] / ".env").read_text()
+    assert _active_provider_key_lines(hermes_env) == ["ANTHROPIC_API_KEY=sk-ant-test-key"]
+
+
+def test_same_provider_and_model_client_switch_needs_no_flag(sandbox):
+    """API-key providers keep working as before: switching between two
+    clients on the same provider/model with an active key is not gated;
+    the output says the value changes without printing either value."""
+    (sandbox["hermes_home"] / "config.yaml").write_text("model:\n  provider: anthropic\n  default: claude-sonnet-5\n")
+    (sandbox["hermes_home"] / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-previous-client\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox)
+    assert result.returncode == 0, result.stderr
+    assert "ANTHROPIC_API_KEY: active -> active (value replaced" in result.stdout
+    assert "sk-ant-previous-client" not in result.stdout + result.stderr
+    assert "sk-ant-test-key" not in result.stdout + result.stderr
+
+
+def test_dry_run_shows_provider_diff_refuses_and_is_read_only(sandbox):
+    _seed_live_codex_profile(sandbox)
+    sandbox["running_marker"].touch()
+    _write_client_env(sandbox["fieldkit_root"], "_demo")
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox, "--dry-run")
+    assert result.returncode != 0
+    assert "openai-codex -> anthropic  (CHANGE)" in result.stdout
+    assert "gpt-5.6-sol -> claude-sonnet-5  (CHANGE)" in result.stdout
+    assert "ANTHROPIC_API_KEY: commented-out/disabled -> ACTIVE  (RE-ENABLE)" in result.stdout
+    assert "refusing" in result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    assert _log_calls(sandbox) == []
+
+
+def test_dry_run_with_flag_shows_diff_and_is_still_read_only(sandbox):
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo")
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox, "--dry-run", "--allow-provider-change")
+    assert result.returncode == 0, result.stderr
+    assert "a real run WOULD apply" in result.stdout
+    assert "model.provider: openai-codex -> anthropic" in result.stdout
+    assert "no files written" in result.stdout
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    assert _log_calls(sandbox) == []
+
+
+def test_dry_run_subscription_provider_no_change_is_read_only(sandbox):
+    """Operator step (b) in the PR: `_demo --dry-run` after switching _demo's
+    .env to openai-codex must report no provider change and touch nothing."""
+    _seed_live_codex_profile(sandbox)
+    _write_client_env(sandbox["fieldkit_root"], "_demo", overrides=_CODEX_CLIENT)
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("_demo", sandbox, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "openai-codex (unchanged)" in result.stdout
+    assert "gpt-5.6-sol (unchanged)" in result.stdout
+    assert "(CHANGE)" not in result.stdout and "RE-ENABLE" not in result.stdout
+    assert "credential check was NOT run" in result.stdout
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before
+    assert _log_calls(sandbox) == []
+
+
+def test_unparseable_live_config_yaml_fails_closed(sandbox):
+    (sandbox["hermes_home"] / "config.yaml").write_text("model: [unclosed\n")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    before = _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"])
+    result = _run("acme", sandbox)
+    assert result.returncode != 0
+    assert "cannot read/parse" in result.stderr
+    assert _tree_snapshot(sandbox["hermes_home"], sandbox["fieldkit_root"]) == before

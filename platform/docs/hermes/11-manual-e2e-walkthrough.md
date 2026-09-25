@@ -50,7 +50,9 @@ Do this before touching Drive or Telegram. All read-only.
    ```
    Expect `CLIENT_NAME=mercury`, and the second command to at least confirm
    a key is present for whichever provider `hermes config get model.provider`
-   reports (see step 2). If `CLIENT_NAME` names a different client, run
+   reports (see step 2) — unless that provider is a subscription/OAuth one
+   such as `openai-codex`, which has no key; check
+   `hermes auth status openai-codex` reports `logged in` instead (doc 09). If `CLIENT_NAME` names a different client, run
    `platform/photo-agent/scripts/install_client.sh mercury` first — do not
    proceed on a mismatch and assume it'll sort itself out.
 
