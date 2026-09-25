@@ -151,7 +151,62 @@ silently accepting.
 Flags: `--dry-run` (print the plan; makes **zero** filesystem changes of
 any kind — no `mkdir`, no `chmod`, no lock, no temp file — and runs no
 `hermes` commands), `--no-restart` (apply config, leave the gateway
-stopped).
+stopped), `--allow-provider-change` (see below).
+
+### No silent provider/model/credential changes (issue #89)
+
+The client `.env` is the source of truth, but the installer never
+*silently* moves the live Hermes profile onto a different provider or
+credential. Before any mutation — and identically under `--dry-run` — it
+reads the live `~/.hermes/config.yaml` and `~/.hermes/.env` and prints the
+before→after for `model.provider`, `model.default`, and every managed
+provider key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`;
+values are never printed). It then **refuses, changing nothing**, unless
+`--allow-provider-change` is passed, if the install would:
+
+- change a `model.provider` or `model.default` that is already set, or
+- write a provider API key that is **commented out / disabled** in the live
+  `.env` (any comment line assigning it, e.g.
+  `# disabled 2026-09-22 (...): ANTHROPIC_API_KEY=...`), or is **absent**
+  from it while the profile already has a model configured.
+
+Not gated: a first install onto a profile with no model configured (and no
+commented-out copy of the key); switching between two clients on the same
+provider and model (the output only says whether the key value changes);
+removing another provider's active key (it is reported, and removal is the
+safe direction). `--dry-run` exits non-zero with the same refusal, so it is
+a faithful preview. Background: issue #89, where a stale `_demo` `.env`
+silently moved the live bot from the ChatGPT subscription back onto the
+Anthropic API key and re-enabled a key the operator had disabled.
+
+### Subscription / OAuth providers (no API key)
+
+Some Hermes providers authenticate from Hermes's **own OAuth store**
+(`~/.hermes/auth.json`, populated by `hermes auth` / `hermes model`), not an
+API key. Verified in Hermes's source (`hermes_cli/auth.py`
+`PROVIDER_REGISTRY` auth types, and `get_auth_status()`): `openai-codex`
+(ChatGPT subscription), `nous`, `xai-oauth`, `qwen-oauth`, `minimax-oauth`.
+For these:
+
+- **omit `HERMES_PROVIDER_API_KEY`** (or leave it genuinely blank — note an
+  inline `# comment` after `=` counts as a value). The installer refuses a
+  key for a subscription provider, since it would be written for nothing.
+- No provider key is written into `~/.hermes/.env`; any active managed
+  provider key there is removed, and commented-out ones are left as-is.
+- The real run **fails closed before any mutation** unless
+  `hermes -p default auth status <provider>` prints exactly
+  `<provider>: logged in` (that command exits 0 either way, so the line is
+  the verdict). `--dry-run` does not run this check (it runs no `hermes`
+  commands) and says so. Log in once on the machine first, e.g.
+  `hermes auth add openai-codex` or `hermes model`.
+
+Example (`_demo` on the ChatGPT subscription):
+
+```
+HERMES_MODEL_PROVIDER=openai-codex
+HERMES_MODEL_DEFAULT=gpt-5.6-sol
+# no HERMES_PROVIDER_API_KEY line
+```
 
 **Required fields in `clients/<name>/src/photo-agent/.env`** (added to
 `platform/photo-agent/.env.example` and every client's own `.env.example`):
@@ -160,15 +215,16 @@ stopped).
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Already required for the pipeline scripts themselves — reused as-is for Hermes's gateway bot (one bot serves both, issue #49) |
 | `TELEGRAM_ALLOWED_USERS` | Comma-separated Telegram user IDs allowed to command the Hermes gateway bot |
-| `HERMES_MODEL_PROVIDER` | e.g. `anthropic`, `openai-api` — see provider identity notes below |
+| `HERMES_MODEL_PROVIDER` | e.g. `anthropic`, `openai-api`, or a subscription provider such as `openai-codex` — see provider identity notes below |
 | `HERMES_MODEL_DEFAULT` | Model id for that provider (`hermes model` shows the current picker list) |
-| `HERMES_PROVIDER_API_KEY` | That client's own API key for `HERMES_MODEL_PROVIDER` — `install_client.sh` maps it to the correct real env var name (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) before writing it into `~/.hermes/.env` |
+| `HERMES_PROVIDER_API_KEY` | **API-key providers only.** That client's own API key for `HERMES_MODEL_PROVIDER` — `install_client.sh` maps it to the correct real env var name (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) before writing it into `~/.hermes/.env`. Must be absent for a subscription/OAuth provider (see above). |
 
 Missing any required field, or an unrecognized `HERMES_MODEL_PROVIDER`
 (the script only knows the API-key variable name for `anthropic`,
-`openai-api`, and `openrouter` — add a case to the script before using
-another provider), fails the whole install loudly before touching any
-file — never a partial install with some fields switched and others stale.
+`openai-api`, and `openrouter`, plus the subscription providers listed
+above — add a case to the script before using another provider), fails the
+whole install loudly before touching any file — never a partial install
+with some fields switched and others stale.
 
 ## Diagnosing a Telegram allowlist problem after installing a client
 

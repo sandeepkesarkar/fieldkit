@@ -184,6 +184,14 @@ platform/photo-agent/scripts/install_client.sh <client>
 hermes config get skills.external_dirs
 ```
 
+Since issue #89 the same run also compares the client's
+`HERMES_MODEL_PROVIDER`/`HERMES_MODEL_DEFAULT` (and provider key) with the
+live profile and **refuses** if they differ, unless you pass
+`--allow-provider-change` — so re-running the installer just to refresh
+`skills.external_dirs` can no longer silently switch the model provider.
+`--dry-run` shows that before→after too. See
+[`09-per-client-model-profiles.md`](09-per-client-model-profiles.md#no-silent-providermodelcredential-changes-issue-89).
+
 Before issue #81 the installer wrote only `platform/photo-agent/skills`,
 replacing the whole list, so a hand-added `email-agent` entry was lost on the
 next run. If you are on a checkout older than that fix, re-run the current

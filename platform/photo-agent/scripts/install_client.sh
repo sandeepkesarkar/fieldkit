@@ -107,8 +107,36 @@
 #   which invokes Hermes's actual installed `load_hermes_dotenv()` (not a
 #   reimplementation) against an isolated scratch HERMES_HOME to prove this.
 #
+# No silent provider/credential changes (issue #89):
+#   Before ANY mutation (and in --dry-run too), the incoming model.provider /
+#   model.default are compared with the LIVE config.yaml, and the incoming
+#   provider API key with the LIVE Hermes .env. The before->after of each is
+#   printed. The install is REFUSED (exit 1, nothing touched) unless
+#   --allow-provider-change is passed when it would:
+#     - change a model.provider or model.default that is already set, or
+#     - write a provider API key that is currently commented-out/disabled in
+#       the live .env (any `# ... KEY=` line, e.g. "# disabled <date>: KEY="),
+#       or absent from it while the profile already has a model configured.
+#   A first install onto a profile with no model configured at all (and no
+#   commented-out copy of the key) is not a "change" and needs no flag.
+#   Replacing one active key with another client's key for the SAME provider
+#   and model is a normal client switch and is not gated (the output says
+#   whether the value changes, never the value itself).
+#
+# Subscription/OAuth providers (issue #89): providers that Hermes
+# authenticates through its OWN OAuth store (<HERMES_HOME>/auth.json, via
+# `hermes auth` / `hermes model`) rather than an API key -- see
+# SUBSCRIPTION_PROVIDERS below, taken from hermes_cli/auth.py's
+# PROVIDER_REGISTRY (auth_type oauth_*) and get_auth_status(). For these,
+# HERMES_PROVIDER_API_KEY must be blank/absent (it would be written for
+# nothing), no provider key is written to Hermes's .env, and the real run
+# fails closed before any mutation unless `hermes -p default auth status
+# <provider>` reports "<provider>: logged in". --dry-run does NOT run that
+# check (it runs no hermes commands -- `hermes auth status` itself creates
+# Hermes's skeleton directories in HERMES_HOME) and says so.
+#
 # Usage:
-#   install_client.sh <client-name> [--dry-run] [--no-restart]
+#   install_client.sh <client-name> [--dry-run] [--no-restart] [--allow-provider-change]
 #
 #   <client-name>   Name of a clients/<name>/ directory with a filled-in
 #                   src/photo-agent/.env (copy from .env.example first).
@@ -119,6 +147,10 @@
 #                   commands.
 #   --no-restart    Do everything except start the gateway again at the end
 #                   (useful when scripting several steps).
+#   --allow-provider-change
+#                   Explicitly permit the provider/model/credential changes
+#                   described under "No silent provider/credential changes"
+#                   above. Without it those changes are refused.
 #
 # Required environment overrides for testing (both default from real paths
 # when unset, so a normal human invocation needs neither):
@@ -139,7 +171,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<'EOF'
-Usage: install_client.sh <client-name> [--dry-run] [--no-restart]
+Usage: install_client.sh <client-name> [--dry-run] [--no-restart] [--allow-provider-change]
 
 Switches the single active fieldkit install to <client-name>: verifies no
 stale non-default Hermes profile gateway is currently running, stops the
@@ -151,20 +183,33 @@ removed, not merely left alone) from clients/<client-name>/src/photo-agent/.env,
 applies the model/skill config, commits both staged files atomically only
 after that config apply fully succeeds, then starts the gateway again.
 
+Subscription/OAuth providers (e.g. openai-codex) take no API key: leave
+HERMES_PROVIDER_API_KEY blank/absent, and log in once with `hermes auth` first.
+
+Refuses (changing nothing) if the install would change the live
+model.provider/model.default, or write a provider API key that is absent or
+commented-out/disabled in the live Hermes .env, unless --allow-provider-change
+is given. --dry-run prints the same before->after and the same refusal.
+
   --dry-run      Print the plan. Makes ZERO filesystem changes of any kind
                  (no mkdir, no chmod, no lock, no temp file) and runs no
                  hermes/gateway commands.
   --no-restart   Apply config changes but leave the gateway stopped.
+  --allow-provider-change
+                 Permit a provider/model change or (re-)adding a provider
+                 API key that is absent/disabled in the live Hermes .env.
 EOF
 }
 
 DRY_RUN=0
 NO_RESTART=0
+ALLOW_PROVIDER_CHANGE=0
 CLIENT=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --no-restart) NO_RESTART=1 ;;
+    --allow-provider-change) ALLOW_PROVIDER_CHANGE=1 ;;
     -h|--help) usage; exit 0 ;;
     -*)
       echo "ERROR: unknown flag: $arg" >&2
@@ -316,12 +361,32 @@ HERMES_MODEL_PROVIDER="$(get_client_var HERMES_MODEL_PROVIDER "$CLIENT_ENV")"
 HERMES_MODEL_DEFAULT="$(get_client_var HERMES_MODEL_DEFAULT "$CLIENT_ENV")"
 HERMES_PROVIDER_API_KEY="$(get_client_var HERMES_PROVIDER_API_KEY "$CLIENT_ENV")"
 
+# Providers Hermes authenticates via its OWN OAuth store (auth.json), not an
+# API key -- verified against the installed Hermes source
+# (hermes_cli/auth.py): PROVIDER_REGISTRY gives each of these an oauth_*
+# auth_type (openai-codex/xai-oauth/qwen-oauth: oauth_external, nous:
+# oauth_device_code, minimax-oauth: oauth_minimax), and get_auth_status()
+# dispatches each to its own OAuth-store status check, which is what
+# `hermes auth status <provider>` prints. Space-separated, not an array, so
+# it reads cleanly in the bash-3.2 case below.
+SUBSCRIPTION_PROVIDERS="openai-codex nous xai-oauth qwen-oauth minimax-oauth"
+PROVIDER_IS_SUBSCRIPTION=0
+if [ -n "$HERMES_MODEL_PROVIDER" ]; then
+  case " $SUBSCRIPTION_PROVIDERS " in
+    *" $HERMES_MODEL_PROVIDER "*) PROVIDER_IS_SUBSCRIPTION=1 ;;
+  esac
+fi
+
 missing=()
 [ -n "$TELEGRAM_BOT_TOKEN" ] || missing+=("TELEGRAM_BOT_TOKEN")
 [ -n "$TELEGRAM_ALLOWED_USERS" ] || missing+=("TELEGRAM_ALLOWED_USERS")
 [ -n "$HERMES_MODEL_PROVIDER" ] || missing+=("HERMES_MODEL_PROVIDER")
 [ -n "$HERMES_MODEL_DEFAULT" ] || missing+=("HERMES_MODEL_DEFAULT")
-[ -n "$HERMES_PROVIDER_API_KEY" ] || missing+=("HERMES_PROVIDER_API_KEY")
+# An API key is required only for API-key providers; a subscription/OAuth
+# provider has none (see SUBSCRIPTION_PROVIDERS above).
+if [ "$PROVIDER_IS_SUBSCRIPTION" -eq 0 ]; then
+  [ -n "$HERMES_PROVIDER_API_KEY" ] || missing+=("HERMES_PROVIDER_API_KEY")
+fi
 
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "ERROR: $CLIENT_ENV is missing required value(s): ${missing[*]}" >&2
@@ -349,23 +414,42 @@ done
 # unconditionally deleted, not merely left unupdated.
 declare -a ALL_PROVIDER_KEY_VARS=(ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY)
 
+# PROVIDER_KEY_VAR is empty for a subscription/OAuth provider: no key is
+# written to Hermes's .env at all (every managed provider key is still
+# stripped, exactly as for a switch between API-key providers).
+PROVIDER_KEY_VAR=""
 case "$HERMES_MODEL_PROVIDER" in
   anthropic) PROVIDER_KEY_VAR="ANTHROPIC_API_KEY" ;;
   openai-api) PROVIDER_KEY_VAR="OPENAI_API_KEY" ;;
   openrouter) PROVIDER_KEY_VAR="OPENROUTER_API_KEY" ;;
   *)
-    cat >&2 <<EOF
+    if [ "$PROVIDER_IS_SUBSCRIPTION" -eq 0 ]; then
+      cat >&2 <<EOF
 ERROR: unrecognized HERMES_MODEL_PROVIDER='$HERMES_MODEL_PROVIDER' in $CLIENT_ENV
 
 install_client.sh only knows the API-key variable name for: anthropic,
-openai-api, openrouter. Add a case for '$HERMES_MODEL_PROVIDER' to the
+openai-api, openrouter -- and the subscription/OAuth providers (no API key):
+$SUBSCRIPTION_PROVIDERS. Add a case for '$HERMES_MODEL_PROVIDER' to the
 case statement in $0 before using this provider — see
 platform/docs/hermes/09-per-client-model-profiles.md for provider identity
 notes (e.g. why plain "openai" is NOT what you want).
 EOF
-    exit 1
+      exit 1
+    fi
     ;;
 esac
+
+if [ "$PROVIDER_IS_SUBSCRIPTION" -eq 1 ] && [ -n "$HERMES_PROVIDER_API_KEY" ]; then
+  cat >&2 <<EOF
+ERROR: HERMES_PROVIDER_API_KEY is set in $CLIENT_ENV, but
+HERMES_MODEL_PROVIDER='$HERMES_MODEL_PROVIDER' is a subscription/OAuth
+provider -- Hermes authenticates it from its own OAuth store ('hermes auth'),
+not an API key, so the key would be written for nothing. Refusing rather than
+guess which one you meant: delete the HERMES_PROVIDER_API_KEY line (or leave
+it blank) for a subscription provider, or choose an API-key provider instead.
+EOF
+  exit 1
+fi
 
 # --- Skill discovery dirs (issue #81): every FieldKit agent's skills dir,
 # DERIVED from $FIELDKIT_ROOT/platform/*/skills rather than hardcoded.
@@ -396,16 +480,170 @@ if not dirs:
 print(json.dumps(dirs))
 ' "$FIELDKIT_ROOT")"
 
+# --- No silent provider/credential changes (issue #89). Read-only: reads
+# the live config.yaml and Hermes .env, runs no hermes command, so it runs
+# identically under --dry-run. ------------------------------------------------
+#
+# Live model.provider / model.default, via PyYAML. Fails closed if
+# config.yaml exists but can't be read or parsed: an unknown "before" can't
+# be compared, so it can't be proven not to be a change. Only the parse
+# error's TYPE is printed, never the file's content. Output is
+# "<provider>\t<model>" (either may be empty).
+LIVE_PROVIDER=""
+LIVE_MODEL=""
+if [ -e "$HERMES_CONFIG" ]; then
+  _live_model_state="$(python3 -c '
+import sys
+path = sys.argv[1]
+try:
+    import yaml
+except ImportError:
+    sys.exit("ERROR: python3 cannot import yaml (PyYAML), so the live model.provider/model.default in %s cannot be compared with the incoming ones -- refusing to proceed" % path)
+try:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+except Exception as e:
+    sys.exit("ERROR: cannot read/parse %s (%s), so the live model.provider/model.default cannot be compared with the incoming ones -- refusing to proceed" % (path, type(e).__name__))
+model = data.get("model") if isinstance(data, dict) else None
+if isinstance(model, dict):
+    provider, default = model.get("provider"), model.get("default")
+elif isinstance(model, str):
+    provider, default = None, model
+else:
+    provider, default = None, None
+out = []
+for v in (provider, default):
+    v = "" if v is None else str(v)
+    if "\t" in v or "\n" in v or "\r" in v:
+        sys.exit("ERROR: live model.provider/model.default in %s contains a tab/newline -- refusing to proceed" % path)
+    out.append(v)
+print("\t".join(out))
+' "$HERMES_CONFIG")"
+  LIVE_PROVIDER="${_live_model_state%%$'\t'*}"
+  LIVE_MODEL="${_live_model_state#*$'\t'}"
+fi
+LIVE_PROFILE_HAS_MODEL=0
+if [ -n "$LIVE_PROVIDER" ] || [ -n "$LIVE_MODEL" ]; then
+  LIVE_PROFILE_HAS_MODEL=1
+fi
+
+# _live_key_state KEY -- echoes the state of KEY in the live Hermes .env:
+#   active    -- an uncommented KEY=<non-empty> line
+#   disabled  -- no active line, but a commented line assigning it (e.g.
+#                "# KEY=..." or "# disabled 2026-09-22 (...): KEY=...")
+#   absent    -- neither
+# Matches by KEY NAME only; never prints a value.
+_live_key_state() {
+  local key="$1"
+  if [ ! -f "$HERMES_ENV" ]; then
+    echo "absent"; return
+  fi
+  if [ -n "$(get_client_var "$key" "$HERMES_ENV")" ]; then
+    echo "active"; return
+  fi
+  if grep -qE "^[[:space:]]*#(.*[^A-Za-z0-9_])?${key}[[:space:]]*=" "$HERMES_ENV" 2>/dev/null; then
+    echo "disabled"; return
+  fi
+  echo "absent"
+}
+
+# Every change is reported below; only those in gated_changes need
+# --allow-provider-change.
+gated_changes=()
+
+if [ "$LIVE_PROVIDER" = "$HERMES_MODEL_PROVIDER" ]; then
+  _provider_line="$HERMES_MODEL_PROVIDER (unchanged)"
+elif [ -n "$LIVE_PROVIDER" ]; then
+  _provider_line="$LIVE_PROVIDER -> $HERMES_MODEL_PROVIDER  (CHANGE)"
+  gated_changes+=("model.provider: $LIVE_PROVIDER -> $HERMES_MODEL_PROVIDER")
+else
+  _provider_line="(unset) -> $HERMES_MODEL_PROVIDER  (initial set)"
+fi
+if [ "$LIVE_MODEL" = "$HERMES_MODEL_DEFAULT" ]; then
+  _model_line="$HERMES_MODEL_DEFAULT (unchanged)"
+elif [ -n "$LIVE_MODEL" ]; then
+  _model_line="$LIVE_MODEL -> $HERMES_MODEL_DEFAULT  (CHANGE)"
+  gated_changes+=("model.default: $LIVE_MODEL -> $HERMES_MODEL_DEFAULT")
+else
+  _model_line="(unset) -> $HERMES_MODEL_DEFAULT  (initial set)"
+fi
+
+# Per-key before->after for every managed provider key. Values are never
+# printed; for an active key being re-written, only whether the value
+# changes is reported (compared in-shell, never via process argv).
+key_lines=()
+for _k in "${ALL_PROVIDER_KEY_VARS[@]}"; do
+  _state="$(_live_key_state "$_k")"
+  if [ "$_k" = "$PROVIDER_KEY_VAR" ]; then
+    case "$_state" in
+      active)
+        if [ "$(get_client_var "$_k" "$HERMES_ENV")" = "$HERMES_PROVIDER_API_KEY" ]; then
+          key_lines+=("$_k: active -> active (same value)")
+        else
+          key_lines+=("$_k: active -> active (value replaced by this client's key)")
+        fi
+        ;;
+      disabled)
+        key_lines+=("$_k: commented-out/disabled -> ACTIVE  (RE-ENABLE)")
+        gated_changes+=("$_k: commented-out/disabled in $HERMES_ENV -> would be written active")
+        ;;
+      *)
+        if [ "$LIVE_PROFILE_HAS_MODEL" -eq 1 ]; then
+          key_lines+=("$_k: absent -> ACTIVE  (ADD)")
+          gated_changes+=("$_k: absent from $HERMES_ENV -> would be added")
+        else
+          key_lines+=("$_k: absent -> active (initial install; no model configured yet)")
+        fi
+        ;;
+    esac
+  else
+    case "$_state" in
+      active) key_lines+=("$_k: active -> removed (not this provider's key)") ;;
+      disabled) key_lines+=("$_k: commented-out/disabled (left as-is)") ;;
+    esac
+  fi
+done
+
 echo "== install_client.sh: switching the active client to '$CLIENT' =="
 echo "  repo root:               $FIELDKIT_ROOT"
 echo "  root .env:                $ROOT_ENV  (CLIENT_NAME -> $CLIENT)"
 echo "  hermes profile:            default  ($HERMES_ENV)"
-echo "  hermes model:               $HERMES_MODEL_PROVIDER / $HERMES_MODEL_DEFAULT"
-echo "  hermes provider key:        $PROVIDER_KEY_VAR (***, not printed)"
+echo "  hermes model.provider:      $_provider_line"
+echo "  hermes model.default:       $_model_line"
+if [ "$PROVIDER_IS_SUBSCRIPTION" -eq 1 ]; then
+  echo "  hermes provider auth:       subscription/OAuth via Hermes's own auth store — no API key written"
+  echo "                              (real run verifies: hermes -p default auth status $HERMES_MODEL_PROVIDER)"
+else
+  echo "  hermes provider key:        $PROVIDER_KEY_VAR (***, not printed)"
+fi
+for _l in "${key_lines[@]:-}"; do
+  [ -n "$_l" ] && echo "    $_l"
+done
 echo "  telegram bot token:         *** (not printed)"
 echo "  telegram allowed users:     *** (not printed — access-control metadata, not shown even in --dry-run)"
 echo "  skill dirs:                 $SKILL_DIRS_JSON"
 echo
+
+if [ "${#gated_changes[@]}" -gt 0 ]; then
+  if [ "$ALLOW_PROVIDER_CHANGE" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "--allow-provider-change given — a real run WOULD apply these live provider/credential change(s):"
+    else
+      echo "--allow-provider-change given — these live provider/credential change(s) WILL be applied:"
+    fi
+    for _c in "${gated_changes[@]}"; do echo "  - $_c"; done
+    echo
+  else
+    echo "ERROR: refusing to install '$CLIENT' — it would change the live Hermes" >&2
+    echo "provider/model/credential, which this script never does silently:" >&2
+    for _c in "${gated_changes[@]}"; do echo "  - $_c" >&2; done
+    echo >&2
+    echo "Nothing was changed. If this change is intended, re-run with" >&2
+    echo "--allow-provider-change. If it is NOT intended, fix" >&2
+    echo "$CLIENT_ENV to match the live profile instead." >&2
+    exit 1
+  fi
+fi
 
 # --- SECURITY: --dry-run exits HERE, before the first side-effecting line
 # of this script runs (no chmod, no mkdir, no lock, no temp file, no
@@ -413,6 +651,9 @@ echo
 # real, live-state-affecting action. ----------------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "--dry-run: no files written, no permissions changed, no lock taken, no hermes/gateway commands run."
+  if [ "$PROVIDER_IS_SUBSCRIPTION" -eq 1 ]; then
+    echo "--dry-run: the '$HERMES_MODEL_PROVIDER' credential check was NOT run (it is a hermes command); the real run refuses unless 'hermes -p default auth status $HERMES_MODEL_PROVIDER' reports logged in."
+  fi
   exit 0
 fi
 
@@ -800,6 +1041,27 @@ command -v hermes >/dev/null 2>&1 || {
   echo "ERROR: 'hermes' is not on PATH — cannot configure or restart the gateway" >&2
   exit 1
 }
+
+# --- Subscription/OAuth provider: FAIL CLOSED unless Hermes itself reports a
+# credential for it, before any mutation. `hermes auth status <provider>`
+# exits 0 whether logged in or not (hermes_cli/auth_commands.py
+# auth_status_command), so the verdict is its exact "<provider>: logged in"
+# line; anything else (logged out, an error, unrecognized output, a nonzero
+# exit) aborts. `-p default` pins it to the default profile this script
+# manages, so a sticky `hermes profile use <other>` can't make it check the
+# wrong auth store. That command prints only a status line, never a token.
+if [ "$PROVIDER_IS_SUBSCRIPTION" -eq 1 ]; then
+  _auth_rc=0
+  _auth_out="$(HERMES_HOME="$HERMES_HOME" hermes -p default auth status "$HERMES_MODEL_PROVIDER" 2>&1)" || _auth_rc=$?
+  _auth_out="$(printf '%s\n' "$_auth_out" | tr -d '\r')"
+  if [ "$_auth_rc" -ne 0 ] || ! printf '%s\n' "$_auth_out" | grep -qxF "$HERMES_MODEL_PROVIDER: logged in"; then
+    echo "ERROR: Hermes has no valid '$HERMES_MODEL_PROVIDER' credential (checked: hermes -p default auth status $HERMES_MODEL_PROVIDER, exit $_auth_rc):" >&2
+    printf '%s\n' "$_auth_out" | head -n 5 | sed 's/^/  | /' >&2
+    echo "Nothing was changed. Log in to $HERMES_MODEL_PROVIDER with Hermes first (hermes auth / hermes model), then re-run." >&2
+    exit 1
+  fi
+  echo "Verified: Hermes reports '$HERMES_MODEL_PROVIDER: logged in'."
+fi
 mkdir -p "$(dirname "$ROOT_ENV")" "$HERMES_HOME"
 # HERMES_HOME is a credentials-only directory this script owns end to end —
 # safe (and required, security-wise) to lock it down to 0700. dirname(ROOT_ENV)
@@ -882,7 +1144,9 @@ _rebuild_strip_managed_keys "$HERMES_ENV" "$HERMES_ENV_TMP" "$_hermes_managed_ke
 _emit_kv "$HERMES_ENV_TMP" "TELEGRAM_BOT_TOKEN" "$TELEGRAM_BOT_TOKEN"
 _emit_kv "$HERMES_ENV_TMP" "TELEGRAM_ALLOWED_USERS" "$TELEGRAM_ALLOWED_USERS"
 _emit_kv "$HERMES_ENV_TMP" "CLIENT_NAME" "$CLIENT"
-_emit_kv "$HERMES_ENV_TMP" "$PROVIDER_KEY_VAR" "$HERMES_PROVIDER_API_KEY"
+if [ -n "$PROVIDER_KEY_VAR" ]; then
+  _emit_kv "$HERMES_ENV_TMP" "$PROVIDER_KEY_VAR" "$HERMES_PROVIDER_API_KEY"
+fi
 
 chmod 600 "$ROOT_ENV_TMP" "$HERMES_ENV_TMP"
 
@@ -894,13 +1158,26 @@ chmod 600 "$ROOT_ENV_TMP" "$HERMES_ENV_TMP"
 # the actual fix for "fully transactional install": a failure ANYWHERE
 # before the two `mv -f` lines near the bottom of this script means BOTH
 # live .env files remain 100% untouched, not just individually atomic.
-for _f_k in "$ROOT_ENV_TMP:CLIENT_NAME" "$ROOT_ENV_TMP:FIELDKIT_ROOT" \
-            "$HERMES_ENV_TMP:TELEGRAM_BOT_TOKEN" "$HERMES_ENV_TMP:TELEGRAM_ALLOWED_USERS" \
-            "$HERMES_ENV_TMP:CLIENT_NAME" "$HERMES_ENV_TMP:$PROVIDER_KEY_VAR"; do
+_expected_f_k=("$ROOT_ENV_TMP:CLIENT_NAME" "$ROOT_ENV_TMP:FIELDKIT_ROOT"
+               "$HERMES_ENV_TMP:TELEGRAM_BOT_TOKEN" "$HERMES_ENV_TMP:TELEGRAM_ALLOWED_USERS"
+               "$HERMES_ENV_TMP:CLIENT_NAME")
+if [ -n "$PROVIDER_KEY_VAR" ]; then
+  _expected_f_k+=("$HERMES_ENV_TMP:$PROVIDER_KEY_VAR")
+fi
+for _f_k in "${_expected_f_k[@]}"; do
   _f="${_f_k%%:*}"; _k="${_f_k#*:}"
   _count="$(grep -cE "^${_k}=" "$_f")"
   if [ "$_count" -ne 1 ]; then
     echo "ERROR: internal validation failed — staged $_f has $_count line(s) for $_k (expected exactly 1). Aborting before touching any live file." >&2
+    exit 1
+  fi
+done
+# And no OTHER managed provider key may be active in the staged Hermes .env
+# (for a subscription provider: none at all).
+for _k in "${ALL_PROVIDER_KEY_VARS[@]}"; do
+  [ "$_k" = "$PROVIDER_KEY_VAR" ] && continue
+  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${_k}[[:space:]]*=" "$HERMES_ENV_TMP"; then
+    echo "ERROR: internal validation failed — staged $HERMES_ENV_TMP still has an active $_k line. Aborting before touching any live file." >&2
     exit 1
   fi
 done

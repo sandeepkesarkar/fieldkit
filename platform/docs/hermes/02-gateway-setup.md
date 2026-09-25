@@ -122,7 +122,11 @@ retired — it was the direct root cause of issue #59. See
 the current model: exactly one client installed at a time, via
 `platform/photo-agent/scripts/install_client.sh`, using Hermes's single
 default profile only. The paragraph below is left as historical record of
-what was tried and why it didn't hold up.
+what was tried and why it didn't hold up. (Since issue #89 the live default
+profile may instead be on a subscription/OAuth provider such as
+`openai-codex` with no API key in `~/.hermes/.env`; `install_client.sh`
+supports that and refuses to change the live provider without
+`--allow-provider-change` — see doc 09.)
 
 Per-client provider isolation used one **Hermes profile per client**
 (`hermes profile create <client>`, `hermes -p <client> config set
