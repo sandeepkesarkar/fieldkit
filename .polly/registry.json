@@ -1,0 +1,31 @@
+{
+  "tasks": [
+    {
+      "id": "instagram-video-upload",
+      "unit": "clients/_demo",
+      "feature": "clients/_demo/.specify/005-instagram-video-upload",
+      "branch": "002-instagram-video-upload",
+      "worktree": ".worktrees/instagram-video-upload",
+      "pr": "https://github.com/sandeepkesarkar/fieldkit/pull/72",
+      "implementer": {"agent": "claude_code", "vendor": "anthropic", "session_title": "instagram-video-upload"},
+      "reviewer": {"agent": "codex", "vendor": "openai", "session_title": "review-instagram-video-upload"},
+      "status": "ready_for_human_merge",
+      "review_rounds": 3,
+      "blocking_findings_resolved": [
+        "cross-platform local video file deleted by one platform's cron before the other platform's job ran, causing silent permanent failure with no alert (fixed via tools/upload_cleanup.py + has_outstanding_job() last-resolver coordination)",
+        "Drive share-link revocation failure was swallowed and the job marked published anyway, leaving a customer video's public link potentially dangling forever (fixed via durable pending_share_cleanups state + unconditional per-tick drain + 24h re-escalation alerts)",
+        "Telegram confirmation link was built from the raw Graph API media ID (invalid instagram.com/p/ URL), not a real permalink (fixed via instagram_api.get_media_permalink())"
+      ],
+      "independently_verified_by_orchestrator": {
+        "pytest_gate": "cd platform/photo-agent && python3 -m pytest tests/ -v -- final: 917 passed, 8 failed, 9 errors, 2 skipped (936 collected); baseline on main: 561 passed, 8 failed, 9 errors (580 collected); failing set byte-identical to baseline across all 3 review rounds (pre-existing, environment-caused: broken local ffmpeg/libx265 dylib, and a hardcoded ~/src/fieldkit path in test_process_photos_skill_timeout_fallback.py -- unrelated to this feature)",
+        "no_committed_secrets": "git ls-files | grep '\\.env$' returned empty on the PR branch; only .env.example files (clients/_demo, clients/venus) were touched"
+      },
+      "known_non_blocking_followups": [
+        "no repo-wide budget/cost-guard mechanism exists anywhere (pre-existing gap, not introduced by this feature; FR-015 holds vacuously since this feature makes zero AI/LLM calls) -- plan.md's claim of an 'existing shared budget-guard check' should be corrected, no such mechanism was found",
+        "no focused regression test proves two successive empty _read() results in facebook_state.py/instagram_state.py return independent list objects (deepcopy fix is correct but under-tested in isolation)"
+      ],
+      "human_action": "review and merge PR #72 on GitHub -- polly does not merge PRs",
+      "updated": "2026-08-31"
+    }
+  ]
+}

@@ -75,7 +75,7 @@ live:**
    recognizes.
 3. Verify:
    ```bash
-   grep '^CLIENT_NAME=' ~/src/fieldkit/.env        # expect CLIENT_NAME=venus
+   grep '^CLIENT_NAME=' "$(git rev-parse --show-toplevel)/.env"   # expect CLIENT_NAME=venus
    hermes doctor                                    # OpenAI API key check should pass
    hermes skills list --source local                # process-photos, photo-approve, photo-reject, all local/enabled
    ```

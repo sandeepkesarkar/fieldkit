@@ -52,12 +52,8 @@ Permanent clients:
 - `_demo` — full pipeline (video → Telegram approval → Facebook)
 - `_construction_co` — scoped pipeline (video → Telegram approval only, no Facebook)
 
-**_demo Feature 005 — Instagram Video Upload: IMPLEMENTATION COMPLETE (T000–T021).**
-Spec: [`clients/_demo/.specify/005-instagram-video-upload/spec.md`](clients/_demo/.specify/005-instagram-video-upload/spec.md)
-Plan: [`clients/_demo/.specify/005-instagram-video-upload/plan.md`](clients/_demo/.specify/005-instagram-video-upload/plan.md)
-Branch: `002-instagram-video-upload`
-Tasks: [`clients/_demo/.specify/005-instagram-video-upload/tasks.md`](clients/_demo/.specify/005-instagram-video-upload/tasks.md)
-Status: All 22 tasks complete; 840 tests collected, 821 passing (up from 580/561). Started ahead of the original "next after Platform 002 adversarial review passes" ordering, per explicit human decision on 2026-08-31. Platform 002 closeout (T040–T042 live two-client isolation run, T050 adversarial review) remains outstanding and is tracked separately — not a blocker for Feature 005's own implementation.
-
-Remaining for Feature 005: live run against a real linked Instagram account (`check_instagram_connection.py` + one real approval), and cron installation for `upload_instagram.py` — both deployment-time steps, not repo changes.
+**_demo Feature 005 — Instagram Video Upload: IMPLEMENTATION COMPLETE, READY FOR HUMAN MERGE (T000–T021).**
+Spec/tasks: [`clients/_demo/.specify/005-instagram-video-upload/`](clients/_demo/.specify/005-instagram-video-upload/) (on branch `002-instagram-video-upload`, not yet merged to `main`)
+**PR**: https://github.com/sandeepkesarkar/fieldkit/pull/72 (open)
+Status: Implemented by claude_code, cross-reviewed by codex (different vendor) across 3 rounds — 3 blocking findings (cross-platform file-deletion race, Drive share-link revocation-failure-swallowed, invalid Instagram permalink) all fixed and re-verified; final verdict PASS. 936 tests collected / 917 passing on the branch vs. 580/561 on `main`, zero regressions. Orchestration record: `.polly/registry.json`. Started ahead of the original "next after Platform 002 adversarial review passes" ordering, per explicit human decision on 2026-08-31; Platform 002 closeout (T040–T042 live two-client isolation run, T050 adversarial review) remains outstanding and untouched by this feature. Human action needed: review and merge PR #72.
 <!-- SPECKIT END -->
