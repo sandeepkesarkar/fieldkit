@@ -15,6 +15,10 @@ _get_access_token() exchanges the stored refresh_token for a short-lived
 access_token via the OAuth2 token endpoint on every call.
 
 Raises RuntimeError on HTTP error, missing credentials, or malformed JSON.
+
+Feature 005 adds create_temporary_share_link() / revoke_share_link(), the only
+functions here that make a file publicly reachable. See their docstrings for why
+that exposure is needed and how it is bounded.
 """
 
 import json
@@ -325,3 +329,160 @@ def delete(file_id: str) -> None:
 def folder_link(folder_id: str) -> str:
     """Return the web link to a Drive folder."""
     return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+# ---------------------------------------------------------------------------
+# Temporary public share links (Feature 005 — Instagram video_url)
+# ---------------------------------------------------------------------------
+#
+# Instagram's media-container endpoint does not accept uploaded bytes: it takes a
+# video_url that Instagram's own servers fetch. The Mac Mini has no public web
+# server, so the approved video is briefly published through Drive — the
+# framework's already-sanctioned host for client-approved media — and unshared
+# again as soon as Instagram has ingested it.
+#
+# The exposure this creates is deliberately bounded: it covers ONE
+# already-approved, already-metadata-stripped video (the same asset the Facebook
+# upload posts — never a re-processed copy), the link is created immediately
+# before the container call, and upload_instagram.py revokes it on every exit
+# path, success or failure. Nothing else in the pipeline uses these functions.
+#
+# The permission granted is {"role": "reader", "type": "anyone"} with
+# allowFileDiscovery left unset, which means link-access only: the file is not
+# search-discoverable, and someone would have to hold the URL to reach it. That is
+# a meaningful limit, but it is still UNAUTHENTICATED access to a client's video,
+# so the real bound has to be time, not obscurity.
+#
+# Why that bound is not an expiring permission: the Drive API's
+# permissions.expirationTime field cannot be used here. It is restricted to user
+# and group permissions — an "anyone" permission cannot carry one — so there is no
+# server-side way to make an anonymous link self-destruct. The bound is therefore
+# enforced by FieldKit instead, and enforced BEFORE the exposure exists rather than
+# after: create_temporary_share_link() hands the caller the file id through
+# on_file_id the moment the file is uploaded and before any permission is granted,
+# so a durable cleanup obligation is recorded while the file is still private. See
+# upload_instagram.py's _create_share_link(); the maximum exposure becomes one
+# attempt plus one cron tick, even if this process dies at the worst moment.
+
+
+def create_temporary_share_link(video_path, on_file_id=None) -> str:
+    """Upload video_path to Drive, make it link-readable, and return a fetchable URL.
+
+    The returned URL is suitable for Instagram's video_url parameter — reachable
+    without credentials. The caller MUST pair this with revoke_share_link() on every
+    exit path, and should get the file id from on_file_id below rather than from the
+    returned URL — only the hook fires on the paths where this function raises.
+
+    on_file_id, if given, is called with the new file's id AFTER the upload and
+    BEFORE the public permission is granted. It exists to close a window that the
+    return value alone cannot: the file id is knowable before the file is public,
+    but a caller that only learns it from the returned URL learns nothing if the
+    permission POST succeeds server-side and its response is then lost to a timeout
+    or a crash. The permission would exist, this function would raise, and the
+    caller would hold no id to revoke — an untracked public link, forever. A caller
+    that records its cleanup obligation in on_file_id can always revoke, including
+    for a file that never actually became public (revoking nothing is a no-op).
+
+    A raising on_file_id aborts before the file is ever shared, deliberately: a
+    caller that cannot record the obligation must not be handed the exposure.
+
+    Raises:
+        FileNotFoundError — video_path does not exist.
+        RuntimeError — DRIVE_ROOT_FOLDER_ID unset, or the upload/permission call failed.
+            Never returns a URL that isn't actually shared.
+    """
+    import os
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"create_temporary_share_link: local file not found: {video_path}")
+
+    parent_id = os.environ.get("DRIVE_ROOT_FOLDER_ID", "")
+    if not parent_id:
+        raise RuntimeError(
+            "DRIVE_ROOT_FOLDER_ID is not set — add it to your client .env file"
+        )
+
+    file_id = upload(video_path, parent_id, video_path.name, content_type="video/mp4")
+
+    # The file exists but is still private. This is the only moment at which the
+    # caller can be told the id with a guarantee that nothing public has been
+    # created yet, so the obligation is registered here rather than on return.
+    if on_file_id is not None:
+        on_file_id(file_id)
+
+    access_token = _get_access_token()
+    try:
+        resp = requests.post(
+            f"{_DRIVE_FILES_URL}/{file_id}/permissions",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+            },
+            data=json.dumps({"role": "reader", "type": "anyone"}),
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive share permission request failed: {exc}") from exc
+    if not resp.ok:
+        raise RuntimeError(f"Drive share permission failed: HTTP {resp.status_code}")
+
+    logger.info("create_temporary_share_link: file_id=%s", file_id)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+def revoke_share_link(file_id: str) -> None:
+    """Remove every public ("anyone") permission from a Drive file.
+
+    Deliberately loud rather than best-effort: a silently failed revoke leaves a
+    client's video publicly reachable indefinitely, which is exactly the state this
+    feature promises not to leave behind. The caller logs and carries on, but it has
+    to know it happened.
+
+    Raises RuntimeError if the permissions cannot be listed or a delete fails.
+    """
+    data = _drive_get(f"{_DRIVE_FILES_URL}/{file_id}/permissions", {
+        "fields": "permissions(id,type)",
+    })
+    access_token = _get_access_token()
+    for permission in data.get("permissions", []):
+        if permission.get("type") != "anyone":
+            continue
+        permission_id = permission.get("id")
+        try:
+            resp = requests.delete(
+                f"{_DRIVE_FILES_URL}/{file_id}/permissions/{permission_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(
+                f"Drive revoke share link request failed for file {file_id}: {exc}"
+            ) from exc
+        # 204 No Content is the success response for a permission delete.
+        if not resp.ok and resp.status_code != 204:
+            raise RuntimeError(
+                f"Drive revoke share link failed for file {file_id}: HTTP {resp.status_code}"
+            )
+        logger.info("revoke_share_link: file_id=%s permission_id=%s", file_id, permission_id)
+
+
+def extract_file_id(share_link: str) -> str:
+    """Return the Drive file id embedded in a create_temporary_share_link() URL.
+
+    For a caller that holds nothing but the URL. A caller that is CREATING the link
+    should take the id from create_temporary_share_link()'s on_file_id hook instead:
+    this function can only run once a URL has been returned, and the case that matters
+    most — the share call raising after the permission was actually created — never
+    returns one. upload_instagram.py uses the hook for exactly that reason.
+
+    Kept because the seam is real: create_temporary_share_link() returns a URL (that's
+    what Instagram needs) while revoke_share_link() takes a file id, and crossing that
+    seam deserves a documented function rather than ad-hoc string slicing at a call site.
+
+    Raises ValueError if the URL carries no id parameter.
+    """
+    from urllib.parse import parse_qs, urlparse
+    file_ids = parse_qs(urlparse(share_link).query).get("id", [])
+    if not file_ids or not file_ids[0]:
+        raise ValueError(f"extract_file_id: no Drive file id in URL: {share_link!r}")
+    return file_ids[0]

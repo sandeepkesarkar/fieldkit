@@ -211,3 +211,49 @@ def test_success_prints_confirmation(base, capsys):
     main(["--page-id", _PAGE_ID])
     out = capsys.readouterr().out
     assert "complete" in out.lower() or "written" in out.lower() or "token" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# --instagram: additive, opt-in Instagram publishing scopes (Feature 005)
+# ---------------------------------------------------------------------------
+
+_INSTAGRAM_SCOPES = ("instagram_basic", "instagram_content_publish")
+_PAGES_SCOPES = ("pages_show_list", "pages_read_engagement", "pages_manage_posts")
+
+
+def test_instagram_flag_adds_the_instagram_publishing_scopes(base, capsys):
+    """--instagram requests the two scopes Instagram publishing needs."""
+    main(["--page-id", _PAGE_ID, "--instagram"])
+    out = capsys.readouterr().out
+    for scope in _INSTAGRAM_SCOPES:
+        assert scope in out, f"Missing scope in URL: {scope}"
+
+
+def test_instagram_flag_keeps_every_pages_scope(base, capsys):
+    """Additive, never a replacement: Facebook publishing must keep working."""
+    main(["--page-id", _PAGE_ID, "--instagram"])
+    out = capsys.readouterr().out
+    for scope in _PAGES_SCOPES:
+        assert scope in out, f"Missing scope in URL: {scope}"
+
+
+def test_default_run_requests_no_instagram_scopes(base, capsys):
+    """Without the flag the request is unchanged.
+
+    Meta rejects scopes the app has not enabled ("Invalid Scopes"), so requesting these
+    by default would break the only Facebook reconnect path on an app not set up for
+    Instagram.
+    """
+    main(["--page-id", _PAGE_ID])
+    out = capsys.readouterr().out
+    for scope in _INSTAGRAM_SCOPES:
+        assert scope not in out, f"Unexpected scope in default URL: {scope}"
+
+
+def test_instagram_flag_passes_the_combined_scope_list_to_the_url_builder(base):
+    """Checks the list actually handed to the builder, not just the printed text."""
+    import scripts.generate_auth_link as gal
+    build = base.spy(gal.facebook_api, "build_auth_url")
+    main(["--page-id", _PAGE_ID, "--instagram"])
+    scopes = build.call_args.args[2]
+    assert list(scopes) == list(_PAGES_SCOPES) + list(_INSTAGRAM_SCOPES)

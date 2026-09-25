@@ -147,3 +147,44 @@ def test_concurrent_mixed_calls_do_not_corrupt_file(valid_record):
     assert not errors, f"Errors in threads: {errors}"
     data = json.loads(state.STATE_FILE.read_text())
     assert data["pending_approval"] in (valid_record, None)
+
+
+# ---------------------------------------------------------------------------
+# Torn or truncated state fails CLOSED (mirrors tools/instagram_state.py)
+# ---------------------------------------------------------------------------
+#
+# state.py shares the same in-place write pattern. Here the value at risk is
+# pending_approval: the record of a video a human is still deciding about, which
+# reading an empty file as fresh state would silently discard.
+
+def test_an_absent_state_file_is_fresh_state():
+    assert state.STATE_FILE.exists() is False
+    assert state.get_pending_approval() is None
+
+
+def test_a_present_but_zero_length_state_file_fails_closed():
+    state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    state.STATE_FILE.write_text("")
+    with pytest.raises(RuntimeError, match="present but empty"):
+        state.get_pending_approval()
+
+
+def test_malformed_json_fails_closed():
+    state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    state.STATE_FILE.write_text('{"pending_approval": {"proj')
+    with pytest.raises(RuntimeError, match="corrupt"):
+        state.get_pending_approval()
+
+
+def test_an_object_with_no_recognised_keys_fails_closed():
+    state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    state.STATE_FILE.write_text("{}")
+    with pytest.raises(RuntimeError, match="does not look like state"):
+        state.get_pending_approval()
+
+
+def test_a_declining_writer_never_leaves_a_zero_length_file():
+    state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    state.clear_pending_approval()
+    assert state.STATE_FILE.exists()
+    assert state.STATE_FILE.stat().st_size > 0

@@ -29,6 +29,7 @@ before reading and release it after writing, mirroring the pattern in state.py.
 FB_APP_SECRET is never stored here. Sensitive token values are never logged.
 """
 
+import copy
 import fcntl
 import json
 import logging
@@ -54,6 +55,7 @@ __all__ = [
     "mark_failed",
     "is_published",
     "find_published",
+    "has_outstanding_job",
 ]
 
 _REQUIRED_UPLOAD_KEYS = frozenset({
@@ -79,17 +81,40 @@ _DEFAULTS = {
 _PUBLISH_HISTORY_LIMIT = 100
 
 
+_KNOWN_TOP_LEVEL_KEYS = frozenset(_DEFAULTS)
+
+
 def _read(file_obj) -> dict:
-    """Read and parse facebook_state.json from an open, locked file object."""
+    """Read and parse facebook_state.json from an open, locked file object.
+
+    FAILS CLOSED on anything that is not recognisably this file, matching
+    tools/instagram_state.py — see its _read() for the full reasoning. An ABSENT file
+    legitimately means a fresh client; a PRESENT ZERO-LENGTH one cannot arise in normal
+    operation, because _write() always writes content before it truncates and
+    _open_for_write() initialises a file it creates. What is left is an external
+    truncation or a crash between creating the file and initialising it, and reading
+    either as "nothing was ever recorded" would silently discard published_idempotency_keys
+    — the list that stops a re-approval from posting the same video twice.
+    """
     file_obj.seek(0)
     content = file_obj.read()
     if not content:
-        return dict(_DEFAULTS)
+        raise RuntimeError(
+            "facebook_state.json is present but empty — an interrupted write, or a file "
+            "created and never initialised. Refusing to read it as fresh state. If this "
+            "client has never published, delete the file; otherwise restore it."
+        )
     try:
-        return json.loads(content)
+        data = json.loads(content)
     except json.JSONDecodeError as exc:
         logger.warning("facebook_state.json is corrupt: %s", exc)
         raise RuntimeError("facebook_state.json is corrupt — delete or restore it manually") from exc
+    if not isinstance(data, dict) or not (_KNOWN_TOP_LEVEL_KEYS & set(data)):
+        raise RuntimeError(
+            "facebook_state.json parsed but does not look like state (no recognised "
+            "top-level keys) — delete or restore it manually"
+        )
+    return data
 
 
 def _write(file_obj, data: dict) -> None:
@@ -104,8 +129,21 @@ def _write(file_obj, data: dict) -> None:
 
 def _open_for_write():
     """Open facebook_state.json for read+write, creating it if absent."""
-    fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT, 0o644)
-    return os.fdopen(fd_no, "r+")
+    try:
+        fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return os.fdopen(os.open(STATE_FILE, os.O_RDWR, 0o644), "r+")
+    # Newly created: initialise it immediately, under the same exclusive lock the caller
+    # is about to take. A caller that locks and then decides not to write would otherwise
+    # leave a zero-length file, which _read() refuses because it cannot be told apart from
+    # an interrupted write.
+    f = os.fdopen(fd_no, "r+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        _write(f, copy.deepcopy(_DEFAULTS))
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return f
 
 
 def get_pending_upload() -> dict | None:
@@ -372,6 +410,24 @@ def find_published(project_name: str) -> dict | None:
         if entry.get("project_name") == project_name:
             return entry
     return None
+
+
+def has_outstanding_job(idempotency_key: str) -> bool:
+    """Return True if a job for idempotency_key is still awaiting resolution.
+
+    "Outstanding" means a pending record with this key is still sitting in the file —
+    enqueued, mid-retry, or claimed and in flight. Everything else is terminal: a
+    published job, a terminally-failed job, and a job that was never enqueued all clear
+    (or never create) the pending record, and all read as False here.
+
+    Added for Feature 005's cross-platform cleanup coordination: the approved video file
+    on disk is shared by the Facebook and Instagram upload jobs, so neither may delete it
+    while the other still has work to do for the same approval. See tools/upload_cleanup.py
+    — callers should go through that rather than calling this directly, so the "is that
+    platform even enabled for this client" half of the question isn't forgotten.
+    """
+    record = get_pending_upload()
+    return record is not None and record.get("idempotency_key") == idempotency_key
 
 
 def is_published(idempotency_key: str) -> bool:

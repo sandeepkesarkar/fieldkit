@@ -11,15 +11,19 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from tools.drive import (
     DriveFolderNotFoundError,
     create_folder,
+    create_temporary_share_link,
     delete,
     download,
+    extract_file_id,
     find_folder,
     folder_link,
     list_photos,
+    revoke_share_link,
     upload,
 )
 
@@ -429,3 +433,325 @@ def test_upload_defaults_to_video_mp4(tmp_path):
 
     headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args.args[1]
     assert headers["X-Upload-Content-Type"] == "video/mp4"
+
+
+# ---------------------------------------------------------------------------
+# Feature 005 — temporary share links for Instagram's video_url requirement
+# ---------------------------------------------------------------------------
+
+_FILE_ID = "drive_file_abc123"
+
+
+@pytest.fixture
+def share_env(monkeypatch):
+    """DRIVE_ROOT_FOLDER_ID must be configured for share-link creation."""
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root_folder_1")
+
+
+@pytest.fixture
+def video_file(tmp_path):
+    """A real on-disk file so upload()'s existence check passes."""
+    p = tmp_path / "kitchen_remodel.mp4"
+    p.write_bytes(b"fake mp4 bytes")
+    return p
+
+
+# --- create_temporary_share_link ---
+
+def test_create_temporary_share_link_returns_fetchable_url(mocker, share_env, video_file):
+    """Returns a URL containing the uploaded file's ID, usable as Instagram's video_url."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    url = create_temporary_share_link(video_file)
+    assert url.startswith("https://")
+    assert _FILE_ID in url
+
+
+def test_create_temporary_share_link_sets_anyone_reader_permission(mocker, share_env, video_file):
+    """Grants exactly an anyone/reader permission — Instagram fetches the URL unauthenticated."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    post = mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    create_temporary_share_link(video_file)
+    args, kwargs = post.call_args
+    assert f"/files/{_FILE_ID}/permissions" in args[0]
+    body = json.loads(kwargs["data"])
+    assert body == {"role": "reader", "type": "anyone"}
+
+
+def test_create_temporary_share_link_uploads_into_the_root_folder(mocker, share_env, video_file):
+    """The video is uploaded under DRIVE_ROOT_FOLDER_ID with video/mp4 content type."""
+    up = mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    create_temporary_share_link(video_file)
+    args, kwargs = up.call_args
+    assert args[1] == "root_folder_1"
+    assert kwargs.get("content_type", "video/mp4") == "video/mp4"
+
+
+def test_create_temporary_share_link_raises_when_file_missing(share_env, tmp_path):
+    """A missing local video raises rather than producing a dead link."""
+    with pytest.raises(FileNotFoundError):
+        create_temporary_share_link(tmp_path / "nope.mp4")
+
+
+def test_create_temporary_share_link_raises_without_root_folder(monkeypatch, video_file):
+    """An unconfigured DRIVE_ROOT_FOLDER_ID is a clear error, not a silent no-op."""
+    monkeypatch.delenv("DRIVE_ROOT_FOLDER_ID", raising=False)
+    with pytest.raises(RuntimeError, match="DRIVE_ROOT_FOLDER_ID"):
+        create_temporary_share_link(video_file)
+
+
+def test_create_temporary_share_link_raises_on_permission_http_error(mocker, share_env, video_file):
+    """A failed permission call raises — never returns an unreachable URL."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", return_value=_err_response(403))
+
+    with pytest.raises(RuntimeError, match="share permission"):
+        create_temporary_share_link(video_file)
+
+
+def test_create_temporary_share_link_raises_on_network_error(mocker, share_env, video_file):
+    """A network failure while sharing raises RuntimeError, not a bare requests error."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", side_effect=requests.exceptions.ConnectionError("down"))
+
+    with pytest.raises(RuntimeError, match="share permission"):
+        create_temporary_share_link(video_file)
+
+
+def test_create_temporary_share_link_propagates_upload_failure(mocker, share_env, video_file):
+    """An upload failure is not swallowed into a bogus link."""
+    mocker.patch("tools.drive.upload", side_effect=RuntimeError("Drive upload failed: HTTP 500"))
+    with pytest.raises(RuntimeError, match="Drive upload failed"):
+        create_temporary_share_link(video_file)
+
+
+# --- revoke_share_link ---
+
+def test_revoke_share_link_deletes_anyone_permissions(mocker):
+    """revoke_share_link() removes every anyone-type permission on the file."""
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("tools.drive._drive_get", return_value={
+        "permissions": [
+            {"id": "owner_perm", "type": "user"},
+            {"id": "anyoneWithLink", "type": "anyone"},
+        ]
+    })
+    delete_req = mocker.patch("requests.delete", return_value=_ok_response({}))
+
+    revoke_share_link(_FILE_ID)
+    assert delete_req.call_count == 1
+    assert f"/files/{_FILE_ID}/permissions/anyoneWithLink" in delete_req.call_args.args[0]
+
+
+def test_revoke_share_link_leaves_owner_permission_alone(mocker):
+    """Only the public permission is revoked — the file itself stays owned and intact."""
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("tools.drive._drive_get", return_value={
+        "permissions": [{"id": "owner_perm", "type": "user"}]
+    })
+    delete_req = mocker.patch("requests.delete", return_value=_ok_response({}))
+
+    revoke_share_link(_FILE_ID)
+    delete_req.assert_not_called()
+
+
+def test_revoke_share_link_accepts_204(mocker):
+    """Drive's 204 No Content is the success response for a permission delete."""
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("tools.drive._drive_get", return_value={
+        "permissions": [{"id": "anyoneWithLink", "type": "anyone"}]
+    })
+    resp = MagicMock()
+    resp.ok = False
+    resp.status_code = 204
+    mocker.patch("requests.delete", return_value=resp)
+
+    revoke_share_link(_FILE_ID)  # must not raise
+
+
+def test_revoke_share_link_raises_on_http_error(mocker):
+    """A failed revoke raises rather than silently leaving the video publicly reachable."""
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("tools.drive._drive_get", return_value={
+        "permissions": [{"id": "anyoneWithLink", "type": "anyone"}]
+    })
+    mocker.patch("requests.delete", return_value=_err_response(500))
+
+    with pytest.raises(RuntimeError, match="revoke"):
+        revoke_share_link(_FILE_ID)
+
+
+def test_revoke_share_link_raises_on_network_error(mocker):
+    """A network failure while revoking raises RuntimeError, not a bare requests error."""
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("tools.drive._drive_get", return_value={
+        "permissions": [{"id": "anyoneWithLink", "type": "anyone"}]
+    })
+    mocker.patch("requests.delete", side_effect=requests.exceptions.ConnectionError("down"))
+
+    with pytest.raises(RuntimeError, match="revoke"):
+        revoke_share_link(_FILE_ID)
+
+
+def test_revoke_share_link_propagates_list_failure(mocker):
+    """A failure listing permissions is surfaced, not treated as 'nothing to revoke'."""
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("tools.drive._drive_get", side_effect=RuntimeError("Drive GET failed: HTTP 500"))
+    with pytest.raises(RuntimeError, match="Drive GET failed"):
+        revoke_share_link(_FILE_ID)
+
+
+# --- extract_file_id ---
+
+def test_extract_file_id_round_trips_with_create(mocker, share_env, video_file):
+    """The URL create_temporary_share_link() returns yields its file id back."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    url = create_temporary_share_link(video_file)
+    assert extract_file_id(url) == _FILE_ID
+
+
+def test_extract_file_id_raises_on_unrecognized_url():
+    """A URL with no id parameter is an error, not a silently wrong file id."""
+    with pytest.raises(ValueError, match="file id"):
+        extract_file_id("https://example.com/not-a-drive-link")
+
+
+# --- Import-time requests availability (shared by both helpers) ---
+
+def test_share_helpers_never_log_the_access_token(mocker, share_env, video_file, caplog):
+    """Neither helper writes the Drive access token into log output."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="super_secret_drive_token")
+    mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+    mocker.patch("tools.drive._drive_get", return_value={
+        "permissions": [{"id": "anyoneWithLink", "type": "anyone"}]
+    })
+    mocker.patch("requests.delete", return_value=_ok_response({}))
+
+    with caplog.at_level("DEBUG"):
+        url = create_temporary_share_link(video_file)
+        revoke_share_link(extract_file_id(url))
+    assert "super_secret_drive_token" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# create_temporary_share_link's on_file_id hook
+# ---------------------------------------------------------------------------
+#
+# The window this closes: the permission POST succeeds server-side and its response
+# is then lost to a timeout or a crash. The permission is real, the call raises, and
+# a caller that only learns the file id from the returned URL learns nothing — an
+# untracked public link with nothing left that could ever revoke it. The file id is
+# knowable BEFORE any of that, so the hook hands it over then.
+
+def test_on_file_id_is_called_with_the_new_file_id(mocker, share_env, video_file):
+    """The caller is told the id, not left to parse it back out of the URL."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    seen = []
+    create_temporary_share_link(video_file, on_file_id=seen.append)
+    assert seen == [_FILE_ID]
+
+
+def test_on_file_id_fires_before_the_file_is_made_public(mocker, share_env, video_file):
+    """The ordering IS the guarantee: the obligation is recorded while it is still private.
+
+    Firing after the permission call would reintroduce exactly the window the hook
+    exists to close, so the test asserts the sequence rather than just the value.
+    """
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+
+    events = []
+    mocker.patch(
+        "requests.post",
+        side_effect=lambda *a, **k: (
+            events.append("permission_granted"), _ok_response({"id": "anyoneWithLink"})
+        )[1],
+    )
+    create_temporary_share_link(
+        video_file, on_file_id=lambda fid: events.append("obligation_recorded")
+    )
+    assert events == ["obligation_recorded", "permission_granted"]
+
+
+def test_on_file_id_fires_even_when_the_permission_call_then_fails(mocker, share_env, video_file):
+    """The ambiguous case: the permission may or may not exist, and the caller must be able to revoke.
+
+    This is the whole point. The call raises, so nothing is returned — but the id has
+    already been handed over, so the caller can still revoke. Revoking a file that never
+    actually became public is a harmless no-op.
+    """
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", side_effect=requests.exceptions.Timeout("response lost"))
+
+    seen = []
+    with pytest.raises(RuntimeError):
+        create_temporary_share_link(video_file, on_file_id=seen.append)
+    assert seen == [_FILE_ID]
+
+
+def test_a_raising_on_file_id_aborts_before_the_file_is_shared(mocker, share_env, video_file):
+    """A caller that cannot record the obligation must not be handed the exposure."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    post = mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    def _cannot_record(_file_id):
+        raise RuntimeError("state file is unwritable")
+
+    with pytest.raises(RuntimeError):
+        create_temporary_share_link(video_file, on_file_id=_cannot_record)
+    post.assert_not_called()
+
+
+def test_on_file_id_is_optional(mocker, share_env, video_file):
+    """Existing callers that do not pass a hook are unaffected."""
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+    assert _FILE_ID in create_temporary_share_link(video_file)
+
+
+def test_on_file_id_is_not_called_when_the_upload_itself_fails(mocker, share_env, video_file):
+    """No file, no obligation — recording one would leave an entry nothing can clear."""
+    mocker.patch("tools.drive.upload", side_effect=RuntimeError("Drive upload failed: HTTP 500"))
+    seen = []
+    with pytest.raises(RuntimeError):
+        create_temporary_share_link(video_file, on_file_id=seen.append)
+    assert seen == []
+
+
+def test_the_anyone_permission_carries_no_expiration_time(mocker, share_env, video_file):
+    """Pins WHY cleanup is enforced in FieldKit rather than by Drive.
+
+    The Drive API restricts permissions.expirationTime to user and group permissions, so
+    an anonymous link cannot be made to self-destruct server-side. If a future change adds
+    an expirationTime here it would be silently ignored by Drive while looking like a
+    bound — this asserts we are not pretending to have one.
+    """
+    mocker.patch("tools.drive.upload", return_value=_FILE_ID)
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    post = mocker.patch("requests.post", return_value=_ok_response({"id": "anyoneWithLink"}))
+
+    create_temporary_share_link(video_file)
+    body = json.loads(post.call_args[1]["data"])
+    assert body == {"role": "reader", "type": "anyone"}
+    assert "expirationTime" not in body
+    # allowFileDiscovery left unset keeps this link-access rather than search-discoverable.
+    assert "allowFileDiscovery" not in body

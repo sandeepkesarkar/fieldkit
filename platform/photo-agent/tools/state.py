@@ -17,6 +17,7 @@ the offset field and its accessors are gone. See
 platform/docs/hermes/10-text-based-approval-migration.md.
 """
 
+import copy
 import fcntl
 import json
 import logging
@@ -50,18 +51,39 @@ _REQUIRED_APPROVAL_KEYS = frozenset({
 _DEFAULTS = {"pending_approval": None}
 
 
+_KNOWN_TOP_LEVEL_KEYS = frozenset(_DEFAULTS)
+
+
 def _read(file_obj) -> dict:
-    """Read and parse state.json from an open, locked file object."""
+    """Read and parse state.json from an open, locked file object.
+
+    FAILS CLOSED on anything that is not recognisably this file, matching
+    tools/instagram_state.py — see its _read() for the full reasoning. An ABSENT file
+    legitimately means a fresh client; a PRESENT ZERO-LENGTH one cannot arise in normal
+    operation, because _write() always writes content before it truncates and
+    _open_for_write() initialises a file it creates. What is left is an external
+    truncation or a crash between creating the file and initialising it, and reading
+    either as "nothing was ever recorded" would silently discard pending_approval — the record of a video a human is still deciding about.
+    """
     file_obj.seek(0)
     content = file_obj.read()
     if not content:
-        logger.debug("state.json is empty — using defaults")
-        return dict(_DEFAULTS)
+        raise RuntimeError(
+            "state.json is present but empty — an interrupted write, or a file created "
+            "and never initialised. Refusing to read it as fresh state. If nothing is "
+            "awaiting approval, delete the file; otherwise restore it."
+        )
     try:
-        return json.loads(content)
+        data = json.loads(content)
     except json.JSONDecodeError as exc:
         logger.warning("state.json is corrupt and cannot be parsed: %s", exc)
         raise RuntimeError("state.json is corrupt — delete or restore it manually") from exc
+    if not isinstance(data, dict) or not (_KNOWN_TOP_LEVEL_KEYS & set(data)):
+        raise RuntimeError(
+            "state.json parsed but does not look like state (no recognised top-level "
+            "keys) — delete or restore it manually"
+        )
+    return data
 
 
 def _write(file_obj, data: dict) -> None:
@@ -85,8 +107,20 @@ def _open_for_write():
     makes the seek/truncate/write sequence in _write fragile if truncate is
     partial. Using O_RDWR | O_CREAT gives full cursor control.
     """
-    fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT, 0o644)
-    return os.fdopen(fd_no, "r+")
+    try:
+        fd_no = os.open(STATE_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return os.fdopen(os.open(STATE_FILE, os.O_RDWR, 0o644), "r+")
+    # Newly created: initialise it immediately, under the same exclusive lock the caller
+    # is about to take, so no caller can leave behind a zero-length file that _read()
+    # would then refuse.
+    f = os.fdopen(fd_no, "r+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        _write(f, copy.deepcopy(_DEFAULTS))
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return f
 
 
 def get_pending_approval() -> dict | None:
