@@ -367,6 +367,35 @@ EOF
     ;;
 esac
 
+# --- Skill discovery dirs (issue #81): every FieldKit agent's skills dir,
+# DERIVED from $FIELDKIT_ROOT/platform/*/skills rather than hardcoded.
+# `hermes config set skills.external_dirs` REPLACES the whole list, so a
+# hardcoded single entry silently unregistered every other agent's commands
+# (e.g. /check_email) on each client switch. Built here, before the dry-run
+# exit, so --dry-run shows the exact list; this step only reads the
+# filesystem. The JSON list is produced by json.dumps from argv -- never by
+# shell-interpolating paths into quotes -- so a path containing spaces,
+# quotes, or backslashes stays a single, correctly-escaped list element.
+# Fails closed on: no skills dir at all (writing [] would unregister every
+# command), or a skills dir that resolves (via symlink) outside
+# $FIELDKIT_ROOT/platform (same containment rule as the client dir above).
+SKILL_DIRS_JSON="$(python3 -c '
+import glob, json, os, sys
+platform = os.path.join(sys.argv[1], "platform")
+platform_real = os.path.realpath(platform)
+dirs = []
+for d in sorted(glob.glob(os.path.join(glob.escape(platform), "*", "skills"))):
+    if not os.path.isdir(d):
+        continue
+    real = os.path.realpath(d)
+    if os.path.commonpath([real, platform_real]) != platform_real:
+        sys.exit("ERROR: %s resolves (via symlink or otherwise) to %s, which is outside %s -- refusing to register it" % (d, real, platform_real))
+    dirs.append(d)
+if not dirs:
+    sys.exit("ERROR: no skill directories found under %s/*/skills -- refusing to write an empty skills.external_dirs" % platform)
+print(json.dumps(dirs))
+' "$FIELDKIT_ROOT")"
+
 echo "== install_client.sh: switching the active client to '$CLIENT' =="
 echo "  repo root:               $FIELDKIT_ROOT"
 echo "  root .env:                $ROOT_ENV  (CLIENT_NAME -> $CLIENT)"
@@ -375,7 +404,7 @@ echo "  hermes model:               $HERMES_MODEL_PROVIDER / $HERMES_MODEL_DEFAU
 echo "  hermes provider key:        $PROVIDER_KEY_VAR (***, not printed)"
 echo "  telegram bot token:         *** (not printed)"
 echo "  telegram allowed users:     *** (not printed — access-control metadata, not shown even in --dry-run)"
-echo "  skill dirs:                 [\"$FIELDKIT_ROOT/platform/photo-agent/skills\"]"
+echo "  skill dirs:                 $SKILL_DIRS_JSON"
 echo
 
 # --- SECURITY: --dry-run exits HERE, before the first side-effecting line
@@ -1040,7 +1069,7 @@ _rollback_hermes_config_and_fail() {
 HERMES_HOME="$HERMES_HOME" hermes profile use default || _rollback_hermes_config_and_fail
 HERMES_HOME="$HERMES_HOME" hermes config set model.provider "$HERMES_MODEL_PROVIDER" || _rollback_hermes_config_and_fail
 HERMES_HOME="$HERMES_HOME" hermes config set model.default "$HERMES_MODEL_DEFAULT" || _rollback_hermes_config_and_fail
-HERMES_HOME="$HERMES_HOME" hermes config set skills.external_dirs "[\"$FIELDKIT_ROOT/platform/photo-agent/skills\"]" || _rollback_hermes_config_and_fail
+HERMES_HOME="$HERMES_HOME" hermes config set skills.external_dirs "$SKILL_DIRS_JSON" || _rollback_hermes_config_and_fail
 
 # --- Commit point: every fallible step above has succeeded, and both
 # config.yaml's and Hermes .env's pre-install snapshots (content + mode)

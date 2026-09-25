@@ -30,6 +30,14 @@ import pytest
 
 _PLATFORM_PHOTO_AGENT = Path(__file__).parents[1]
 _INSTALL_SCRIPT = _PLATFORM_PHOTO_AGENT / "scripts" / "install_client.sh"
+_REPO_PLATFORM = _PLATFORM_PHOTO_AGENT.parent
+
+# Every agent in THIS repo that ships Hermes skills (issue #81). Derived from
+# the real checkout, so adding a new platform/<agent>/skills dir automatically
+# extends the sandbox mirror and the coverage assertions below.
+_REPO_AGENTS_WITH_SKILLS = sorted(
+    d.parent.name for d in _REPO_PLATFORM.glob("*/skills") if d.is_dir()
+)
 
 
 # Status text below matches Hermes's REAL macOS/launchd output contract
@@ -209,6 +217,10 @@ def sandbox(tmp_path):
     stub_bin.mkdir()
     fieldkit_root.mkdir()
     hermes_home.mkdir()
+    # Mirror the real repo's platform/*/skills layout (issue #81) so the
+    # installer derives skills.external_dirs from the same agent set.
+    for agent in _REPO_AGENTS_WITH_SKILLS:
+        (fieldkit_root / "platform" / agent / "skills").mkdir(parents=True)
 
     log_path = tmp_path / "stub.log"
     running_marker = tmp_path / "gateway_running_marker"
@@ -1806,3 +1818,101 @@ def test_installed_client_resolves_via_real_process_photos_with_no_ambient_clien
     resolve_result = _resolve_via_real_process_photos(sandbox["fieldkit_root"], {})
     assert resolve_result.returncode == 0, resolve_result.stderr
     assert "RESOLVED_CLIENT=acme" in resolve_result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #81: skills.external_dirs must list EVERY platform/*/skills dir, derived
+# rather than hardcoded -- `hermes config set` replaces the whole list, so a
+# single hardcoded entry dropped /check_email on every client switch.
+# ---------------------------------------------------------------------------
+
+def _external_dirs_value(sandbox: dict) -> list[str]:
+    """Parse the JSON list the installer passed to `config set skills.external_dirs`."""
+    import json
+    prefix = "STUB_HERMES_CALL: config set skills.external_dirs "
+    values = [c[len(prefix):] for c in _log_calls(sandbox) if c.startswith(prefix)]
+    assert len(values) == 1, values
+    return json.loads(values[0])
+
+
+def _expected_skill_dirs(fieldkit_root: Path, agents) -> list[str]:
+    root = os.path.realpath(fieldkit_root)
+    return sorted(os.path.join(root, "platform", a, "skills") for a in agents)
+
+
+def test_repo_has_both_known_skill_agents():
+    """Guards the mirror itself: if the glob broke, coverage tests would be vacuous."""
+    assert {"email-agent", "photo-agent"} <= set(_REPO_AGENTS_WITH_SKILLS)
+
+
+def test_external_dirs_covers_every_repo_platform_skills_dir(sandbox):
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox)
+    assert result.returncode == 0, result.stderr
+    assert _external_dirs_value(sandbox) == _expected_skill_dirs(
+        sandbox["fieldkit_root"], _REPO_AGENTS_WITH_SKILLS
+    )
+
+
+def test_external_dirs_is_derived_so_a_new_agent_is_not_dropped(sandbox):
+    (sandbox["fieldkit_root"] / "platform" / "future-agent" / "skills").mkdir(parents=True)
+    # A platform dir with no skills/ subdir, and a skills FILE, are not listed.
+    (sandbox["fieldkit_root"] / "platform" / "docs").mkdir(parents=True)
+    (sandbox["fieldkit_root"] / "platform" / "odd-agent").mkdir(parents=True)
+    (sandbox["fieldkit_root"] / "platform" / "odd-agent" / "skills").write_text("")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox)
+    assert result.returncode == 0, result.stderr
+    assert _external_dirs_value(sandbox) == _expected_skill_dirs(
+        sandbox["fieldkit_root"], [*_REPO_AGENTS_WITH_SKILLS, "future-agent"]
+    )
+
+
+def test_dry_run_lists_every_skill_dir_and_runs_nothing(sandbox):
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    for d in _expected_skill_dirs(sandbox["fieldkit_root"], _REPO_AGENTS_WITH_SKILLS):
+        assert d in result.stdout
+    assert _log_calls(sandbox) == []
+
+
+def test_external_dirs_with_spaces_and_quotes_in_root_is_valid_json(tmp_path, sandbox):
+    """A repo path with spaces/quotes must stay one correctly-escaped list element."""
+    import shutil
+    odd_root = tmp_path / 'my "field" kit\\dir'
+    shutil.move(str(sandbox["fieldkit_root"]), str(odd_root))
+    sandbox["fieldkit_root"] = odd_root
+    sandbox["env"]["FIELDKIT_ROOT"] = str(odd_root)
+    _write_client_env(odd_root, "acme")
+    result = _run("acme", sandbox)
+    assert result.returncode == 0, result.stderr
+    assert _external_dirs_value(sandbox) == _expected_skill_dirs(odd_root, _REPO_AGENTS_WITH_SKILLS)
+
+
+def test_no_skill_dirs_fails_closed_before_any_mutation(sandbox):
+    import shutil
+    shutil.rmtree(sandbox["fieldkit_root"] / "platform")
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    for args in ((), ("--dry-run",)):
+        result = _run("acme", sandbox, *args)
+        assert result.returncode != 0
+        assert "no skill directories found" in result.stderr
+        assert not (sandbox["fieldkit_root"] / ".env").exists()
+        assert not (sandbox["hermes_home"] / ".env").exists()
+        assert not (sandbox["hermes_home"] / ".install_client.lock").exists()
+        assert _log_calls(sandbox) == []
+
+
+def test_skills_dir_symlinked_outside_platform_is_rejected(tmp_path, sandbox):
+    outside = tmp_path / "outside_skills"
+    outside.mkdir()
+    (sandbox["fieldkit_root"] / "platform" / "rogue-agent").mkdir()
+    (sandbox["fieldkit_root"] / "platform" / "rogue-agent" / "skills").symlink_to(outside)
+    _write_client_env(sandbox["fieldkit_root"], "acme")
+    result = _run("acme", sandbox)
+    assert result.returncode != 0
+    assert "outside" in result.stderr
+    assert not (sandbox["fieldkit_root"] / ".env").exists()
+    assert not (sandbox["hermes_home"] / ".env").exists()
+    assert _log_calls(sandbox) == []

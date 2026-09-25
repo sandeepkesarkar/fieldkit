@@ -167,16 +167,13 @@ mkdir -p "$FIELDKIT_ROOT/data/email-agent" "$FIELDKIT_ROOT/logs"
 
 Hermes discovers this skill directly from the fieldkit repo via
 `skills.external_dirs` in `~/.hermes/config.yaml` — no copy step, no stale
-cache. Add `platform/email-agent/skills` alongside the existing
-`platform/photo-agent/skills` entry (this is a **new** directory the config
-does not list yet, even if `process-photos`/`check-approval` are already
-installed):
-
-The exact `hermes config set` command, with the current absolute paths, is
-maintained in one place — see
-`platform/docs/hermes/12-skill-path-resolution.md`. It is a **deployment
-prerequisite**: until `platform/email-agent/skills` is listed there,
-`/check_email` is not registered as a command at all.
+cache. `platform/photo-agent/scripts/install_client.sh <client>` writes
+every `platform/*/skills` directory (including `platform/email-agent/skills`)
+into that list, so there is no manual `hermes config set` step — run the
+installer (or re-run it if you installed before issue #81, when it wrote only
+the photo-agent entry). Until `platform/email-agent/skills` is listed,
+`/check_email` is not registered as a command at all; see
+`platform/docs/hermes/12-skill-path-resolution.md` for how to check.
 
 Restart the gateway to pick it up:
 
@@ -276,7 +273,7 @@ tail -f "$FIELDKIT_ROOT/logs/cron.log"
 | `No OAuth client configured` | Run Step 4 |
 | `gws auth login` fails | Re-run Step 5 — ensure you sign in with `$AGENT_EMAIL` |
 | `check-email` missing required binary | `prerequisites.commands` lists `gws` and `python3` — confirm both are on PATH. Run `which gws python3` to verify. |
-| `check-email` does not appear in `hermes skills list --source local` | The `skills.external_dirs` entry for `platform/email-agent/skills` is missing from `~/.hermes/config.yaml`, or the gateway hasn't picked it up yet. Re-check Step 8 and restart the gateway. |
+| `check-email` does not appear in `hermes skills list --source local` | The `skills.external_dirs` entry for `platform/email-agent/skills` is missing from `~/.hermes/config.yaml`, or the gateway hasn't picked it up yet. Re-run `install_client.sh <client>` (Step 8) and restart the gateway. |
 | LLM improvises instead of running the script | The skill wasn't discovered. Confirm `platform/email-agent/skills/check-email/SKILL.md` exists and `~/.hermes/config.yaml`'s `skills.external_dirs` includes its parent directory, then run `hermes gateway restart`. |
 | `check_email: ADMIN_ALLOWLIST is empty` in Telegram | `.env` is missing or `ADMIN_ALLOWLIST` is blank. Check Step 7. |
 | `check_email: ADMIN_TELEGRAM_CHAT_ID is not set` | `.env` is missing `ADMIN_TELEGRAM_CHAT_ID`. Check Step 7. |

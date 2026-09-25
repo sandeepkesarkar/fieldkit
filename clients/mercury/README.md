@@ -45,11 +45,11 @@ cause of issue #59 — a live skill invocation silently resolving against
    ```
    This writes `CLIENT_NAME=mercury` into the repo-root `.env`, installs
    mercury's Telegram bot token/allowlist and Anthropic key into Hermes's
-   default profile, points `skills.external_dirs` at
-   `platform/photo-agent/skills`, and restarts the gateway.
+   default profile, points `skills.external_dirs` at every
+   `platform/*/skills` directory, and restarts the gateway.
 3. Verify: `grep '^CLIENT_NAME=' "$(git rev-parse --show-toplevel)/.env"` should read
    `CLIENT_NAME=mercury`, and `hermes skills list --source local` should
-   show `process-photos`, `photo-approve`, `photo-reject`.
+   show `process-photos`, `photo-approve`, `photo-reject`, `check-email`.
 
 Full mechanism, provider-identity notes (`openai-api` vs. bare `openai` vs.
 `openai-codex`), and what to do about a leftover pre-#61 Hermes profile:
