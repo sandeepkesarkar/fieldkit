@@ -93,8 +93,24 @@ If an Instagram upload fails (expired token, API error, network issue, video pro
 - **FR-012**: System MUST log all Instagram upload attempts, outcomes (published/failed), retry counts, and error details to the client's per-client log file for operational visibility, consistent with Feature 003's logging.
 - **FR-013**: System MUST treat the Instagram publish and the Facebook publish for a given approved video as independent outcomes — a failure on one platform MUST NOT block, retry, or roll back the other platform's post.
 - **FR-014**: System MUST strip all metadata (GPS, timestamps, camera info, faces) from the video before it is uploaded to Instagram, per the framework privacy gate — reusing the same stripped asset already produced for the Facebook upload rather than re-processing.
-- **FR-015**: System MUST enforce the client's daily AI/API budget limit and pause Instagram publishing operations (queuing them for the next budget window) if the client's daily budget has already been exhausted, consistent with framework budget governance.
+- **FR-015**: *Removed for this feature (2026-09-25).* It previously required pausing Instagram publishing when the client's daily AI/API budget was exhausted. See **Decision: FR-015 removed** below. The number is left unused so that FR-016 and any existing references keep their meaning.
 - **FR-016**: System MUST only enable Instagram publishing for clients explicitly configured for it; clients without an Instagram connection (e.g., `_construction_co`, which is out of scope for this feature) MUST see no Instagram-related behavior at all.
+
+### Decision: FR-015 removed
+
+**Decided 2026-09-25 by the maintainer, during review of PR #72.**
+
+FR-015 is removed from this feature, because Instagram publishing spends no money. It calls only:
+
+- the Instagram Graph API: media container creation, container status, and publish;
+- the Google Drive API: temporary share-link creation and revocation;
+- the Telegram Bot API: owner notifications.
+
+None of these is billed per call, and the feature calls no AI model. A budget check here would therefore have no spend to cap.
+
+Budget governance still applies to FieldKit as a whole, but it belongs where money is actually spent: the Hermes agent and its model calls. That control is tracked separately from this feature.
+
+An earlier version of `plan.md` claimed FR-015 was satisfied by "the pipeline's existing shared budget-guard check". No such check exists anywhere in the repository. That claim is corrected in `plan.md`.
 
 ### Key Entities
 
@@ -121,7 +137,7 @@ If an Instagram upload fails (expired token, API error, network issue, video pro
 ## Assumptions
 
 - Each client (e.g., `_demo`) has at most one Instagram professional (Business or Creator) account, linked to the same single Facebook Page connected under Feature 003; multi-account support is out of scope.
-- Instagram publishing reuses the Facebook Page connection and administrator-driven authorization flow already built for Feature 003 — no new, separate OAuth setup story is introduced for Instagram; only a connection *check* (FR-005) that discovers the linked Instagram account is added.
+- Instagram publishing reuses the Facebook Page connection and administrator-driven authorization flow already built for Feature 003 — no new, separate OAuth setup story is introduced for Instagram; only a connection *check* (FR-005) that discovers the linked Instagram account is added. *(Clarified 2026-09-25: the existing flow does have to be **re-run** once, requesting `instagram_basic` and `instagram_content_publish` in addition to the three Pages scopes, because the Page token issued for Feature 003 does not carry them. See `research.md`.)*
 - The administrator (Sandeep) performs the one-time Instagram connection check; the business owner does not interact with Meta's developer portal.
 - Caption text is out of scope; this feature posts video-only, matching Feature 003. Caption generation is a separate future feature.
 - The video file produced by Feature 002 (photo/video agent) and already validated for Facebook (9:16 portrait, MP4) is assumed compatible with Instagram Reels without additional conversion; if Instagram-specific constraints (duration, encoding) differ, that is a technical/planning concern, not a scope change.

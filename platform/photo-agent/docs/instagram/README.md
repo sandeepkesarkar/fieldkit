@@ -9,16 +9,36 @@ no new OAuth flow** — which is why there is no `01-create-app.md` here. Everyt
 below rides on the Facebook Page connection you already made in
 [`../facebook/`](../facebook/README.md).
 
+It does **not** ride on that connection's existing *permissions*, though. The Page
+token issued for Facebook publishing lacks the two Instagram scopes, so the same
+authorization flow must be run once more to add them — see Step 0 below.
+
 ---
 
-## Why there is no new app or token
+## Why there is no new app or token — but there are new scopes
 
 Instagram content publishing for professional accounts is served by the
 **Facebook** Graph API (`graph.facebook.com`), through the Facebook Page the
 Instagram account is linked to. An Instagram account must already be a
 Business/Creator account linked to a Page before the API can publish to it at
-all — and once that's true, the Page access token FieldKit already holds from
-Feature 003 is sufficient.
+all. When that's true, publishing uses the same Meta app and the same *kind* of
+Page access token FieldKit already has from Feature 003.
+
+It does **not** use that token *as issued*. An earlier version of this page said
+the existing Page token was sufficient and no new scopes were needed. That was
+wrong. A live check of the `_demo` Page token found exactly these scopes:
+
+- `pages_show_list`
+- `pages_read_engagement`
+- `pages_manage_posts`
+
+Instagram publishing additionally needs:
+
+- `instagram_basic` — read the linked Instagram account
+- `instagram_content_publish` — create and publish media containers
+
+A token without them cannot publish to Instagram, however it was obtained, so it
+has to be re-issued with them. See Step 0.
 
 So this feature adds exactly one new environment variable:
 
@@ -27,7 +47,9 @@ So this feature adds exactly one new environment variable:
 | `IG_BUSINESS_ACCOUNT_ID` | Instagram professional account ID (numeric) | Written by `check_instagram_connection.py` |
 
 `IG_BUSINESS_ACCOUNT_ID` is a **public account identifier, not a secret**. No new
-token, app secret, or credential class is introduced anywhere in Feature 005.
+app secret or credential class is introduced anywhere in Feature 005.
+`FB_PAGE_ACCESS_TOKEN` is re-issued with two more scopes (Step 0) but stays the
+same variable, holding the same kind of token.
 
 **If `IG_BUSINESS_ACCOUNT_ID` is absent or empty, Instagram publishing is off for
 that client** — `check_approval.py` enqueues no Instagram job and
@@ -48,8 +70,34 @@ per-client enable switch; there is no client-name special-casing in the code.
    In Meta Business Suite / Page settings: *Linked accounts → Instagram → Connect*.
    Reference: <https://www.facebook.com/business/help/898752960195806>
 
-Steps 2 and 3 are done by a human in Meta's UI. They are not automatable, and
-`check_instagram_connection.py` will tell you clearly if either is missing.
+4. The Meta app has **`instagram_basic`** and **`instagram_content_publish`**
+   enabled, the same way `pages_manage_posts` was enabled for Facebook (see
+   [`../facebook/01-create-app.md`](../facebook/01-create-app.md), section D2). If they
+   are not enabled, Step 0's OAuth dialog reports "Invalid Scopes".
+
+Steps 2, 3 and 4 are done by a human in Meta's UI. They are not automatable, and
+`check_instagram_connection.py` will tell you clearly if 2 or 3 is missing.
+
+---
+
+## Step 0 — Re-authorize with the Instagram scopes (one-time, per client)
+
+Re-run the Facebook authorization flow, this time with `--instagram`:
+
+```bash
+cd platform/photo-agent
+CLIENT_NAME=_demo python3 scripts/generate_auth_link.py --page-id 123456789 --instagram
+```
+
+This requests the three Pages scopes **plus** `instagram_basic` and
+`instagram_content_publish`, and writes the resulting Page token over the existing
+`FB_PAGE_ACCESS_TOKEN`. Facebook publishing keeps working with the new token, since
+the Pages scopes are all still there.
+
+Why `--instagram` is a flag rather than always on: Meta rejects any requested scope
+the app has not enabled. If the Instagram scopes were always requested, this script
+— the only way to reconnect Facebook — would fail on an app not set up for Instagram
+(prerequisite 4).
 
 ---
 
@@ -598,7 +646,9 @@ script here would expose an operator tool as an owner-facing command.
 |---|---|
 | `check_instagram_connection.py` exits 3, "No Instagram account is linked" | Prerequisite 3 not done — link the account to the Page in Meta's settings |
 | Exits 3, "is a PERSONAL account" | Prerequisite 2 not done — convert to Business/Creator in the Instagram app |
-| Exits 1, "token is invalid or expired" | Re-run `generate_auth_link.py` to reconnect the Page |
+| Exits 1, "token is invalid or expired" | Re-run `generate_auth_link.py --instagram` to reconnect the Page |
+| Publishing fails with a permissions error though the account is linked | The Page token lacks `instagram_basic` / `instagram_content_publish` — do Step 0 |
+| Step 0's OAuth dialog says "Invalid Scopes" | The Meta app has not enabled the two Instagram permissions — prerequisite 4 |
 | Nothing happens on approval; no `IG_ENQUEUED` in the log | `IG_BUSINESS_ACCOUNT_ID` not set for this client — run step 1 |
 | `IG_FAILED` with "did not finish processing" | Container stuck past 300s; retried automatically, often a large or oddly-encoded video |
 | `IG_TOKEN_EXP` | Page token expired — the Facebook upload will be failing too; reconnect once, fixes both |

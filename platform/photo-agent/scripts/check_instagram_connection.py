@@ -11,10 +11,14 @@ IG_BUSINESS_ACCOUNT_ID, which is what enables Instagram publishing for that clie
 
 There is deliberately no OAuth flow here, unlike generate_auth_link.py. An Instagram
 account must already be converted to Business/Creator and linked to a Facebook Page
-before the Graph API can publish to it at all; given that, the Page access token
-FieldKit already holds is sufficient to discover and publish to it. This feature
-therefore adds NO new secret: IG_BUSINESS_ACCOUNT_ID is a public account identifier,
-and every API call reuses FB_PAGE_ACCESS_TOKEN.
+before the Graph API can publish to it at all, and every API call here reuses
+FB_PAGE_ACCESS_TOKEN. This feature therefore adds NO new secret:
+IG_BUSINESS_ACCOUNT_ID is a public account identifier.
+
+That token must carry instagram_basic and instagram_content_publish, which the token
+issued for Facebook publishing does not. Obtain it with
+`generate_auth_link.py --instagram` before running this. (An earlier version of this
+docstring said the existing Page token was sufficient. It was not.)
 
 Run once per client, by the administrator. The business owner takes no separate
 action beyond what Feature 003 already required.
