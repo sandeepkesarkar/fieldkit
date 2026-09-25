@@ -4,6 +4,14 @@ generate_auth_link.py — One-time admin CLI: authorize FieldKit to post to a Fa
 Usage:
     python3 scripts/generate_auth_link.py --page-id PAGE_ID
     python3 scripts/generate_auth_link.py --page-id PAGE_ID --port 8081
+    python3 scripts/generate_auth_link.py --page-id PAGE_ID --instagram
+
+--instagram additionally requests instagram_basic and instagram_content_publish,
+which Feature 005 (Instagram publishing) needs and the Pages scopes alone do not
+grant. It is opt-in because Meta rejects any requested scope the app has not
+enabled, and shows "Invalid Scopes" in the OAuth dialog. Adding the Instagram
+scopes unconditionally would therefore break this script — the only way to
+reconnect the Facebook integration — on any app that has not enabled them.
 
 Reads FB_APP_ID and FB_APP_SECRET from .env.
 Generates a Facebook OAuth URL, starts a local HTTP server to catch the redirect,
@@ -52,6 +60,11 @@ _log = logging.getLogger(__name__)
 
 _ENV_PATH = _ROOT / "clients" / _CLIENT / "src" / "photo-agent" / ".env"
 _OAUTH_SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]
+# Added to the Pages scopes, never instead of them, when --instagram is passed.
+# instagram_basic covers reading the linked account; instagram_content_publish covers
+# creating and publishing media containers. See the module docstring for why this is
+# opt-in rather than always requested.
+_INSTAGRAM_SCOPES = ["instagram_basic", "instagram_content_publish"]
 
 
 def main(argv=None) -> None:
@@ -71,6 +84,15 @@ def main(argv=None) -> None:
         dest="page_id",
         help="Facebook Page ID to link (required if account has multiple Pages).",
     )
+    parser.add_argument(
+        "--instagram",
+        action="store_true",
+        help=(
+            "Also request instagram_basic and instagram_content_publish, needed for "
+            "Instagram publishing (Feature 005). The Meta app must have both "
+            "permissions enabled first, or the OAuth dialog reports Invalid Scopes."
+        ),
+    )
     args = parser.parse_args(argv)
 
     app_id = os.environ.get("FB_APP_ID", "")
@@ -89,7 +111,8 @@ def main(argv=None) -> None:
 
     import secrets as _secrets
     state_token = _secrets.token_hex(16)
-    auth_url = facebook_api.build_auth_url(app_id, redirect_uri, _OAUTH_SCOPES, state_token)
+    scopes = _OAUTH_SCOPES + (_INSTAGRAM_SCOPES if args.instagram else [])
+    auth_url = facebook_api.build_auth_url(app_id, redirect_uri, scopes, state_token)
 
     print(f"Facebook authorization URL:\n{auth_url}\n")
     print(f"Waiting for authorization on http://localhost:{args.port}/callback ...")

@@ -27,7 +27,9 @@
 ## Decision: Account discovery instead of a new OAuth flow
 
 **Choice**: `GET /{page_id}?fields=instagram_business_account` using the existing `FB_PAGE_ACCESS_TOKEN` from Feature 003.
-**Rationale**: An Instagram account must already be converted to Business/Creator and linked to a Facebook Page for Graph API publishing to be possible at all. Given that constraint, the Page token FieldKit already holds is sufficient to discover and publish to the linked Instagram account — no additional permission scopes or OAuth round-trip needed.
+**Rationale**: An Instagram account must already be converted to Business/Creator and linked to a Facebook Page for Graph API publishing to be possible at all. Given that constraint, the Instagram account is reached through the Page connection FieldKit already has. No separate Instagram Login flow and no new Meta app are needed.
+
+**Correction (2026-09-25)**: this rationale originally said the existing Page token needed "no additional permission scopes or OAuth round-trip". That is false. A live check of the `_demo` Page token found only `pages_show_list`, `pages_read_engagement` and `pages_manage_posts`. Instagram publishing also needs `instagram_basic` and `instagram_content_publish`, and the Instagram Business/Creator account must be linked to the Page. The same authorization flow therefore has to be run once more, requesting those two scopes as well: `generate_auth_link.py --instagram`. The Meta app must have both permissions enabled first, or the OAuth dialog reports "Invalid Scopes".
 **Alternatives considered**: A separate Instagram-specific OAuth flow (Instagram Login) — only relevant for the deprecated Basic Display API surface; not applicable to Business/Creator content publishing, and would duplicate Feature 003's setup for no benefit.
 
 ---

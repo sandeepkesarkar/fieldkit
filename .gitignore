@@ -28,9 +28,19 @@ env/
 # by `omnigent run --harness codex` invocations in this directory
 .codex-tmp/
 
+# Omnigent project config — machine-local because default_agent must be an
+# absolute path. Copy .omnigent/config.example.yaml to create it.
+.omnigent/config.yaml
+
 
 # Editor
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Nested git worktrees (e.g. .worktrees/<branch>/) — never part of a commit.
+# Not a substitute for the tracked-files scoping in
+# test_no_stale_repo_path_in_current_docs: that test uses `git ls-files` so no
+# untracked directory can affect it, ignored or not.
+.worktrees/

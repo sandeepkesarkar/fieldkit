@@ -17,6 +17,10 @@ Unlike OpenClaw (which required manually re-syncing `SKILL_*.md` edits into
 notes), Hermes discovers this skill directly from the fieldkit repo via
 `~/.hermes/config.yaml`:
 
+> ⚠️ **Dated record.** The `external_dirs` path below is as-of-then and is now
+> stale. The current config command lives in
+> `platform/docs/hermes/12-skill-path-resolution.md`.
+
 ```yaml
 skills:
   external_dirs:
