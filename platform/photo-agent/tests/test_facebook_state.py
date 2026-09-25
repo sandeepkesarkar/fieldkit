@@ -931,3 +931,25 @@ def test_record_publish_reconciliation_alerts_first_then_throttles(valid_record)
     again = fb_state.record_publish_reconciliation(_VID, project_name="p", idempotency_key="42")
     assert again is None
     assert fb_state.list_publish_reconciliations()[0]["attempts"] == 2
+
+
+def test_clear_accepts_the_two_operator_releases_only(valid_record):
+    key = _attempted(valid_record)
+    fb_state.mark_failed(key)
+    assert fb_state.clear_publish_reconciliation(_VID, fb_state.OPERATOR_DELETED) is True
+    with fb_state._transaction() as txn:
+        fb_state._add_publish_reconciliation(
+            txn.data, video_id=_VID, project_name="p", idempotency_key=key, now="t"
+        )
+        txn.commit()
+    assert fb_state.clear_publish_reconciliation(_VID, fb_state.OPERATOR_OVERRIDE) is True
+
+
+@pytest.mark.parametrize("reason", ["operator_deleted_video", "operator_override_accepts_duplicate_risk"])
+def test_operator_releases_cannot_settle_a_live_record(valid_record, reason):
+    """Operator reasons clear a quarantine entry; they are not a Meta observation."""
+    key = _attempted(valid_record)
+    with pytest.raises(ValueError):
+        fb_state.mark_publish_settled(key, _VID, reason)
+    with pytest.raises(ValueError):
+        fb_state.record_recovered_publish(key, "p", _VID, reason)

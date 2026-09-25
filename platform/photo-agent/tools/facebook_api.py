@@ -18,6 +18,7 @@ It must never be logged or appear in upload_facebook.py (cron path).
 
 import logging
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import urlencode
 
 import requests
@@ -229,6 +230,18 @@ def _raise_for_graph_error(resp, data: dict, what: str, access_token: str) -> No
         raise FacebookUploadError(f"{what} failed: HTTP {resp.status_code}")
 
 
+# The post-affecting fields sent with the publish. EMPTY, deliberately, for parity with the
+# one-shot upload this replaced (issue #78): that sent only `access_token` and the `source`
+# file — no title, description or published flag — so every post FieldKit has made so far
+# was created with Meta's defaults (published=true, no title/description). Meta documents
+# title and description as optional on POST /{page_id}/videos, and nothing as required at
+# the finish phase. Meta's SDK uploader sends title=<file name> at finish, but that is the
+# ad-account (advideos) uploader, and copying it would put "video.mp4" on client posts.
+# Adding a caption later is a product change: put it here, so the one place it is sent is
+# the phase that publishes.
+PUBLISH_METADATA = MappingProxyType({})  # read-only: a shared mutable default would be a trap
+
+
 def _upload_post(page_access_token: str, page_id: str, what: str, data: dict, files=None) -> dict:
     """POST one phase of a sessionized upload to /{page_id}/videos and return its JSON body.
 
@@ -358,7 +371,7 @@ def upload_video(
 
     finish = _upload_post(
         page_access_token, page_id, "finish",
-        {"upload_phase": "finish", "upload_session_id": session_id},
+        {"upload_phase": "finish", "upload_session_id": session_id, **PUBLISH_METADATA},
     )
     if finish.get("success") is not True:
         raise FacebookUploadError(
@@ -430,3 +443,59 @@ def get_video_publish_state(page_access_token: str, video_id: str) -> tuple[str,
     if video_status in _VIDEO_STATUS_NOT_PUBLISHED:
         return "not_published", f"video_status_{video_status}"
     return "unknown", f"video_status={video_status!s} publish_status={publish_status!s}"
+
+
+# Graph API error code for "object does not exist / cannot be loaded" (e.g. "Unsupported
+# get request. Object with ID ... does not exist").
+_GRAPH_NO_SUCH_OBJECT = 100
+
+
+def delete_video(page_access_token: str, video_id: str) -> None:
+    """DELETE the video node video_id. Returns only if Meta reports success.
+
+    Operator tool for resolving a quarantined publish (issue #78) — see
+    scripts/resolve_facebook_quarantine.py. The Page /videos reference directs deletion to
+    the Video node, and Meta's generated SDK (adobjects/advideo.py api_delete) issues
+    DELETE /{video_id}. Authenticates by header; errors are redacted.
+
+    Raises FacebookTokenError (190) or FacebookUploadError on any other error, including a
+    code-100 "does not exist" — which is deliberately NOT treated as success: Graph returns
+    it both for a video that is gone and for one this token cannot see.
+    """
+    try:
+        resp = requests.delete(
+            f"{_GRAPH_BASE}/{video_id}",
+            headers=_auth_header(page_access_token),
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise FacebookUploadError(
+            f"Video delete request failed: {_safe(exc, page_access_token)}"
+        ) from None
+    data = _json_or_empty(resp)
+    _raise_for_graph_error(resp, data, "video delete", page_access_token)
+    if data.get("success") is not True:
+        raise FacebookUploadError(
+            f"Video delete for {video_id} did not report success; keys: {sorted(data)}"
+        )
+    logger.info("delete_video: video_id=%s", video_id)
+
+
+def video_is_gone(page_access_token: str, video_id: str) -> bool:
+    """True only if reading video_id returns Graph error code 100 (object does not exist).
+
+    Used AFTER a successful delete_video() to confirm the node is gone. Any other result —
+    the video still readable, a different error, a network failure — is False, so a caller
+    releasing a key on this can only err towards keeping it blocked.
+    """
+    try:
+        resp = requests.get(
+            f"{_GRAPH_BASE}/{video_id}",
+            params={"fields": "id"},
+            headers=_auth_header(page_access_token),
+            timeout=30,
+        )
+    except requests.exceptions.RequestException:
+        return False
+    error = _json_or_empty(resp).get("error")
+    return isinstance(error, dict) and error.get("code") == _GRAPH_NO_SUCH_OBJECT

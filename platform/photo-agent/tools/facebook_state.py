@@ -133,6 +133,16 @@ _OBSERVED_NOT_PUBLISHED = frozenset({
 })
 _OBSERVED_DEFINITIVE = _OBSERVED_NOT_PUBLISHED | {_OBSERVED_PUBLISHED}
 
+# Operator releases (scripts/resolve_facebook_quarantine.py). Accepted ONLY by
+# clear_publish_reconciliation(), never by mark_publish_settled():
+#   OPERATOR_DELETED  — the operator deleted that exact video_id via the Graph API and a
+#                       follow-up read confirmed the node is gone, so it cannot be live;
+#   OPERATOR_OVERRIDE — the operator released the key WITHOUT a definitive answer and
+#                       explicitly accepted that re-approval may post a duplicate.
+OPERATOR_DELETED = "operator_deleted_video"
+OPERATOR_OVERRIDE = "operator_override_accepts_duplicate_risk"
+_CLEARABLE = _OBSERVED_DEFINITIVE | {OPERATOR_DELETED, OPERATOR_OVERRIDE}
+
 _DEFAULTS = {
     "pending_facebook_upload": None,
     "published_idempotency_keys": [],
@@ -960,13 +970,15 @@ def clear_publish_reconciliation(video_id: str, observed: str) -> bool:
     """Drop video_id from the unresolved list once Meta has been definitive about it.
 
     observed must be a definitive observation from get_video_publish_state() — published
-    (record it via record_recovered_publish() first) or one of the not-published ones.
-    Returns True if an entry was removed.
+    (record it via record_recovered_publish() first) or one of the not-published ones — or
+    one of the two operator releases (OPERATOR_DELETED, OPERATOR_OVERRIDE) written only by
+    scripts/resolve_facebook_quarantine.py. "Not visible on the Page right now" is NOT one
+    of them: an accepted FINISH may still be processing. Returns True if an entry was removed.
     """
-    if observed not in _OBSERVED_DEFINITIVE:
+    if observed not in _CLEARABLE:
         raise ValueError(
             f"clear_publish_reconciliation: {observed!r} is not a definitive observation; "
-            f"expected one of {sorted(_OBSERVED_DEFINITIVE)}"
+            f"expected one of {sorted(_CLEARABLE)}"
         )
     with _transaction() as txn:
         data = txn.data
