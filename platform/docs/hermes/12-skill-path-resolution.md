@@ -159,34 +159,39 @@ flagged here rather than left to read as though they were:
   the live gateway's process environment. Facts about provenance and about one
   machine, established by inspection (`ps eww` on the gateway).
 
-## Deployment prerequisite — required, not optional
+## Deployment prerequisite — `skills.external_dirs`
 
-`skills.external_dirs` must list **both** agents' skill directories. The live
-config lists only `platform/photo-agent/skills`, so `/check_email` is not
-registered as a command at all — `scan_skill_commands()` returns the three
-photo skills and no `check-email` entry. Merging PR #75 does not change that:
-the path fix and the registration gap are independent, and `/check_email`
-stays unavailable until this is applied.
+`skills.external_dirs` must list **every** agent's skill directory
+(`platform/*/skills` — today `photo-agent` and `email-agent`). If
+`platform/email-agent/skills` is missing, `/check_email` is not registered as
+a command at all — `scan_skill_commands()` returns the three photo skills and
+no `check-email` entry.
 
-Run in a normal login shell, so it targets the default profile
-(`hermes config` writes to the profile named by `HERMES_HOME`, which is unset
-in a login shell and therefore the default):
+**`install_client.sh` sets this for you** (issue #81). It derives the list
+from whichever `platform/*/skills` directories exist in the checkout and
+writes all of them, so running it — including on every client switch — no
+longer drops an agent's commands, and a future agent's skills are picked up
+without editing the script. There is no separate manual step:
 
 ```bash
-# 1. Confirm which profile you are about to change, and what is currently set
-hermes gateway list
-hermes config get skills.external_dirs
+# Preview the exact list it will write (changes nothing)
+platform/photo-agent/scripts/install_client.sh <client> --dry-run
 
-# 2. Set both entries (absolute paths; Hermes reads them in place)
-hermes config set skills.external_dirs \
-  '["/Users/sandeep_a_k/src/project-fieldkit-dev/fieldkit/platform/photo-agent/skills","/Users/sandeep_a_k/src/project-fieldkit-dev/fieldkit/platform/email-agent/skills"]'
+# Apply (writes the list, restarts the gateway)
+platform/photo-agent/scripts/install_client.sh <client>
 
-# 3. Read it back before restarting
+# Read it back
 hermes config get skills.external_dirs
 ```
 
-If the repo ever moves again, this config is the **only** place that needs
-updating — the skills themselves follow automatically.
+Before issue #81 the installer wrote only `platform/photo-agent/skills`,
+replacing the whole list, so a hand-added `email-agent` entry was lost on the
+next run. If you are on a checkout older than that fix, re-run the current
+`install_client.sh` rather than setting the value by hand.
+
+If the repo ever moves again, re-run `install_client.sh <client>` from the
+new location — this config is the **only** place that needs updating, and the
+skills themselves follow automatically.
 
 ---
 

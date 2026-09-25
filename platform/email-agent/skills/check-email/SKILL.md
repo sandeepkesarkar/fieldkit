@@ -55,10 +55,9 @@ OpenClaw -> Hermes mapping (issue #25, platform/.specify/003-hermes-runtime/spec
   `skills.external_dirs` config (`~/.hermes/config.yaml`) should point at
   this file's parent directory (`platform/email-agent/skills`) inside the
   fieldkit repo, so there is no copy step and no stale-cache risk once
-  configured. See SETUP.md's skill-install step for the exact config entry
-  and the one-time `external_dirs` addition this skill requires (it lives in
-  a different parent directory than the photo-agent skills already
-  registered there).
+  configured. `install_client.sh` writes every `platform/*/skills` dir into
+  that list (issue #81), so this directory is registered alongside the
+  photo-agent skills with no manual step; see SETUP.md's skill-install step.
 - Everything else (script invocation, verbatim relay) is unchanged from the
   OpenClaw skill's body.
 -->
