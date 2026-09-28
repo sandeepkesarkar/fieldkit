@@ -32,6 +32,15 @@ review), and nothing local can prove a remote request has finished acting. A fil
 longer exists cannot become public whenever such a grant lands. Deletion that fails, or
 cannot be confirmed, keeps the obligation — retried by both crons, re-alerted daily.
 
+PROVENANCE BEFORE PERMANENT DELETION. The file id comes from instagram_state.json, so a
+corrupted or hand-edited entry could name a client's real file. Each entry therefore
+records that it is a temporary copy, the folder it was uploaded into and its name
+(record_share_intent), and drive.delete_temporary_share() checks the live file against them
+and the configured DRIVE_ROOT_FOLDER_ID before touching it (provenance_for). A mismatch is
+refused with NOTHING changed — no revoke, no delete — and treated like any failed cleanup:
+the obligation stays, both crons retry it, and the admin is alerted daily, with wording
+that says it was refused and why.
+
 WHEN A DRAIN MAY ACT: THE OWNER FENCE. Deleting a live attempt's copy while Instagram is
 still fetching it would break that publish, so a drain must know whether the attempt that
 registered an obligation can still be using it. Age cannot say: a claim lease expiring lets
@@ -88,7 +97,7 @@ from datetime import datetime, timezone
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from typing import IO, Callable, Iterator
 
-from tools import drive, instagram_state
+from tools import drive, instagram_state, state
 from tools.redaction import redact_secrets
 
 _log = logging.getLogger(__name__)
@@ -285,17 +294,20 @@ def _drain_entry(entry, now, send_alert, holds_instagram_lock) -> None:
         )
         return
     try:
-        drive.delete_temporary_share(file_id)
+        drive.delete_temporary_share(file_id, provenance=provenance_for(entry))
     except RuntimeError as exc:
+        refused = isinstance(exc, drive.TemporaryShareRefused)
         _log.error(
-            "retry of temporary share deletion still failing: project=%s file_id=%s "
-            "error=%s", project_name, file_id, redact_secrets(str(exc)),
+            "%s: project=%s file_id=%s error=%s",
+            "refused to delete a file that does not look like a temporary share copy"
+            if refused else "retry of temporary share deletion still failing",
+            project_name, file_id, redact_secrets(str(exc)),
         )
         updated = instagram_state.record_share_cleanup(
             file_id, project_name, create_if_missing=False
         )
         if updated:
-            send_alert(alert_text(updated))
+            send_alert(alert_text(updated, refused=exc if refused else None))
         return
     # Confirmed permanently deleted: nothing — a late grant, a resumed attempt, anyone —
     # can make this file public again, so the obligation is retired whoever still lives.
@@ -308,7 +320,40 @@ def _drain_entry(entry, now, send_alert, holds_instagram_lock) -> None:
     )
 
 
-def alert_text(entry: dict) -> str:
+def provenance_for(entry: dict) -> dict:
+    """What drive.delete_temporary_share() must verify before deleting entry's file.
+
+    - root_folder_id: the CONFIGURED DRIVE_ROOT_FOLDER_ID, read at cleanup time. The copy
+      must sit directly in it; unset means nothing can be verified, so deletion is refused.
+    - recorded_parent_id / expected_name: what record_share_intent() stored when the copy
+      was created. An entry written before provenance was recorded has neither
+      (temporary_copy is absent): it is checked conservatively — it must still be a video
+      directly inside the configured root, not a folder, not the root, not protected — but
+      its name cannot be checked. That is stated rather than hidden: a legacy entry pointing
+      at some other video directly in the root folder would pass.
+    - protected_ids: the approved video's Drive id from the pending approval, when one is
+      recorded. The approved video lives in the project folder, not the root, so the parent
+      check already excludes it; this is an extra, explicit guard. Unreadable approval state
+      skips only this extra check (logged) — it must not stop a public copy being removed.
+    """
+    provenance_recorded = bool(entry.get("temporary_copy"))
+    protected = []
+    try:
+        pending = state.get_pending_approval()
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        _log.warning("could not read approval state for protected ids: %s", type(exc).__name__)
+        pending = None
+    if pending and pending.get("drive_video_file_id"):
+        protected.append(pending["drive_video_file_id"])
+    return {
+        "root_folder_id": os.environ.get("DRIVE_ROOT_FOLDER_ID") or None,
+        "recorded_parent_id": entry.get("parent_id") if provenance_recorded else None,
+        "expected_name": entry.get("name") if provenance_recorded else None,
+        "protected_ids": protected,
+    }
+
+
+def alert_text(entry: dict, refused: "Exception | None" = None) -> str:
     """Build the admin alert for a Drive share link that could not be revoked.
 
     The first alert and every re-escalation use this same wording, differing only in the
@@ -319,6 +364,17 @@ def alert_text(entry: dict) -> str:
     project_name = entry.get("project_name", "unknown")
     file_id = entry.get("file_id", "unknown")
     since = entry.get("recorded_at", "unknown")
+    if refused is not None:
+        return (
+            f"⚠️ Instagram: FieldKit REFUSED to delete Drive file {file_id} recorded for "
+            f"{project_name} — {refused}. It does not look like the temporary copy FieldKit "
+            "created, so nothing was changed.\n"
+            f"Attempts: {attempts}, first recorded: {since}.\n"
+            "FieldKit keeps the cleanup entry and will remind you daily. Check that file in "
+            "Drive: if it is a leftover temporary copy, delete it permanently (and empty it "
+            "from the trash); if it is client content, the entry in instagram_state.json "
+            "is wrong and needs checking."
+        )
     return (
         f"⚠️ Instagram: could not remove the temporary public link for {project_name} "
         f"(Drive file {file_id}). The video may still be publicly reachable.\n"

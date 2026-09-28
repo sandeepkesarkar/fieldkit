@@ -1208,7 +1208,7 @@ def test_share_drain_runs_with_instagram_unconfigured_and_no_job(base, revoke):
     assert "IG_BUSINESS_ACCOUNT_ID" not in os.environ
     _record_due_cleanup()
     main([])
-    revoke.assert_called_once_with("orphan_file")
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)
     assert _cleanup_ids() == []
 
 
@@ -1220,7 +1220,7 @@ def test_share_drain_needs_no_meta_token(base, revoke, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         main([])
     assert exc.value.code == 1  # the Facebook misconfiguration is still reported...
-    revoke.assert_called_once_with("orphan_file")  # ...after the link was revoked
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)  # ...after the link was revoked
     assert _cleanup_ids() == []
 
 
@@ -1232,7 +1232,7 @@ def test_share_drain_runs_even_when_another_facebook_tick_holds_the_upload_lock(
     mocker.patch.object(uf, "_try_acquire_upload_lock", return_value=None)
     _record_due_cleanup()
     main([])
-    revoke.assert_called_once_with("orphan_file")
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)
 
 
 def test_share_drain_leaves_a_link_a_live_instagram_attempt_may_be_using(base, revoke):
@@ -1324,7 +1324,7 @@ def test_slow_timing_out_revokes_do_not_delay_the_facebook_publish(with_pending,
         # Revokes that already failed once: due for revoking under any version of the rule.
         ig_state.record_share_cleanup(f"orphan_{n}", _PROJECT)
 
-    def _slow_timeout(file_id):
+    def _slow_timeout(file_id, **kwargs):
         events.append(("revoke", time.monotonic()))
         time.sleep(0.2)
         raise RuntimeError("Drive revoke share link request failed: read timed out")
@@ -1350,7 +1350,7 @@ def test_share_drain_still_runs_on_a_tick_with_no_facebook_job(base, revoke):
     """Moving the drain after the publish path must not make it depend on there being one."""
     _record_due_cleanup()
     main([])
-    revoke.assert_called_once_with("orphan_file")
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)
 
 
 def test_facebook_only_client_tick_creates_no_instagram_files(base, revoke, tmp_path, monkeypatch):

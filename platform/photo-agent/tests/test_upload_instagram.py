@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 
 import pytest
+from unittest.mock import ANY
 
 from scripts.upload_instagram import main
 from tools.instagram_api import (
@@ -410,7 +411,7 @@ def test_happy_path_revokes_the_share_link(with_pending):
     """The temporary public link is revoked once Instagram has the video."""
     import scripts.upload_instagram as ui
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
 
 
 def test_happy_path_sends_telegram_confirmation_with_real_permalink(with_pending):
@@ -590,7 +591,7 @@ def test_pending_cleanups_are_retried_every_tick(base):
         {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
     ]
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1", provenance=ANY)
     ui.instagram_state.clear_share_cleanup.assert_called_once_with("stale_file_1")
 
 
@@ -602,7 +603,7 @@ def test_pending_cleanups_are_retried_even_with_no_job(base):
         {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 3},
     ]
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1", provenance=ANY)
 
 
 def test_failed_cleanup_retry_stays_recorded(base):
@@ -634,7 +635,7 @@ def test_cleanup_drains_when_instagram_is_disabled(base, monkeypatch):
         {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
     ]
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1", provenance=ANY)
     ui.instagram_state.clear_share_cleanup.assert_called_once_with("stale_file_1")
 
 
@@ -648,7 +649,7 @@ def test_cleanup_drains_when_page_token_is_missing(base, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         main([])
     assert exc.value.code == 1  # still reports the misconfiguration...
-    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1")  # ...but cleans up first
+    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1", provenance=ANY)  # ...but cleans up first
 
 
 def test_cleanup_still_drains_with_instagram_disabled_and_no_token(base, monkeypatch):
@@ -660,7 +661,7 @@ def test_cleanup_still_drains_with_instagram_disabled_and_no_token(base, monkeyp
         {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 9},
     ]
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("stale_file_1", provenance=ANY)
 
 
 def test_disabled_instagram_still_publishes_nothing(base, monkeypatch):
@@ -711,7 +712,7 @@ def test_instagram_drain_revokes_a_fresh_intent_left_by_a_killed_attempt(base):
          "recorded_at": datetime.now(timezone.utc).isoformat()},
     ]
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("killed_file")
+    ui.drive.delete_temporary_share.assert_called_once_with("killed_file", provenance=ANY)
     ui.instagram_state.clear_share_cleanup.assert_called_once_with("killed_file")
 
 
@@ -846,7 +847,7 @@ def test_transient_failure_revokes_the_share_link(failing):
     """The public link is revoked even when the attempt fails."""
     import scripts.upload_instagram as ui
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
 
 
 def test_transient_failure_sends_no_alert(failing):
@@ -1066,7 +1067,7 @@ def test_token_error_revokes_the_share_link(with_pending):
     import scripts.upload_instagram as ui
     ui.instagram_api.create_media_container.side_effect = InstagramTokenError("expired")
     main([])
-    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
 
 
 def test_token_error_during_poll_is_terminal(with_pending):
@@ -1096,7 +1097,7 @@ def test_stuck_container_times_out_and_retries(with_pending):
     main([])
     ui.instagram_api.publish_container.assert_not_called()
     ui.instagram_state.release_claim.assert_called_once_with(_IDEM_KEY)
-    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
 
 
 def test_stuck_container_polls_the_full_300_second_cap(with_pending):
@@ -1587,7 +1588,9 @@ def test_the_cleanup_obligation_is_registered_before_the_file_is_shared(with_pen
     import scripts.upload_instagram as ui
     intent = mocker.patch.object(ui.instagram_state, "record_share_intent")
     main([])
-    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT, owner=mocker.ANY)
+    intent.assert_called_once_with(
+        _SHARE_FILE_ID, _PROJECT, owner=mocker.ANY, parent_id=mocker.ANY, name="video.mp4"
+    )
     # ...fenced by this attempt's owner token (issue #80): see tools/share_cleanup.py.
     assert re.fullmatch(r"[0-9a-f]{32}", intent.call_args.kwargs["owner"])
 
@@ -1611,10 +1614,12 @@ def test_a_share_call_that_raises_after_creating_the_permission_is_still_revocab
 
     ui.drive.create_temporary_share_link.side_effect = _share_then_lose_the_response
     main([])
-    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT, owner=mocker.ANY)
+    intent.assert_called_once_with(
+        _SHARE_FILE_ID, _PROJECT, owner=mocker.ANY, parent_id=mocker.ANY, name="video.mp4"
+    )
     # ...fenced by this attempt's owner token (issue #80): see tools/share_cleanup.py.
     assert re.fullmatch(r"[0-9a-f]{32}", intent.call_args.kwargs["owner"])
-    ui.drive.delete_temporary_share.assert_called_once_with(_SHARE_FILE_ID)
+    ui.drive.delete_temporary_share.assert_called_once_with(_SHARE_FILE_ID, provenance=ANY)
 
 
 def test_a_successful_revoke_retires_the_obligation(with_pending):
@@ -2254,3 +2259,41 @@ def test_a_settlement_only_follows_a_definitive_status(with_pending):
     ui.instagram_api.get_container_status.side_effect = InstagramUploadError("graph down")
     main([])
     ui.instagram_state.mark_publish_settled.assert_not_called()
+
+
+def test_the_obligation_records_the_copys_provenance(with_pending, mocker, monkeypatch):
+    """Issue #80 round 4: the entry says it is a temporary copy, in which folder and under
+    which name, so cleanup can refuse to permanently delete anything else."""
+    import scripts.upload_instagram as ui
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root_folder_1")
+    intent = mocker.patch.object(ui.instagram_state, "record_share_intent")
+    main([])
+    intent.assert_called_once_with(
+        _SHARE_FILE_ID, _PROJECT, owner=mocker.ANY, parent_id="root_folder_1", name="video.mp4"
+    )
+
+
+def test_the_attempt_verifies_its_copy_before_deleting_it(with_pending, monkeypatch):
+    """The attempt's own cleanup hands delete_temporary_share() that same provenance."""
+    import scripts.upload_instagram as ui
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root_folder_1")
+    main([])
+    provenance = ui.drive.delete_temporary_share.call_args.kwargs["provenance"]
+    assert provenance["root_folder_id"] == "root_folder_1"
+    assert provenance["recorded_parent_id"] == "root_folder_1"
+    assert provenance["expected_name"] == "video.mp4"
+
+
+def test_a_refused_deletion_keeps_the_obligation_and_says_why(with_pending):
+    """A refusal is not a success: nothing is retired, and the alert says it was refused."""
+    import scripts.upload_instagram as ui
+    from tools.drive import TemporaryShareRefused
+    ui.drive.delete_temporary_share.side_effect = TemporaryShareRefused(
+        f"refused to delete Drive file {_SHARE_FILE_ID}: it is not directly inside the "
+        "configured Drive root folder"
+    )
+    main([])
+    ui.instagram_state.clear_share_cleanup.assert_not_called()
+    ui.instagram_state.record_share_cleanup.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+    texts = [c.args[1] for c in ui.telegram_api.send_message.call_args_list]
+    assert any("REFUSED to delete" in t and "not directly inside" in t for t in texts)

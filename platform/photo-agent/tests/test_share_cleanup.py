@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from unittest.mock import ANY
 
 import tools.instagram_state as ig_state
 from tools import share_cleanup
@@ -132,7 +133,7 @@ def test_live_owners_overdue_copy_is_deleted_and_the_obligation_retired(
     ig_state.record_share_intent("stalled_file", _PROJECT, owner=token)
     _age_entry("stalled_file", _OVERDUE)
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=holds_instagram_lock)
-    revoke.assert_called_once_with("stalled_file")
+    revoke.assert_called_once_with("stalled_file", provenance=ANY)
     assert _file_ids() == []
 
 
@@ -141,7 +142,7 @@ def test_live_owners_failed_cleanup_is_due_at_once(revoke, live_owner):
     ig_state.record_share_intent("f", _PROJECT, owner=token)
     ig_state.record_share_cleanup("f", _PROJECT)  # the attempt's own cleanup failed
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
-    revoke.assert_called_once_with("f")
+    revoke.assert_called_once_with("f", provenance=ANY)
     assert _file_ids() == []
 
 
@@ -174,7 +175,7 @@ def test_done_owners_fresh_link_is_revoked_and_cleared_at_once(
     token = _dead_owner()
     ig_state.record_share_intent("f", _PROJECT, owner=token)
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=holds_instagram_lock)
-    revoke.assert_called_once_with("f")
+    revoke.assert_called_once_with("f", provenance=ANY)
     assert _file_ids() == []
 
 
@@ -198,7 +199,7 @@ def test_killed_owners_leftover_file_is_removed_once_its_obligation_clears(
 def test_ownerless_entry_is_cleared_by_the_instagram_lock_holder(revoke):
     ig_state.record_share_intent("legacy", _PROJECT)
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=True)
-    revoke.assert_called_once_with("legacy")
+    revoke.assert_called_once_with("legacy", provenance=ANY)
     assert _file_ids() == []
 
 
@@ -212,7 +213,7 @@ def test_ownerless_overdue_entry_is_deleted_and_retired_by_other_callers(revoke)
     ig_state.record_share_intent("legacy", _PROJECT)
     _age_entry("legacy", _OVERDUE)
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
-    revoke.assert_called_once_with("legacy")
+    revoke.assert_called_once_with("legacy", provenance=ANY)
     assert _file_ids() == []
 
 
@@ -262,7 +263,7 @@ def test_retry_failure_does_not_resurrect_an_entry_another_worker_cleared(mocker
     """The other drain revoked and cleared it between our read and our failed retry."""
     ig_state.record_share_intent("raced", _PROJECT, owner=_dead_owner())
 
-    def _other_worker_cleared_it_then_drive_failed(file_id):
+    def _other_worker_cleared_it_then_drive_failed(file_id, **kwargs):
         ig_state.clear_share_cleanup(file_id)
         raise RuntimeError("Drive down")
 
@@ -313,7 +314,7 @@ def test_drain_skips_without_waiting_when_another_drain_holds_the_lock(revoke, i
     finally:
         held.close()
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=True)
-    revoke.assert_called_once_with("f1")
+    revoke.assert_called_once_with("f1", provenance=ANY)
 
 
 def test_drain_lock_is_released_after_a_drain_that_raised(mocker, isolated_state):
@@ -335,7 +336,7 @@ def test_drain_does_not_need_the_instagram_upload_lock(revoke, isolated_state):
         share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
     finally:
         held.close()
-    revoke.assert_called_once_with("f1")
+    revoke.assert_called_once_with("f1", provenance=ANY)
 
 
 def test_drain_with_no_instagram_state_creates_nothing(revoke, isolated_state):
@@ -407,3 +408,156 @@ def test_sweep_keeps_young_referenced_or_live_owner_files(isolated_state, live_o
 def test_sweep_creates_nothing_when_there_is_no_owner_directory(isolated_state):
     assert share_cleanup.sweep_dead_owner_files() == 0
     assert not isolated_state.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 round 4 — a corrupted or hand-edited state file must not become data loss
+# ---------------------------------------------------------------------------
+#
+# These run the REAL drive.delete_temporary_share() against a fake Drive at the HTTP layer
+# (requests.get / requests.delete), so the provenance check is exercised exactly as in
+# production. The entries are written straight into instagram_state.json, as a corrupted
+# or hand-edited file would be.
+
+_ROOT_ID = "root_folder_1"
+_PROJECT_FOLDER_ID = "project_folder_1"
+_APPROVED_VIDEO_ID = "approved_video_1"
+
+
+class _HttpDrive:
+    """Files by id; GET answers metadata or 404, DELETE removes. Nothing real is reached."""
+
+    def __init__(self):
+        self.files = {
+            _ROOT_ID: {"mimeType": "application/vnd.google-apps.folder", "parents": [],
+                       "name": "FieldKit"},
+            _PROJECT_FOLDER_ID: {"mimeType": "application/vnd.google-apps.folder",
+                                 "parents": [_ROOT_ID], "name": "kitchen_remodel"},
+            _APPROVED_VIDEO_ID: {"mimeType": "video/mp4", "parents": [_PROJECT_FOLDER_ID],
+                                 "name": "kitchen_remodel.mp4"},
+            "temp_copy_1": {"mimeType": "video/mp4", "parents": [_ROOT_ID],
+                            "name": "kitchen_remodel.mp4"},
+        }
+        self.deleted = []
+
+    @staticmethod
+    def _resp(code, body=None):
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.status_code = code
+        m.ok = 200 <= code < 300
+        m.json.return_value = body or {}
+        return m
+
+    def get(self, url, **kwargs):
+        file_id = url.rsplit("/", 1)[-1]
+        meta = self.files.get(file_id)
+        return self._resp(404) if meta is None else self._resp(200, dict(meta, id=file_id))
+
+    def delete(self, url, **kwargs):
+        file_id = url.rsplit("/", 1)[-1]
+        if self.files.pop(file_id, None) is None:
+            return self._resp(404)
+        self.deleted.append(file_id)
+        return self._resp(204)
+
+
+@pytest.fixture
+def http_drive(mocker, monkeypatch):
+    fake = _HttpDrive()
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", _ROOT_ID)
+    mocker.patch.object(share_cleanup.drive, "_get_access_token", return_value="tok")
+    revoke = mocker.patch.object(share_cleanup.drive, "revoke_share_link")
+    mocker.patch("requests.get", side_effect=fake.get)
+    mocker.patch("requests.delete", side_effect=fake.delete)
+    mocker.patch.object(
+        share_cleanup.state, "get_pending_approval",
+        return_value={"drive_video_file_id": _APPROVED_VIDEO_ID},
+    )
+    fake.revoke = revoke
+    return fake
+
+
+def _hand_write_entries(entries):
+    """Write pending_share_cleanups straight into the state file, bypassing the API."""
+    ig_state.record_share_intent("placeholder", _PROJECT)  # create a valid state file
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    raw["pending_share_cleanups"] = entries
+    ig_state.STATE_FILE.write_text(json.dumps(raw, indent=2))
+
+
+def _forged(file_id, **extra):
+    entry = {
+        "file_id": file_id, "project_name": _PROJECT, "attempts": 1,
+        "recorded_at": "2020-01-01T00:00:00+00:00", "last_attempt_at": None,
+        "last_alerted_at": None, "owner": None,
+    }
+    entry.update(extra)
+    return entry
+
+
+_CORRUPTED_ENTRIES = {
+    # Forged provenance claiming the approved video is a temporary copy in the root.
+    "forged entry naming the client's approved video": _forged(
+        _APPROVED_VIDEO_ID, temporary_copy=True, parent_id=_ROOT_ID,
+        name="kitchen_remodel.mp4",
+    ),
+    "legacy entry naming the client's approved video": _forged(_APPROVED_VIDEO_ID),
+    "legacy entry naming a project folder": _forged(_PROJECT_FOLDER_ID),
+    "legacy entry naming the Drive root folder": _forged(_ROOT_ID),
+}
+
+
+@pytest.mark.parametrize("case", list(_CORRUPTED_ENTRIES))
+def test_corrupted_state_cannot_make_cleanup_delete_client_content(http_drive, case):
+    _hand_write_entries([_CORRUPTED_ENTRIES[case]])
+    target = _CORRUPTED_ENTRIES[case]["file_id"]
+    alerts = []
+    for holds in (False, True):
+        share_cleanup.drain(alerts.append, holds_instagram_lock=holds)
+
+    assert target in http_drive.files          # still there
+    assert http_drive.deleted == []            # nothing deleted
+    http_drive.revoke.assert_not_called()      # nor even unshared
+    assert _file_ids() == [target]             # the obligation is kept, not dropped
+    assert len(alerts) == 1                    # one alert, however often it is retried
+    assert "REFUSED to delete" in alerts[0] and target in alerts[0]
+    assert "http" not in alerts[0]
+
+
+def test_a_genuine_copy_is_still_deleted_and_retired(http_drive):
+    """The check must not stop legitimate cleanup — recorded provenance or legacy entry."""
+    http_drive.files["temp_copy_2"] = dict(http_drive.files["temp_copy_1"])
+    _hand_write_entries([
+        _forged("temp_copy_1", temporary_copy=True, parent_id=_ROOT_ID,
+                name="kitchen_remodel.mp4"),
+        _forged("temp_copy_2"),  # legacy: no provenance recorded
+    ])
+    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
+    assert sorted(http_drive.deleted) == ["temp_copy_1", "temp_copy_2"]
+    assert _file_ids() == []
+    assert _APPROVED_VIDEO_ID in http_drive.files
+
+
+def test_unconfigured_root_folder_refuses_rather_than_guesses(http_drive, monkeypatch):
+    monkeypatch.delenv("DRIVE_ROOT_FOLDER_ID")
+    _hand_write_entries([
+        _forged("temp_copy_1", temporary_copy=True, parent_id=_ROOT_ID,
+                name="kitchen_remodel.mp4"),
+    ])
+    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
+    assert http_drive.deleted == []
+    assert _file_ids() == ["temp_copy_1"]
+
+
+def test_provenance_for_uses_recorded_values_only_for_marked_entries(monkeypatch, mocker):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", _ROOT_ID)
+    mocker.patch.object(share_cleanup.state, "get_pending_approval", return_value=None)
+    marked = share_cleanup.provenance_for(
+        {"file_id": "f", "temporary_copy": True, "parent_id": "p", "name": "n.mp4"}
+    )
+    assert marked == {"root_folder_id": _ROOT_ID, "recorded_parent_id": "p",
+                      "expected_name": "n.mp4", "protected_ids": []}
+    # Unmarked (legacy or hand-written) entries cannot vouch for themselves.
+    unmarked = share_cleanup.provenance_for({"file_id": "f", "parent_id": "p", "name": "n"})
+    assert unmarked["recorded_parent_id"] is None and unmarked["expected_name"] is None

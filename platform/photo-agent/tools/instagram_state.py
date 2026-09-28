@@ -1060,7 +1060,13 @@ def is_published(idempotency_key: str) -> bool:
 # public stays public whether or not anyone intends to publish another Reel.
 
 
-def record_share_intent(file_id: str, project_name: str, owner: str | None = None) -> None:
+def record_share_intent(
+    file_id: str,
+    project_name: str,
+    owner: str | None = None,
+    parent_id: str | None = None,
+    name: str | None = None,
+) -> None:
     """Register a cleanup obligation for a Drive file BEFORE it is made public.
 
     Called from drive.create_temporary_share_link()'s on_file_id hook, at the one moment
@@ -1083,6 +1089,12 @@ def record_share_intent(file_id: str, project_name: str, owner: str | None = Non
     It is what lets a drain in EITHER cron worker tell an obligation whose attempt may still
     grant or keep the permission — which it must never clear — from one whose attempt is
     provably done. See tools/share_cleanup.py.
+
+    parent_id and name are the PROVENANCE of the temporary copy — the Drive folder it was
+    uploaded into and the name it was uploaded under — and the entry is marked
+    temporary_copy=True. drive.delete_temporary_share() checks the live file against them
+    before any permanent deletion, so a corrupted or hand-edited entry naming a client's
+    real file is refused rather than deleted.
     """
     now = datetime.now(timezone.utc).isoformat()
     with _transaction() as txn:
@@ -1098,6 +1110,9 @@ def record_share_intent(file_id: str, project_name: str, owner: str | None = Non
             "last_alerted_at": None,
             "attempts": 0,
             "owner": owner,
+            "temporary_copy": True,
+            "parent_id": parent_id,
+            "name": name,
         })
         txn.commit()
     logger.info(

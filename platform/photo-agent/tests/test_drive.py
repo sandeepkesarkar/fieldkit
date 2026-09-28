@@ -758,68 +758,106 @@ def test_the_anyone_permission_carries_no_expiration_time(mocker, share_env, vid
     assert "allowFileDiscovery" not in body
 
 
-# --- delete_temporary_share (issue #80 round 3) ---
+# --- delete_temporary_share (issue #80 rounds 3 and 4) ---
 #
-# A revoke proves only that no public permission is visible at that moment; a permission
-# POST whose response was lost may still land afterwards. Only a confirmed permanent
-# deletion ends the exposure for good, so this function must raise unless files.get
-# answers 404 after files.delete.
+# Round 3: a revoke proves only that no public permission is visible at that moment; a
+# permission POST whose response was lost may still land afterwards. Only a confirmed
+# permanent deletion ends the exposure for good, so this function must raise unless
+# files.get answers 404 after files.delete.
+#
+# Round 4: the file id comes from instagram_state.json, which could be corrupted or
+# hand-edited to name a client's real file. So the live file is verified against its
+# recorded provenance FIRST, and a mismatch is refused having changed nothing.
 
-def _status(code: int) -> MagicMock:
+_ROOT_ID = "root_folder_1"
+_PROJECT_FOLDER_ID = "project_folder_1"
+_APPROVED_VIDEO_ID = "approved_video_1"
+
+_TEMP_COPY_META = {
+    "id": _FILE_ID, "name": "kitchen.mp4", "mimeType": "video/mp4",
+    "parents": [_ROOT_ID], "trashed": False,
+}
+
+
+def _provenance(**overrides):
+    base = {
+        "root_folder_id": _ROOT_ID,
+        "recorded_parent_id": _ROOT_ID,
+        "expected_name": "kitchen.mp4",
+        "protected_ids": [_APPROVED_VIDEO_ID],
+    }
+    base.update(overrides)
+    return base
+
+
+def _status(code: int, body: dict | None = None) -> MagicMock:
     m = MagicMock()
     m.status_code = code
     m.ok = 200 <= code < 300
-    m.json.return_value = {"id": _FILE_ID, "trashed": False}
+    m.json.return_value = body if body is not None else {"id": _FILE_ID, "trashed": False}
     return m
 
 
 @pytest.fixture
 def share_delete(mocker):
+    """Drive answers: metadata of a genuine temporary copy, then 404 after the delete."""
     mocker.patch("tools.drive._get_access_token", return_value="tok")
     revoke = mocker.patch("tools.drive.revoke_share_link")
     delete = mocker.patch("requests.delete", return_value=_status(204))
-    get = mocker.patch("requests.get", return_value=_status(404))
+    get = mocker.patch(
+        "requests.get", side_effect=[_status(200, dict(_TEMP_COPY_META)), _status(404)]
+    )
     return revoke, delete, get
 
 
-def test_delete_temporary_share_revokes_then_permanently_deletes_then_confirms(share_delete):
+def test_delete_temporary_share_verifies_then_revokes_deletes_and_confirms(share_delete):
     revoke, delete, get = share_delete
-    delete_temporary_share(_FILE_ID)
+    delete_temporary_share(_FILE_ID, provenance=_provenance())
     revoke.assert_called_once_with(_FILE_ID)
-    assert delete.call_args.args[0].endswith(f"/files/{_FILE_ID}")   # files.delete,
-    assert get.call_args.args[0].endswith(f"/files/{_FILE_ID}")      # then files.get
+    assert delete.call_args.args[0].endswith(f"/files/{_FILE_ID}")          # files.delete
+    first, second = get.call_args_list
+    assert "parents" in first.kwargs["params"]["fields"]                      # verify first,
+    assert second.args[0].endswith(f"/files/{_FILE_ID}")                      # confirm after
+
+
+def test_delete_temporary_share_requires_provenance():
+    """Keyword-only and required: a caller cannot skip verification by leaving it out."""
+    with pytest.raises(TypeError):
+        delete_temporary_share(_FILE_ID)  # noqa — the point of the test
 
 
 def test_delete_temporary_share_never_trashes(share_delete, mocker):
     """Trash is not the end of exposure: a trashed file stays reachable to others."""
     patch_ = mocker.patch("requests.patch")
     post = mocker.patch("requests.post")
-    delete_temporary_share(_FILE_ID)
+    delete_temporary_share(_FILE_ID, provenance=_provenance())
     patch_.assert_not_called()
     post.assert_not_called()
 
 
 def test_delete_temporary_share_raises_if_the_file_is_still_there(share_delete):
     _, _, get = share_delete
-    get.return_value = _status(200)          # e.g. still present, or merely trashed
+    get.side_effect = [_status(200, dict(_TEMP_COPY_META)), _status(200)]
     with pytest.raises(RuntimeError, match="still exists"):
-        delete_temporary_share(_FILE_ID)
+        delete_temporary_share(_FILE_ID, provenance=_provenance())
 
 
 @pytest.mark.parametrize("code", [500, 503, 403])
 def test_delete_temporary_share_raises_if_deletion_cannot_be_confirmed(share_delete, code):
     _, _, get = share_delete
-    get.return_value = _status(code)
+    get.side_effect = [_status(200, dict(_TEMP_COPY_META)), _status(code)]
     with pytest.raises(RuntimeError, match="could not confirm"):
-        delete_temporary_share(_FILE_ID)
+        delete_temporary_share(_FILE_ID, provenance=_provenance())
 
 
 def test_delete_temporary_share_raises_if_the_confirming_read_times_out(share_delete):
     import requests as _requests
     _, _, get = share_delete
-    get.side_effect = _requests.exceptions.ReadTimeout("read timed out")
+    get.side_effect = [
+        _status(200, dict(_TEMP_COPY_META)), _requests.exceptions.ReadTimeout("read timed out"),
+    ]
     with pytest.raises(RuntimeError, match="could not confirm"):
-        delete_temporary_share(_FILE_ID)
+        delete_temporary_share(_FILE_ID, provenance=_provenance())
 
 
 @pytest.mark.parametrize("code", [500, 503, 403])
@@ -827,8 +865,8 @@ def test_delete_temporary_share_raises_on_a_failed_delete(share_delete, code):
     _, delete, get = share_delete
     delete.return_value = _status(code)
     with pytest.raises(RuntimeError, match="delete failed"):
-        delete_temporary_share(_FILE_ID)
-    get.assert_not_called()
+        delete_temporary_share(_FILE_ID, provenance=_provenance())
+    assert get.call_count == 1  # the verification read only; no confirmation claimed
 
 
 def test_delete_temporary_share_raises_on_a_delete_that_times_out(share_delete):
@@ -837,19 +875,93 @@ def test_delete_temporary_share_raises_on_a_delete_that_times_out(share_delete):
     _, delete, _ = share_delete
     delete.side_effect = _requests.exceptions.ReadTimeout("read timed out")
     with pytest.raises(RuntimeError, match="delete request failed"):
-        delete_temporary_share(_FILE_ID)
+        delete_temporary_share(_FILE_ID, provenance=_provenance())
 
 
-def test_delete_temporary_share_accepts_an_already_deleted_file_once_confirmed(share_delete):
-    _, delete, get = share_delete
-    delete.return_value = _status(404)
-    delete_temporary_share(_FILE_ID)          # must not raise
-    get.assert_called_once()
+def test_delete_temporary_share_accepts_a_file_already_gone_at_verification(share_delete):
+    revoke, delete, get = share_delete
+    get.side_effect = [_status(404)]
+    delete_temporary_share(_FILE_ID, provenance=_provenance())   # must not raise
+    delete.assert_not_called()
+    revoke.assert_not_called()
 
 
 def test_delete_temporary_share_still_deletes_when_the_revoke_fails(share_delete):
     """The revoke is only the fast first step; deletion ends the exposure regardless."""
     revoke, delete, _ = share_delete
     revoke.side_effect = RuntimeError("Drive revoke share link failed: HTTP 503")
-    delete_temporary_share(_FILE_ID)
+    delete_temporary_share(_FILE_ID, provenance=_provenance())
     delete.assert_called_once()
+
+
+@pytest.mark.parametrize("code", [500, 403])
+def test_delete_temporary_share_changes_nothing_if_it_cannot_verify(share_delete, code):
+    revoke, delete, get = share_delete
+    get.side_effect = [_status(code)]
+    with pytest.raises(RuntimeError, match="could not read file"):
+        delete_temporary_share(_FILE_ID, provenance=_provenance())
+    revoke.assert_not_called()
+    delete.assert_not_called()
+
+
+# The refusals. Each describes a real file that a corrupted or hand-edited cleanup entry
+# could point at; none may be revoked or deleted.
+_REFUSALS = {
+    "the client's approved video, inside the project folder": (
+        dict(_TEMP_COPY_META, parents=[_PROJECT_FOLDER_ID]), {}, "not directly inside",
+    ),
+    "a project folder, directly under the root": (
+        dict(_TEMP_COPY_META, id=_PROJECT_FOLDER_ID, name="kitchen_remodel",
+             mimeType="application/vnd.google-apps.folder"), {}, "is a folder",
+    ),
+    "a photo directly under the root": (
+        dict(_TEMP_COPY_META, mimeType="image/jpeg", name="photo.jpg"), {}, "not a video",
+    ),
+    "a different video directly under the root": (
+        dict(_TEMP_COPY_META, name="some_other_video.mp4"), {}, "name does not match",
+    ),
+    "an entry recorded under a different root than the configured one": (
+        dict(_TEMP_COPY_META), {"recorded_parent_id": "old_root"}, "recorded at creation",
+    ),
+    "no configured root folder": (
+        dict(_TEMP_COPY_META), {"root_folder_id": None}, "not configured",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_REFUSALS))
+def test_delete_temporary_share_refuses_what_is_not_the_temporary_copy(share_delete, case):
+    from tools.drive import TemporaryShareRefused
+    revoke, delete, get = share_delete
+    meta, provenance_overrides, reason = _REFUSALS[case]
+    get.side_effect = [_status(200, meta)]
+    with pytest.raises(TemporaryShareRefused, match=reason):
+        delete_temporary_share(meta["id"], provenance=_provenance(**provenance_overrides))
+    revoke.assert_not_called()
+    delete.assert_not_called()
+
+
+@pytest.mark.parametrize("target", [_ROOT_ID, _APPROVED_VIDEO_ID])
+def test_delete_temporary_share_refuses_the_root_folder_and_protected_ids(share_delete, target):
+    from tools.drive import TemporaryShareRefused
+    revoke, delete, get = share_delete
+    get.side_effect = [_status(200, dict(_TEMP_COPY_META, id=target))]
+    with pytest.raises(TemporaryShareRefused):
+        delete_temporary_share(target, provenance=_provenance())
+    revoke.assert_not_called()
+    delete.assert_not_called()
+
+
+def test_legacy_entry_without_provenance_is_checked_on_parent_and_type(share_delete):
+    """An entry from before provenance was recorded: no recorded parent or name, so the
+    live file must still be a video directly in the configured root."""
+    from tools.drive import TemporaryShareRefused
+    _, delete, get = share_delete
+    legacy = _provenance(recorded_parent_id=None, expected_name=None)
+    delete_temporary_share(_FILE_ID, provenance=legacy)          # a genuine copy: deleted
+    delete.assert_called_once()
+    delete.reset_mock()
+    get.side_effect = [_status(200, dict(_TEMP_COPY_META, parents=[_PROJECT_FOLDER_ID]))]
+    with pytest.raises(TemporaryShareRefused):
+        delete_temporary_share(_FILE_ID, provenance=legacy)
+    delete.assert_not_called()

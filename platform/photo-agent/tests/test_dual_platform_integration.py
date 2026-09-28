@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 
 import pytest
+from unittest.mock import ANY
 
 import tools.facebook_state as fb_state
 import tools.instagram_state as ig_state
@@ -610,7 +611,7 @@ def test_cleanup_still_drains_after_instagram_is_disabled(cron, video, monkeypat
 
     ig_main([])
 
-    ui.drive.delete_temporary_share.assert_called_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_with("drive_file_1", provenance=ANY)
     assert ig_state.list_share_cleanups() == []
 
 
@@ -952,7 +953,7 @@ def test_link_left_by_a_killed_instagram_worker_is_revoked_by_the_facebook_worke
         fb_main([])
 
     # ...the link was revoked anyway, with no Instagram config and no Meta token at all.
-    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
     assert ig_state.list_share_cleanups() == []
 
 
@@ -975,7 +976,7 @@ def test_facebook_tick_during_a_live_instagram_attempt_does_not_revoke_its_link(
     assert revokes_seen_by_facebook_tick == [0]
     assert ig_state.is_published(_IDEM_KEY) is True
     # Instagram's own exit path revoked it, exactly once.
-    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
     assert ig_state.list_share_cleanups() == []
 
 
@@ -1067,7 +1068,7 @@ class _FakeDrive:
     def revoke(self, file_id):
         self.public.discard(file_id)
 
-    def delete_temporary(self, file_id):
+    def delete_temporary(self, file_id, **kwargs):
         self.public.discard(file_id)
         self.files.discard(file_id)
 
@@ -1202,7 +1203,7 @@ class _LateGrantDrive:
         # Lists permissions and deletes the public ones: sees none yet, "succeeds".
         self.public.discard(file_id)
 
-    def delete_temporary(self, file_id):
+    def delete_temporary(self, file_id, **kwargs):
         if self.delete_fails:
             raise RuntimeError("Drive delete failed: HTTP 503")
         self.public.discard(file_id)

@@ -312,6 +312,19 @@ for a trashed file ["other users can still access the file in the owner's trash 
 it's permanently deleted"](https://developers.google.com/workspace/drive/api/guides/delete).
 A delete that fails, or cannot be confirmed, keeps the obligation.
 
+**Verified before it is deleted.** The file ID comes from `instagram_state.json`, so a
+corrupted or hand-edited entry could name a client's real file. Each entry therefore
+records that it is a temporary copy, the folder it was uploaded into and its name, and
+before touching anything `drive.delete_temporary_share()` reads the live file and
+checks it: it must be a video, not a folder, directly inside the configured
+`DRIVE_ROOT_FOLDER_ID` (the approved video lives one level down, in the project folder),
+not the root folder itself, not the pending approval's video, and — when recorded —
+under the same parent and name it was created with. Anything else is **refused with
+nothing changed** (not even unshared); the entry stays, both crons keep retrying, and the
+admin gets a daily alert saying it was refused and why. Entries written before this
+check existed carry no recorded name, so for those only the parent, type and root
+checks apply.
+
 This is also *the* time bound on the exposure, because Drive cannot provide one.
 The Drive API's `permissions.expirationTime` is restricted to user and group
 permissions — an `anyone` permission cannot carry one — so there is no server-side
@@ -775,6 +788,7 @@ these scripts would expose an operator tool as an owner-facing command.
 | `IG_TOKEN_EXP` | Page token expired — the Facebook upload will be failing too; reconnect once, fixes both |
 | Alert naming a Drive file that "may still be publicly reachable" | Deleting the temporary copy failed, or could not be confirmed; FieldKit keeps retrying each tick and re-alerts daily. Check `pending_share_cleanups` in `instagram_state.json`; to fix it now, permanently delete that file in Drive (delete it, then empty it from the trash — a trashed file is still reachable) and the next tick confirms it and clears the entry |
 | The same share-link alert arriving daily | Cleanup is still failing after many attempts. The `attempts` count in the alert says how many. Resolve it manually in Drive as above — the reminder stops as soon as a deletion is confirmed |
+| Alert saying FieldKit "REFUSED to delete" a Drive file | The cleanup entry names a file that does not look like FieldKit's temporary copy (wrong folder, a folder, not a video, name mismatch, or `DRIVE_ROOT_FOLDER_ID` unset). Nothing was changed. Check the file in Drive: a leftover temporary copy can be deleted permanently by hand; client content means the entry in `instagram_state.json` is wrong |
 | Confirmation says "could not fetch the post link" | The Reel published, but the permalink lookup failed. Check the account directly; no retry is attempted since the post is already live |
 | Local video still on disk after a publish | Expected while the other platform's job for that approval is still pending — the last one to resolve deletes it |
 | A video can't be re-approved; `IG_BLOCKED` in the log | Its earlier publish is quarantined. Wait for the drain, or run `resolve_instagram_quarantine.py resolve <container_id>`. See "Resolving a quarantine by hand" |

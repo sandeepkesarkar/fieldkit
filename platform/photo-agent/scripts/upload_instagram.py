@@ -416,7 +416,9 @@ def _process_upload(
     attempt_number = attempt_count + 1
     instagram_logger.log_upload_started(project_name, attempt_number)
 
-    share_file_id = None
+    # The temporary copy this attempt creates, with the provenance recorded for it — set by
+    # _register_share() and handed to _end_share_link() on every exit path.
+    share_entry = None
     # The container currently in play, and whether anything has been published from it.
     # Both are seeded from the PREVIOUS attempt, because the previous attempt is exactly
     # what may have published without FieldKit learning of it — reading only this attempt's
@@ -434,9 +436,19 @@ def _process_upload(
         ambiguous case where the permission was actually created and only its response
         was lost.
         """
-        nonlocal share_file_id
-        share_file_id = file_id
-        instagram_state.record_share_intent(file_id, project_name, owner=share_owner)
+        nonlocal share_entry
+        # Provenance of the copy, mirroring what drive.create_temporary_share_link() does:
+        # it uploads video_path under its own name into DRIVE_ROOT_FOLDER_ID.
+        share_entry = {
+            "file_id": file_id,
+            "temporary_copy": True,
+            "parent_id": os.environ.get("DRIVE_ROOT_FOLDER_ID") or None,
+            "name": Path(video_path).name,
+        }
+        instagram_state.record_share_intent(
+            file_id, project_name, owner=share_owner,
+            parent_id=share_entry["parent_id"], name=share_entry["name"],
+        )
 
     try:
         container_id = None
@@ -519,7 +531,7 @@ def _process_upload(
         # Token expiry is terminal after ONE attempt (FR-008): retrying cannot fix it, and
         # burning the remaining attempt budget would only delay the alert the owner needs.
         # Checked before InstagramUploadError below — it is deliberately NOT a subclass.
-        _end_share_link(share_file_id, project_name, chat_id)
+        _end_share_link(share_entry, project_name, chat_id)
         _log.error("Instagram token error: project=%s: %s", project_name, _safe_error(exc))
         quarantined = False
         if publish_attempted and active_container_id:
@@ -551,7 +563,7 @@ def _process_upload(
         # never finished within the poll cap, or a Drive failure creating the share link.
         # RuntimeError/OSError are caught alongside InstagramUploadError because the Drive
         # helpers raise those — a Drive failure is just as retryable as an Instagram one.
-        _end_share_link(share_file_id, project_name, chat_id)
+        _end_share_link(share_entry, project_name, chat_id)
         detail = _safe_error(exc)
         _log.error("upload failed: project=%s attempt=%d: %s", project_name, attempt_number, detail)
         instagram_logger.log_upload_attempt_failed(project_name, attempt_number, detail)
@@ -584,7 +596,7 @@ def _process_upload(
 
     # Success path. The temporary copy is deleted first: Instagram has already ingested
     # the video by the time a container publishes, so nothing needs it any more.
-    _end_share_link(share_file_id, project_name, chat_id)
+    _end_share_link(share_entry, project_name, chat_id)
     instagram_state.mark_published(idem_key, post_id, permalink=permalink)
     instagram_logger.log_upload_published(project_name, post_id)
     # mark_published() above is what makes this job terminal in the state file, and it has
@@ -1085,12 +1097,13 @@ def _exhausted_alert(project_name: str, unresolved: bool) -> str:
     )
 
 
-def _end_share_link(file_id: str | None, project_name: str, chat_id: str) -> None:
+def _end_share_link(share_entry: dict | None, project_name: str, chat_id: str) -> None:
     """End this attempt's temporary Drive share, if one was created: delete the copy.
 
-    Takes the file id captured by _register_share() before the file was ever made public,
-    not the returned URL — so a share call that raised after creating the permission is
-    still cleaned up.
+    Takes the entry captured by _register_share() before the file was ever made public —
+    its file id plus the provenance recorded for it — not the returned URL, so a share call
+    that raised after creating the permission is still cleaned up, and the copy is verified
+    against its provenance before it is deleted (see tools/share_cleanup.provenance_for).
 
     The obligation is retired ONLY on confirmed permanent deletion of the temporary copy
     (drive.delete_temporary_share), never on "no public permission visible right now". A
@@ -1106,19 +1119,27 @@ def _end_share_link(file_id: str | None, project_name: str, chat_id: str) -> Non
     tools/share_cleanup.py's drain (run from this worker AND upload_facebook.py), and the
     admin is alerted, naming the specific file.
     """
-    if not file_id:
+    if not share_entry:
         return
+    file_id = share_entry["file_id"]
     try:
-        drive.delete_temporary_share(file_id)
+        drive.delete_temporary_share(
+            file_id, provenance=share_cleanup.provenance_for(share_entry)
+        )
     except RuntimeError as exc:
+        refused = isinstance(exc, drive.TemporaryShareRefused)
         _log.error(
-            "failed to delete temporary share copy — video may be publicly reachable: "
-            "project=%s file_id=%s error=%s",
+            "%s: project=%s file_id=%s error=%s",
+            "refused to delete a file that does not look like the temporary share copy"
+            if refused else
+            "failed to delete temporary share copy — video may be publicly reachable",
             project_name, file_id, _safe_error(exc),
         )
         entry = instagram_state.record_share_cleanup(file_id, project_name)
         if entry:
-            _send_alert(chat_id, share_cleanup.alert_text(entry))
+            _send_alert(
+                chat_id, share_cleanup.alert_text(entry, refused=exc if refused else None)
+            )
         return
     # Confirmed gone — retire the obligation registered before the file was shared.
     instagram_state.clear_share_cleanup(file_id)
