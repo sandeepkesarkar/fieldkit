@@ -64,6 +64,22 @@ def isolated_worker_health(tmp_path, monkeypatch):
     return wh
 
 
+@pytest.fixture(autouse=True)
+def isolated_instagram_state(tmp_path, monkeypatch):
+    """Keep the Instagram share-link drain (issue #80) out of the real client data dir.
+
+    upload_facebook.py now drains instagram_state's pending_share_cleanups every tick, and
+    instagram_state resolves its path from FIELDKIT_DATA_DIR at IMPORT time — after this
+    script has loaded the real client .env. Without this every `main([])` here would read
+    (and could lock or write next to) the actual checkout's instagram_state.json.
+    """
+    import tools.instagram_state as ig_state
+    data_dir = tmp_path / "ig_state"
+    monkeypatch.setattr(ig_state, "DATA_DIR", data_dir)
+    monkeypatch.setattr(ig_state, "STATE_FILE", data_dir / "instagram_state.json")
+    return ig_state
+
+
 @pytest.fixture
 def env(monkeypatch):
     monkeypatch.setenv("FB_PAGE_ACCESS_TOKEN", _PAGE_TOKEN)
@@ -1161,3 +1177,195 @@ def test_reconciliation_never_consults_page_video_listing(meta, real_state):
         main([])
     urls = [c.args[0] for c in fb_api.requests.get.call_args_list]
     assert urls and all(u == "https://graph.facebook.com/v25.0/vid1" for u in urls)
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 — this worker also drains Instagram share-link cleanups
+# ---------------------------------------------------------------------------
+
+def _record_due_cleanup(file_id="orphan_file"):
+    """A cleanup the Facebook drain may revoke and retire: its owning attempt has ended."""
+    import tools.instagram_state as ig_state
+    from tools import share_cleanup
+    with share_cleanup.share_owner() as owner:
+        ig_state.record_share_intent(file_id, _PROJECT, owner=owner)
+
+
+def _cleanup_ids():
+    import tools.instagram_state as ig_state
+    return [e["file_id"] for e in ig_state.list_share_cleanups()]
+
+
+@pytest.fixture
+def revoke(mocker):
+    import tools.drive as drive
+    return mocker.patch.object(drive, "delete_temporary_share")
+
+
+def test_share_drain_runs_with_instagram_unconfigured_and_no_job(base, revoke):
+    """IG_BUSINESS_ACCOUNT_ID is unset (see `env`) and there is no Facebook job."""
+    import os
+    assert "IG_BUSINESS_ACCOUNT_ID" not in os.environ
+    _record_due_cleanup()
+    main([])
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)
+    assert _cleanup_ids() == []
+
+
+def test_share_drain_needs_no_meta_token(base, revoke, monkeypatch):
+    """Revoking a Drive permission needs Drive credentials only."""
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("FB_PAGE_ID", raising=False)
+    _record_due_cleanup()
+    with pytest.raises(SystemExit) as exc:
+        main([])
+    assert exc.value.code == 1  # the Facebook misconfiguration is still reported...
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)  # ...after the link was revoked
+    assert _cleanup_ids() == []
+
+
+def test_share_drain_runs_even_when_another_facebook_tick_holds_the_upload_lock(
+    base, revoke, mocker
+):
+    """A long Facebook upload in progress must not stall revocation."""
+    import scripts.upload_facebook as uf
+    mocker.patch.object(uf, "_try_acquire_upload_lock", return_value=None)
+    _record_due_cleanup()
+    main([])
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)
+
+
+def test_share_drain_leaves_a_link_a_live_instagram_attempt_may_be_using(base, revoke):
+    import tools.instagram_state as ig_state
+    ig_state.record_share_intent("in_use_file", _PROJECT)
+    main([])
+    revoke.assert_not_called()
+    assert _cleanup_ids() == ["in_use_file"]
+
+
+def test_share_drain_contention_skips_and_still_publishes(with_pending, revoke, mocker):
+    """The Instagram worker's drain holds the drain lock: skip it, never wait on it."""
+    import scripts.upload_facebook as uf
+    mocker.patch.object(uf.share_cleanup, "_try_acquire_drain_lock", return_value=None)
+    _record_due_cleanup()
+    main([])
+    revoke.assert_not_called()
+    assert _cleanup_ids() == ["orphan_file"]
+    uf.facebook_api.upload_video.assert_called_once()
+    uf.facebook_state.mark_published.assert_called_once()
+
+
+def test_drive_outage_in_share_drain_does_not_affect_the_facebook_publish(
+    with_pending, revoke
+):
+    import scripts.upload_facebook as uf
+    revoke.side_effect = RuntimeError("Drive revoke share link failed: HTTP 503")
+    _record_due_cleanup()
+    main([])
+    uf.facebook_api.upload_video.assert_called_once()
+    uf.facebook_state.mark_published.assert_called_once()
+    assert _cleanup_ids() == ["orphan_file"]  # obligation kept for the next tick
+
+
+def test_corrupt_instagram_state_does_not_affect_the_facebook_publish(
+    with_pending, revoke, caplog
+):
+    """instagram_state refuses a corrupt file by raising; that must stay out of this tick."""
+    import scripts.upload_facebook as uf
+    import tools.instagram_state as ig_state
+    ig_state.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ig_state.STATE_FILE.write_text("{not json")
+    main([])
+    uf.facebook_api.upload_video.assert_called_once()
+    uf.facebook_state.mark_published.assert_called_once()
+    revoke.assert_not_called()
+    assert ig_state.STATE_FILE.read_text() == "{not json"  # left for a human, not rewritten
+    assert "share-link cleanup failed this tick" in caplog.text
+
+
+def test_unexpected_share_drain_error_does_not_affect_the_facebook_publish(
+    with_pending, mocker
+):
+    import scripts.upload_facebook as uf
+    mocker.patch.object(uf.share_cleanup, "drain", side_effect=Exception("anything at all"))
+    main([])
+    uf.facebook_api.upload_video.assert_called_once()
+    uf.facebook_state.mark_published.assert_called_once()
+
+
+def test_share_drain_failure_alert_comes_from_this_worker(base, revoke):
+    """An orphaned intent that cannot be revoked alerts the admin from the Facebook worker."""
+    import json
+
+    import scripts.upload_facebook as uf
+    import tools.instagram_state as ig_state
+    revoke.side_effect = RuntimeError("Drive down")
+    ig_state.record_share_intent("orphan_file", _PROJECT)
+    # Age the intent past the threshold by editing the test's own tmp state file.
+    data = json.loads(ig_state.STATE_FILE.read_text())
+    data["pending_share_cleanups"][0]["recorded_at"] = "2020-01-01T00:00:00+00:00"
+    ig_state.STATE_FILE.write_text(json.dumps(data))
+    main([])
+    texts = [c.args[1] for c in uf.telegram_api.send_message.call_args_list]
+    assert len(texts) == 1
+    assert "could not remove the temporary public link" in texts[0]
+    assert "orphan_file" in texts[0]
+
+
+def test_slow_timing_out_revokes_do_not_delay_the_facebook_publish(with_pending, revoke):
+    """A Drive outage makes every revoke hang until its timeout. The Facebook post must go
+    out before the drain spends any of that time, however many links are queued."""
+    import time
+
+    import scripts.upload_facebook as uf
+    import tools.instagram_state as ig_state
+    events = []
+    for n in range(5):
+        # Revokes that already failed once: due for revoking under any version of the rule.
+        ig_state.record_share_cleanup(f"orphan_{n}", _PROJECT)
+
+    def _slow_timeout(file_id, **kwargs):
+        events.append(("revoke", time.monotonic()))
+        time.sleep(0.2)
+        raise RuntimeError("Drive revoke share link request failed: read timed out")
+
+    def _publish(*args, **kwargs):
+        events.append(("publish", time.monotonic()))
+        return _POST_ID
+
+    revoke.side_effect = _slow_timeout
+    uf.facebook_api.upload_video.side_effect = _publish
+
+    started = time.monotonic()
+    main([])
+
+    kinds = [kind for kind, _ in events]
+    assert kinds == ["publish"] + ["revoke"] * 5       # every revoke came after the post
+    assert events[0][1] - started < 0.2                 # the post waited on none of them
+    uf.facebook_state.mark_published.assert_called_once()
+    assert len(_cleanup_ids()) == 5                     # all kept for the next tick
+
+
+def test_share_drain_still_runs_on_a_tick_with_no_facebook_job(base, revoke):
+    """Moving the drain after the publish path must not make it depend on there being one."""
+    _record_due_cleanup()
+    main([])
+    revoke.assert_called_once_with("orphan_file", provenance=ANY)
+
+
+def test_facebook_only_client_tick_creates_no_instagram_files(base, revoke, tmp_path, monkeypatch):
+    """A client that never used Instagram (e.g. _construction_co): the data directory that
+    holds facebook_state.json ends the tick with exactly the files it started with."""
+    import tools.instagram_state as ig_state
+    data_dir = tmp_path / "shared" / "photo-agent"
+    data_dir.mkdir(parents=True)
+    (data_dir / "facebook_state.json").write_text("{}")
+    monkeypatch.setattr(ig_state, "DATA_DIR", data_dir)
+    monkeypatch.setattr(ig_state, "STATE_FILE", data_dir / "instagram_state.json")
+    before = sorted(p.relative_to(data_dir) for p in data_dir.rglob("*"))
+
+    main([])
+
+    after = sorted(p.relative_to(data_dir) for p in data_dir.rglob("*"))
+    assert after == before
+    revoke.assert_not_called()

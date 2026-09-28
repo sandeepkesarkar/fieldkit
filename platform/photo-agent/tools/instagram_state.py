@@ -20,6 +20,11 @@ independence): a Facebook job's state, lock, and claim namespace are never
 touched by an Instagram job for the same video, and vice versa. The two are
 correlated only by sharing the same idempotency_key.
 
+One narrow exception: pending_share_cleanups is also drained from upload_facebook.py, via
+tools/share_cleanup.py, so a public Drive link is revoked even if the Instagram cron stops
+(issue #80). That drain touches only that list and only through the functions below, so
+it goes through _transaction() like every other write.
+
 pending_instagram_upload is always cleared (set back to null) once a job
 resolves — via mark_published() or mark_failed(), both terminal.
 
@@ -1039,21 +1044,29 @@ def is_published(idempotency_key: str) -> bool:
 # ---------------------------------------------------------------------------
 #
 # Publishing a Reel requires briefly making the approved video publicly readable on
-# Drive (Instagram fetches it by URL; see tools/drive.py). Revoking that link is a
+# Drive (Instagram fetches it by URL; see tools/drive.py). Ending that exposure — by
+# permanently deleting the temporary copy, confirmed (drive.delete_temporary_share) — is a
 # SEPARATE concern from the publish itself: the Reel can be genuinely live while the
-# revoke call fails on a transient Drive error.
+# cleanup fails on a transient Drive error.
 #
 # Treating that as an acceptable success would leave a client's video publicly
 # reachable forever with nothing recording the fact — the failure mode the privacy
-# gate exists to prevent. So a failed revoke is written down here instead, durably,
-# and retried on every subsequent cron tick until it succeeds. This list is keyed by
-# Drive file id and is deliberately independent of the upload job's lifecycle: the
-# job is terminal, the cleanup is not — and it is deliberately not gated on Instagram
-# still being configured for the client, since a link that is already public stays public
-# whether or not anyone intends to publish another Reel.
+# gate exists to prevent. So a failed cleanup is written down here instead, durably,
+# and retried on every subsequent cron tick until it succeeds — by BOTH cron workers
+# (tools/share_cleanup.py), so the retry survives either one stopping (issue #80). This
+# list is keyed by Drive file id and is deliberately independent of the upload job's
+# lifecycle: the job is terminal, the cleanup is not — and it is deliberately not gated
+# on Instagram still being configured for the client, since a link that is already
+# public stays public whether or not anyone intends to publish another Reel.
 
 
-def record_share_intent(file_id: str, project_name: str) -> None:
+def record_share_intent(
+    file_id: str,
+    project_name: str,
+    owner: str | None = None,
+    parent_id: str | None = None,
+    name: str | None = None,
+) -> None:
     """Register a cleanup obligation for a Drive file BEFORE it is made public.
 
     Called from drive.create_temporary_share_link()'s on_file_id hook, at the one moment
@@ -1071,6 +1084,17 @@ def record_share_intent(file_id: str, project_name: str) -> None:
 
     Idempotent: re-registering a file id that is already recorded leaves the existing
     entry, and its alert history, untouched.
+
+    owner is the token of the attempt's ownership fence (tools/share_cleanup.share_owner).
+    It is what lets a drain in EITHER cron worker tell an obligation whose attempt may still
+    grant or keep the permission — which it must never clear — from one whose attempt is
+    provably done. See tools/share_cleanup.py.
+
+    parent_id and name are the PROVENANCE of the temporary copy — the Drive folder it was
+    uploaded into and the name it was uploaded under — and the entry is marked
+    temporary_copy=True. drive.delete_temporary_share() checks the live file against them
+    before any permanent deletion, so a corrupted or hand-edited entry naming a client's
+    real file is refused rather than deleted.
     """
     now = datetime.now(timezone.utc).isoformat()
     with _transaction() as txn:
@@ -1085,6 +1109,10 @@ def record_share_intent(file_id: str, project_name: str) -> None:
             "last_attempt_at": None,
             "last_alerted_at": None,
             "attempts": 0,
+            "owner": owner,
+            "temporary_copy": True,
+            "parent_id": parent_id,
+            "name": name,
         })
         txn.commit()
     logger.info(
@@ -1094,8 +1122,10 @@ def record_share_intent(file_id: str, project_name: str) -> None:
     )
 
 
-def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
-    """Record that file_id's public Drive permission still needs revoking.
+def record_share_cleanup(
+    file_id: str, project_name: str, *, create_if_missing: bool = True
+) -> dict | None:
+    """Record that file_id's temporary Drive copy still needs deleting (a cleanup failed).
 
     Returns the entry dict when the admin SHOULD BE ALERTED right now, or None when they
     should not. That decision is made here rather than by the caller because it needs the
@@ -1109,6 +1139,12 @@ def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
     publicly reachable indefinitely, and after one message nothing would ever mention it
     again. The returned entry carries `attempts` and `recorded_at` so the caller can say how
     long this has been going on.
+
+    create_if_missing=False is for a RETRY of an existing entry (tools/share_cleanup.py's
+    drain, which runs from both cron workers). If the entry is already gone — another
+    worker revoked it and cleared it between this caller's read and its failed retry —
+    nothing is written and None is returned, rather than resurrecting a settled obligation
+    and alerting about it.
     """
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
@@ -1135,6 +1171,8 @@ def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
             )
             return dict(entry) if should_alert else None
 
+        if not create_if_missing:
+            return None
         entry = {
             "file_id": file_id,
             "project_name": project_name,
@@ -1153,8 +1191,12 @@ def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
 
 
 def list_share_cleanups() -> list[dict]:
-    """Return the Drive share links still awaiting revocation (oldest first)."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    """Return the Drive share links still awaiting revocation (oldest first).
+
+    Creates nothing: a missing directory or file simply means there is nothing to revoke.
+    upload_facebook.py calls this on every tick (via tools/share_cleanup.py) for clients
+    that may never have used Instagram at all, and must not leave Instagram files behind.
+    """
     try:
         with open(STATE_FILE, "r") as f:
             fcntl.flock(f, fcntl.LOCK_SH)

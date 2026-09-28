@@ -537,6 +537,26 @@ def test_record_share_cleanup_adds_entry():
     assert entries[0]["attempts"] == 1
 
 
+def test_record_share_cleanup_retry_does_not_resurrect_a_cleared_entry():
+    """create_if_missing=False (the shared drain's retry) never recreates a settled entry.
+
+    Both cron workers drain this list (issue #80); if one revoked and cleared an entry
+    while the other's retry of it failed, recreating it would re-alert about a link that
+    is already gone.
+    """
+    assert ig_state.record_share_cleanup(
+        "file_1", "kitchen_remodel", create_if_missing=False
+    ) is None
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_record_share_cleanup_retry_still_bumps_an_existing_entry():
+    ig_state.record_share_intent("file_1", "kitchen_remodel")
+    entry = ig_state.record_share_cleanup("file_1", "kitchen_remodel", create_if_missing=False)
+    assert entry is not None  # first real failure of an intent alerts
+    assert entry["attempts"] == 1
+
+
 def test_record_share_cleanup_first_failure_returns_entry_to_alert_on():
     """The first failure always alerts, and hands back the entry to describe it."""
     entry = ig_state.record_share_cleanup("file_1", "kitchen_remodel")

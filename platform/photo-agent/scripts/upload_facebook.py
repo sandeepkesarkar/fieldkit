@@ -76,6 +76,20 @@ still-pending job — which then fails terminally, publishing nothing and alerti
 nobody. Deletion now happens only when every enabled platform has resolved this
 approval; see tools/upload_cleanup.py.
 
+Instagram share-link cleanup (issue #80). Publishing a Reel briefly makes the approved
+video publicly readable on Drive (as a disposable copy), and the obligation to delete that
+copy is recorded in instagram_state's pending_share_cleanups. This script drains that list
+too, every tick, through tools/share_cleanup.py — so the copy is still deleted, and one
+that cannot be deleted is still re-alerted daily, if upload_instagram.py dies mid-attempt
+or its cron is removed. Deleting needs Drive credentials only, so the drain runs on every tick regardless
+of Instagram being configured, of a Meta token, or of there being a Facebook job. It is
+isolated from this script's own work: it runs only AFTER the Facebook publish path has
+finished (so a slow or failing Drive never delays a Facebook post), it only takes its own
+drain lock, non-blocking, it creates nothing for a client with no Instagram state, and any
+error in it is logged and swallowed (see _drain_share_cleanups). When it may act on an
+entry, and why only a confirmed deletion retires one, is explained in
+tools/share_cleanup.py.
+
 FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
 
@@ -127,6 +141,7 @@ from tools import (
     facebook_logger,
     facebook_state,
     paths,
+    share_cleanup,
     telegram_api,
     upload_cleanup,
     worker_health,
@@ -233,6 +248,20 @@ def main(argv=None) -> None:
     # this platform's behalf, and check_approval.py before queueing a job for it.
     worker_health.record_heartbeat(upload_cleanup.FACEBOOK)
 
+    # Instagram share-link cleanup (issue #80) runs AFTER this tick's Facebook work, in a
+    # finally: Facebook publishing must never wait on Instagram cleanup, and a Drive outage
+    # can make each revoke take tens of seconds. The finally is what still runs it on every
+    # other kind of tick — no job, Facebook unconfigured (sys.exit), another Facebook tick
+    # holding the upload lock — because it needs Drive credentials only, and a public link
+    # stays public whatever Facebook is doing.
+    try:
+        _run_facebook_tick(page_token, page_id, chat_id)
+    finally:
+        _drain_share_cleanups(chat_id)
+
+
+def _run_facebook_tick(page_token: str, page_id: str, chat_id: str) -> None:
+    """This tick's Facebook work: config gate, upload lock, sweep, reconciliation, publish."""
     if not page_token or not page_id:
         _log.error("FB_PAGE_ACCESS_TOKEN and FB_PAGE_ID are required")
         sys.exit(1)
@@ -264,6 +293,32 @@ def main(argv=None) -> None:
     finally:
         fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
+
+
+def _drain_share_cleanups(chat_id: str) -> None:
+    """Delete Instagram share copies whose worker can no longer be relied on to (issue #80).
+
+    Delegates to tools/share_cleanup.drain() with holds_instagram_lock=False: it deletes a
+    copy a live Instagram attempt may be using only once that entry is overdue, and retires
+    an obligation only on a confirmed permanent deletion — see that module for the rule and
+    why. It never takes upload_instagram.lock, and skips (never waits) if the
+    Instagram worker's drain is running, so it cannot block or be blocked by an Instagram
+    publish (FR-013). main() calls it only after this tick's Facebook work.
+
+    Never raises. This is a safety net running inside the Facebook worker, and a failure
+    in it — a Drive outage, or an unreadable instagram_state.json, which raises by design
+    rather than being mistaken for an empty list — must not cost this tick its Facebook
+    publish. The obligation stays recorded either way, so the next tick retries.
+    """
+    try:
+        share_cleanup.drain(
+            lambda text: _send_alert(chat_id, text), holds_instagram_lock=False
+        )
+    except Exception as exc:  # noqa: BLE001 — isolation is the point; see docstring
+        _log.error(
+            "Instagram share-link cleanup failed this tick — obligations kept, retried "
+            "next tick: %s: %s", type(exc).__name__, _safe_error(exc),
+        )
 
 
 def _process_upload(record: dict, page_token: str, page_id: str, chat_id: str) -> None:

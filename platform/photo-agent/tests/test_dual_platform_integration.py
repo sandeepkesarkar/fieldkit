@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 
 import pytest
+from unittest.mock import ANY
 
 import tools.facebook_state as fb_state
 import tools.instagram_state as ig_state
@@ -187,6 +188,9 @@ def cron(approved, mocker, video):
         ui.drive, "create_temporary_share_link", side_effect=_fake_share_link
     )
     mocker.patch.object(ui.drive, "revoke_share_link")
+    # create=True only so this fixture also loads against code from before this function
+    # existed — used to show which tests fail there.
+    mocker.patch.object(ui.drive, "delete_temporary_share", create=True)
     mocker.patch.object(ui.instagram_api, "create_media_container", return_value=_CONTAINER_ID)
     mocker.patch.object(ui.instagram_api, "get_container_status", return_value="FINISHED")
     mocker.patch.object(ui.instagram_api, "publish_container", return_value=_IG_POST_ID)
@@ -514,7 +518,7 @@ def test_instagram_disabled_lets_facebook_delete_immediately(cron, video, monkey
 def test_failed_revoke_is_recorded_and_retried_next_tick(cron, video):
     """A revoke failure is durable state plus a retry, never a silent success."""
     import scripts.upload_instagram as ui
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
 
     ig_main([])
     assert ig_state.is_published(_IDEM_KEY) is True
@@ -522,7 +526,7 @@ def test_failed_revoke_is_recorded_and_retried_next_tick(cron, video):
     assert [e["file_id"] for e in pending] == ["drive_file_1"]
 
     # Drive recovers; the next tick drains the backlog even with no new job.
-    ui.drive.revoke_share_link.side_effect = None
+    ui.drive.delete_temporary_share.side_effect = None
     ig_main([])
     assert ig_state.list_share_cleanups() == []
 
@@ -530,7 +534,7 @@ def test_failed_revoke_is_recorded_and_retried_next_tick(cron, video):
 def test_failed_revoke_alerts_once_within_the_reminder_window(cron, video):
     """The admin is told which Drive file may still be public, without per-tick spam."""
     import scripts.upload_instagram as ui
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
 
     ig_main([])
     ig_main([])
@@ -551,7 +555,7 @@ def test_failed_revoke_reescalates_once_the_window_elapses(cron, video, monkeypa
     """
     import scripts.upload_instagram as ui
     monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
 
     for _ in range(4):
         ig_main([])
@@ -570,9 +574,9 @@ def test_reminder_stops_as_soon_as_the_revoke_succeeds(cron, video, monkeypatch)
     """Re-escalation must end when the problem does — no reminders about a fixed link."""
     import scripts.upload_instagram as ui
     monkeypatch.setattr(ig_state, "_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS", 0)
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
     ig_main([])
-    ui.drive.revoke_share_link.side_effect = None
+    ui.drive.delete_temporary_share.side_effect = None
     ig_main([])
     ui.telegram_api.send_message.reset_mock()
 
@@ -597,17 +601,17 @@ def test_cleanup_still_drains_after_instagram_is_disabled(cron, video, monkeypat
     rather than staying publicly reachable forever with no code path left to fix it.
     """
     import scripts.upload_instagram as ui
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
     ig_main([])
     assert [e["file_id"] for e in ig_state.list_share_cleanups()] == ["drive_file_1"]
 
     # The client turns Instagram off entirely, and Drive recovers afterwards.
     monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
-    ui.drive.revoke_share_link.side_effect = None
+    ui.drive.delete_temporary_share.side_effect = None
 
     ig_main([])
 
-    ui.drive.revoke_share_link.assert_called_with("drive_file_1")
+    ui.drive.delete_temporary_share.assert_called_with("drive_file_1", provenance=ANY)
     assert ig_state.list_share_cleanups() == []
 
 
@@ -617,12 +621,12 @@ def test_cleanup_still_drains_after_the_meta_token_is_removed(cron, video, monke
     Revoking a Drive permission needs Drive credentials and nothing else.
     """
     import scripts.upload_instagram as ui
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
     ig_main([])
     assert len(ig_state.list_share_cleanups()) == 1
 
     monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
-    ui.drive.revoke_share_link.side_effect = None
+    ui.drive.delete_temporary_share.side_effect = None
 
     with pytest.raises(SystemExit):
         ig_main([])  # still reports the misconfiguration, but only after cleaning up
@@ -633,12 +637,12 @@ def test_cleanup_still_drains_after_the_meta_token_is_removed(cron, video, monke
 def test_disabled_instagram_drains_cleanup_without_publishing(cron, video, monkeypatch):
     """Ungating cleanup must not ungate publishing — FR-016 still holds."""
     import scripts.upload_instagram as ui
-    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
     ig_main([])
     ig_state.clear_pending_upload(_IDEM_KEY)
 
     monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
-    ui.drive.revoke_share_link.side_effect = None
+    ui.drive.delete_temporary_share.side_effect = None
     ui.instagram_api.create_media_container.reset_mock()
 
     ig_main([])
@@ -885,3 +889,381 @@ def test_an_exhausted_job_that_never_published_stays_re_approvable(cron, video):
     assert ig_state.get_pending_upload() is None
     assert ig_state.has_unresolved_publish(_IDEM_KEY) is False
     assert ig_state.list_publish_reconciliations() == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 — share-link revocation survives the Instagram worker stopping
+# ---------------------------------------------------------------------------
+
+class _WorkerKilled(BaseException):
+    """Stands in for SIGKILL / OOM / power loss: no except clause and no finally-revoke runs.
+
+    A BaseException, not an Exception, so none of upload_instagram.py's handlers — which
+    are where the per-attempt revoke lives — can catch it.
+    """
+
+
+def _age_share_intents(seconds):
+    """Rewind every pending_share_cleanups recorded_at by `seconds` (test harness only).
+
+    Edits the tmp state file directly, as _edit_pending_record does: simulating the clock
+    moving on is a harness concern, not something the production API should offer.
+    """
+    from datetime import datetime, timedelta, timezone
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    then = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    for entry in raw["pending_share_cleanups"]:
+        entry["recorded_at"] = then
+    ig_state.STATE_FILE.write_text(json.dumps(raw, indent=2))
+
+
+def _share_alerts(*mods):
+    return [
+        c.args[1]
+        for mod in mods
+        for c in mod.telegram_api.send_message.call_args_list
+        if "could not remove the temporary public link" in c.args[1]
+    ]
+
+
+def test_link_left_by_a_killed_instagram_worker_is_revoked_by_the_facebook_worker(
+    cron, video, monkeypatch
+):
+    """THE issue #80 scenario, end to end through both real state machines.
+
+    The Instagram worker dies after the share link exists and before any revoke. Its cron
+    never runs again, and Instagram is then unconfigured with no Meta token either. The
+    next upload_facebook.py tick revokes the link and clears the obligation.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = _WorkerKilled()
+
+    with pytest.raises(_WorkerKilled):
+        ig_main([])
+
+    # The link exists and is recorded, and nothing revoked it.
+    assert [e["file_id"] for e in ig_state.list_share_cleanups()] == ["drive_file_1"]
+    ui.drive.delete_temporary_share.assert_not_called()
+
+    # The Instagram cron is gone for good, and so is its config and the Meta token.
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit):  # Facebook is misconfigured now too — reported, and...
+        fb_main([])
+
+    # ...the link was revoked anyway, with no Instagram config and no Meta token at all.
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_facebook_tick_during_a_live_instagram_attempt_does_not_revoke_its_link(cron, video):
+    """A Facebook tick that lands while Instagram is still fetching the video must not
+    pull the link out from under it."""
+    import scripts.upload_instagram as ui
+    revokes_seen_by_facebook_tick = []
+
+    def _container_created_while_facebook_ticks(page_token, account_id, share_link):
+        # Instagram's servers are fetching share_link right now. A Facebook tick fires.
+        fb_main([])
+        revokes_seen_by_facebook_tick.append(ui.drive.delete_temporary_share.call_count)
+        return _CONTAINER_ID
+
+    ui.instagram_api.create_media_container.side_effect = _container_created_while_facebook_ticks
+
+    ig_main([])
+
+    assert revokes_seen_by_facebook_tick == [0]
+    assert ig_state.is_published(_IDEM_KEY) is True
+    # Instagram's own exit path revoked it, exactly once.
+    ui.drive.delete_temporary_share.assert_called_once_with("drive_file_1", provenance=ANY)
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_both_workers_retrying_one_failing_link_alert_once_per_interval(cron, video):
+    """Two drains on one dangling link never double the admin's reminders."""
+    import scripts.upload_facebook as uf
+    import scripts.upload_instagram as ui
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
+
+    ig_main([])  # publishes; its own revoke fails -> first alert
+    for _ in range(3):
+        fb_main([])
+        ig_main([])
+
+    assert len(_share_alerts(ui, uf)) == 1
+    assert ig_state.list_share_cleanups()[0]["attempts"] == 7
+
+
+def test_daily_reminder_still_arrives_from_facebook_after_the_instagram_cron_stops(
+    cron, video
+):
+    """The re-alert is reachable from the surviving worker, and only once per interval."""
+    import scripts.upload_facebook as uf
+    import scripts.upload_instagram as ui
+    ui.drive.delete_temporary_share.side_effect = RuntimeError("Drive down")
+    ig_main([])
+    assert len(_share_alerts(ui)) == 1
+
+    # The Instagram cron is removed. A day passes.
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    raw["pending_share_cleanups"][0]["last_alerted_at"] = "2020-01-01T00:00:00+00:00"
+    ig_state.STATE_FILE.write_text(json.dumps(raw, indent=2))
+
+    fb_main([])
+    fb_main([])
+
+    reminders = _share_alerts(uf)
+    assert len(reminders) == 1
+    assert "drive_file_1" in reminders[0]
+    assert _SHARE_LINK not in reminders[0]
+    assert len(_share_alerts(ui)) == 1  # nothing further from the stopped worker
+
+    ui.drive.delete_temporary_share.side_effect = None
+    fb_main([])
+    assert ig_state.list_share_cleanups() == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 round 2 — no sequence may leave a public permission with no obligation
+# ---------------------------------------------------------------------------
+#
+# A fake Drive that knows which files are ACTUALLY public, so each test can assert the
+# property directly rather than inferring it from calls: every public file must still have
+# a pending_share_cleanups entry behind it, and a later tick must take it down.
+
+class _FakeDrive:
+    """create_temporary_share_link / delete_temporary_share with real permission bookkeeping.
+
+    Mirrors drive.create_temporary_share_link's ordering: on_file_id fires with the file
+    still private, THEN the public permission is granted. pause_before_grant, if set, runs
+    once in between — the window where the obligation exists and the permission does not.
+    """
+
+    def __init__(self):
+        self.files = set()
+        self.public = set()
+        self.created = 0
+        self.pause_before_grant = None
+        self.kill_after_grant = False
+
+    def create(self, video_path, on_file_id=None):
+        self.created += 1
+        file_id = f"drive_file_{self.created}"
+        self.files.add(file_id)
+        on_file_id(file_id)
+        hook, self.pause_before_grant = self.pause_before_grant, None
+        if hook:
+            hook(file_id)
+        granted = file_id in self.files  # a file deleted during the pause cannot be shared
+        if granted:
+            self.public.add(file_id)
+        if self.kill_after_grant:
+            # The process dies straight after the grant request, whatever it returned.
+            raise _WorkerKilled()
+        if not granted:
+            raise RuntimeError("Drive share permission failed: HTTP 404")
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    def revoke(self, file_id):
+        self.public.discard(file_id)
+
+    def delete_temporary(self, file_id, **kwargs):
+        self.public.discard(file_id)
+        self.files.discard(file_id)
+
+
+@pytest.fixture
+def fake_drive(cron):
+    import scripts.upload_instagram as ui
+    fake = _FakeDrive()
+    ui.drive.create_temporary_share_link.side_effect = fake.create
+    ui.drive.delete_temporary_share.side_effect = fake.delete_temporary
+    return fake
+
+
+def _assert_every_public_link_is_tracked(fake):
+    tracked = {e["file_id"] for e in ig_state.list_share_cleanups()}
+    untracked = fake.public - tracked
+    assert not untracked, f"public with no cleanup obligation: {sorted(untracked)}"
+
+
+_A_DAY = 24 * 60 * 60
+
+
+@pytest.mark.parametrize("then", ["killed", "completes"])
+def test_a_stall_between_intent_and_permission_grant_cannot_strand_a_public_link(
+    cron, video, fake_drive, then
+):
+    """(a) Instagram records the intent, stalls for a day BEFORE granting the permission,
+    and Facebook ticks meanwhile. Revoking then is a no-op, so the obligation must survive
+    it: when the attempt resumes and grants the permission, something still has to take
+    it down — whether the attempt then dies or runs to the end."""
+
+    def _stall(file_id):
+        _age_share_intents(_A_DAY)
+        fb_main([])
+        fb_main([])
+
+    fake_drive.pause_before_grant = _stall
+    if then == "killed":
+        fake_drive.kill_after_grant = True
+        with pytest.raises(_WorkerKilled):
+            ig_main([])
+    else:
+        ig_main([])
+
+    _assert_every_public_link_is_tracked(fake_drive)
+    fb_main([])  # a later tick
+    assert fake_drive.public == set()
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_a_stall_after_the_permission_grant_is_revoked_and_the_attempt_fails_closed(
+    cron, video, fake_drive
+):
+    """(b) Instagram stalls for a day AFTER the link is public. Facebook ends the exposure
+    by deleting the temporary copy, and may retire the obligation only because that
+    deletion is confirmed: a file that no longer exists cannot be made public again by the
+    attempt or by anything else. The resumed attempt cannot fetch a deleted file, so it
+    fails without publishing."""
+    import scripts.upload_instagram as ui
+
+    def _stalled_container_create(page_token, account_id, share_link):
+        _age_share_intents(_A_DAY)
+        fb_main([])
+        assert fake_drive.public == set()                       # exposure ended mid-stall
+        assert "drive_file_1" not in fake_drive.files           # ...by deleting the copy
+        _assert_every_public_link_is_tracked(fake_drive)
+        raise InstagramUploadError("media fetch failed: the video URL is not reachable")
+
+    ui.instagram_api.create_media_container.side_effect = _stalled_container_create
+    ig_main([])
+
+    ui.instagram_api.publish_container.assert_not_called()
+    assert fake_drive.public == set()
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_a_reclaim_while_the_original_attempt_is_still_alive_cannot_strand_a_link(
+    cron, video, fake_drive
+):
+    """(c) The original attempt stalls before its permission grant, long enough for its
+    claim lease to lapse; a second invocation reclaims the job and drains while the first
+    is still alive. The first then grants its permission and dies."""
+
+    def _second_invocation_reclaims(file_id):
+        _age_share_intents(_A_DAY)
+        _edit_pending_record(last_attempt_at="2020-01-01T00:00:00+00:00")  # lease lapsed
+        ig_main([])  # the reclaiming invocation: drains, then runs its own attempt
+        assert ig_state.is_published(_IDEM_KEY) is True
+        fake_drive.kill_after_grant = True  # the original resumes, grants, and dies
+
+    fake_drive.pause_before_grant = _second_invocation_reclaims
+    with pytest.raises(_WorkerKilled):
+        ig_main([])
+
+    _assert_every_public_link_is_tracked(fake_drive)
+    fb_main([])
+    assert fake_drive.public == set()
+    assert ig_state.list_share_cleanups() == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 round 3 — a permission grant Drive applies AFTER the attempt has ended
+# ---------------------------------------------------------------------------
+
+class _LateGrantDrive:
+    """A fake Drive in which a permission POST can be accepted, lose its response, and be
+    APPLIED LATER — after the caller has given up, looked, seen nothing, and moved on.
+
+    Models files as well as permissions, because only a file that still exists can become
+    public: a grant that lands on a permanently deleted file does nothing. Patches both the
+    permission-only revoke and the temporary-file deletion, so the same test runs against
+    code that uses either.
+    """
+
+    def __init__(self):
+        self.files = set()
+        self.public = set()
+        self.in_flight_grants = []
+        self.created = 0
+        self.delete_fails = False
+
+    def create(self, video_path, on_file_id=None):
+        self.created += 1
+        file_id = f"drive_file_{self.created}"
+        self.files.add(file_id)
+        on_file_id(file_id)
+        # Drive accepted the POST; the response is lost; the grant is not applied yet.
+        self.in_flight_grants.append(file_id)
+        raise RuntimeError("Drive share permission request failed: read timed out")
+
+    def revoke(self, file_id):
+        # Lists permissions and deletes the public ones: sees none yet, "succeeds".
+        self.public.discard(file_id)
+
+    def delete_temporary(self, file_id, **kwargs):
+        if self.delete_fails:
+            raise RuntimeError("Drive delete failed: HTTP 503")
+        self.public.discard(file_id)
+        self.files.discard(file_id)
+
+    def apply_late_grants(self):
+        for file_id in self.in_flight_grants:
+            if file_id in self.files:          # a deleted file cannot become public
+                self.public.add(file_id)
+        self.in_flight_grants.clear()
+
+
+@pytest.fixture
+def late_grant_drive(cron, mocker):
+    import scripts.upload_instagram as ui
+    fake = _LateGrantDrive()
+    ui.drive.create_temporary_share_link.side_effect = fake.create
+    # Both edges, so this test runs against code that ends a share either way: by
+    # revoke_share_link() alone (before this round) or by delete_temporary_share().
+    mocker.patch.object(ui.drive, "revoke_share_link", side_effect=fake.revoke)
+    mocker.patch.object(
+        ui.drive, "delete_temporary_share", side_effect=fake.delete_temporary, create=True
+    )
+    return fake
+
+
+def test_a_grant_applied_after_the_attempt_ended_cannot_strand_a_public_link(
+    cron, video, late_grant_drive
+):
+    """The permission POST times out; the attempt's own cleanup sees no permission and
+    reports success; _process_upload() and share_owner() exit; THEN Drive applies the
+    grant. Absence of a permission at one moment is not an answer — nothing may retire the
+    obligation on it."""
+    ig_main([])                               # attempt ends: the share call "failed"
+    late_grant_drive.apply_late_grants()      # ...and Drive applies the grant afterwards
+
+    _assert_every_public_link_is_tracked(late_grant_drive)
+    fb_main([])
+    ig_main([])
+    assert late_grant_drive.public == set()
+
+
+def test_a_late_grant_while_deletion_keeps_failing_stays_tracked_until_deleted(
+    cron, video, late_grant_drive
+):
+    """Fail-closed: if the temporary file cannot be deleted, the obligation is kept, both
+    crons keep retrying, and the late grant is taken down once deletion succeeds."""
+    import scripts.upload_facebook as uf
+    import scripts.upload_instagram as ui
+    late_grant_drive.delete_fails = True
+    ig_main([])
+    late_grant_drive.apply_late_grants()
+    fb_main([])
+
+    _assert_every_public_link_is_tracked(late_grant_drive)
+    assert late_grant_drive.public == {"drive_file_1"}
+    assert len(_share_alerts(ui, uf)) == 1
+
+    late_grant_drive.delete_fails = False
+    fb_main([])
+    assert late_grant_drive.public == set()
+    assert late_grant_drive.files == set()
+    assert ig_state.list_share_cleanups() == []

@@ -16,8 +16,9 @@ access_token via the OAuth2 token endpoint on every call.
 
 Raises RuntimeError on HTTP error, missing credentials, or malformed JSON.
 
-Feature 005 adds create_temporary_share_link() / revoke_share_link(), the only
-functions here that make a file publicly reachable. See their docstrings for why
+Feature 005 adds create_temporary_share_link() / revoke_share_link() /
+delete_temporary_share(); the first is the only function here that makes a file
+publicly reachable. See their docstrings for why
 that exposure is needed and how it is bounded.
 """
 
@@ -338,13 +339,14 @@ def folder_link(folder_id: str) -> str:
 # Instagram's media-container endpoint does not accept uploaded bytes: it takes a
 # video_url that Instagram's own servers fetch. The Mac Mini has no public web
 # server, so the approved video is briefly published through Drive — the
-# framework's already-sanctioned host for client-approved media — and unshared
-# again as soon as Instagram has ingested it.
+# framework's already-sanctioned host for client-approved media — as a disposable
+# COPY uploaded fresh for each attempt, which is permanently deleted again once
+# Instagram has ingested it (delete_temporary_share).
 #
 # The exposure this creates is deliberately bounded: it covers ONE
 # already-approved, already-metadata-stripped video (the same asset the Facebook
 # upload posts — never a re-processed copy), the link is created immediately
-# before the container call, and upload_instagram.py revokes it on every exit
+# before the container call, and upload_instagram.py deletes the copy on every exit
 # path, success or failure. Nothing else in the pipeline uses these functions.
 #
 # The permission granted is {"role": "reader", "type": "anyone"} with
@@ -369,8 +371,8 @@ def create_temporary_share_link(video_path, on_file_id=None) -> str:
     """Upload video_path to Drive, make it link-readable, and return a fetchable URL.
 
     The returned URL is suitable for Instagram's video_url parameter — reachable
-    without credentials. The caller MUST pair this with revoke_share_link() on every
-    exit path, and should get the file id from on_file_id below rather than from the
+    without credentials. The caller MUST pair this with delete_temporary_share() on
+    every exit path (revoke_share_link() alone is not enough — see there), and should get the file id from on_file_id below rather than from the
     returned URL — only the hook fires on the paths where this function raises.
 
     on_file_id, if given, is called with the new file's id AFTER the upload and
@@ -379,9 +381,10 @@ def create_temporary_share_link(video_path, on_file_id=None) -> str:
     but a caller that only learns it from the returned URL learns nothing if the
     permission POST succeeds server-side and its response is then lost to a timeout
     or a crash. The permission would exist, this function would raise, and the
-    caller would hold no id to revoke — an untracked public link, forever. A caller
-    that records its cleanup obligation in on_file_id can always revoke, including
-    for a file that never actually became public (revoking nothing is a no-op).
+    caller would hold no id to clean up — an untracked public link, forever. A caller
+    that records its cleanup obligation in on_file_id can always delete the copy,
+    including one that never actually became public — or whose permission Drive only
+    applies later: a deleted file cannot become public.
 
     A raising on_file_id aborts before the file is ever shared, deliberately: a
     caller that cannot record the obligation must not be handed the exposure.
@@ -464,6 +467,154 @@ def revoke_share_link(file_id: str) -> None:
                 f"Drive revoke share link failed for file {file_id}: HTTP {resp.status_code}"
             )
         logger.info("revoke_share_link: file_id=%s permission_id=%s", file_id, permission_id)
+
+
+_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+
+
+class TemporaryShareRefused(RuntimeError):
+    """delete_temporary_share() refused: the file does not look like FieldKit's temporary copy.
+
+    A RuntimeError so every existing caller already keeps the cleanup obligation and retries
+    — but distinct, so callers can tell the admin that nothing was changed and why, rather
+    than reporting a transient Drive failure.
+    """
+
+
+def _check_temporary_copy(file_id: str, meta: dict, provenance: dict) -> None:
+    """Raise TemporaryShareRefused unless `meta` describes the temporary copy we created.
+
+    provenance (see tools/share_cleanup.provenance_for):
+      root_folder_id      — the configured DRIVE_ROOT_FOLDER_ID. The temporary copy is
+                            uploaded DIRECTLY into it; the client's approved video lives one
+                            level down, in the project folder (process_photos.py).
+      recorded_parent_id  — the parent recorded when the copy was created, or None for an
+                            entry written before provenance was recorded.
+      expected_name       — the file name recorded at creation, or None (legacy entry).
+      protected_ids       — ids that must never be deleted (e.g. the approved video's id).
+
+    Every check here refuses rather than guesses: a refusal keeps the obligation and alerts,
+    which a human can resolve; a wrong deletion of client content cannot be undone.
+    """
+    root = provenance.get("root_folder_id")
+    reason = None
+    if not root:
+        reason = "DRIVE_ROOT_FOLDER_ID is not configured, so its parent cannot be verified"
+    elif file_id == root:
+        reason = "it is the Drive root folder itself"
+    elif file_id in set(provenance.get("protected_ids") or ()):
+        reason = "it is a protected file (the approved video)"
+    elif provenance.get("recorded_parent_id") not in (None, root):
+        reason = "the folder recorded at creation is not the configured Drive root folder"
+    elif meta.get("mimeType") == _FOLDER_MIME_TYPE:
+        reason = "it is a folder"
+    elif not str(meta.get("mimeType", "")).startswith("video/"):
+        reason = "it is not a video"
+    elif root not in (meta.get("parents") or []):
+        reason = "it is not directly inside the configured Drive root folder"
+    elif provenance.get("expected_name") not in (None, meta.get("name")):
+        reason = "its name does not match the copy FieldKit uploaded"
+    if reason:
+        raise TemporaryShareRefused(
+            f"refused to delete Drive file {file_id}: {reason}"
+        )
+
+
+def delete_temporary_share(file_id: str, *, provenance: dict) -> None:
+    """End a temporary share for good: verify, revoke, permanently delete, confirm it gone.
+
+    ONLY for the disposable copy create_temporary_share_link() uploaded for Instagram to
+    fetch — never for a client's approved video or folder. That copy is uploaded fresh on
+    every attempt and nothing else refers to it, so deleting it loses nothing.
+
+    Why deletion, and not just revoke_share_link(): a revoke proves only that no public
+    permission is visible AT THAT MOMENT. A permission POST that Drive accepted but whose
+    response was lost (a client-side timeout) is not proven to have finished acting, so it
+    could still be applied after the revoke has looked, seen nothing, and moved on. A file
+    that no longer exists cannot become public whenever such a grant lands, so a confirmed
+    permanent deletion is the definitive end of the exposure, and the only thing callers
+    may retire a cleanup obligation on.
+
+    Why verify first: the file id comes from instagram_state.json. If that file were ever
+    corrupted or hand-edited to name a client's real file, an unconditional permanent
+    delete would turn cleanup into data loss. provenance is keyword-only and REQUIRED, so a
+    caller cannot skip the check by omission.
+
+    Steps:
+      0. files.get(id,name,mimeType,parents,trashed), then _check_temporary_copy(). A 404
+         here means it is already gone — the answer every later step is waiting for — so it
+         returns. A refusal raises TemporaryShareRefused having CHANGED NOTHING: no revoke,
+         no delete.
+      1. revoke_share_link() — best effort, the fast first step. Its failure is logged,
+         not raised: step 2 ends the exposure regardless.
+      2. files.delete — which "Permanently deletes a file owned by the user without moving
+         it to the trash". Never files.update(trashed=true): per Google, "other users can
+         still access the file in the owner's trash until it's permanently deleted".
+         https://developers.google.com/workspace/drive/api/reference/rest/v3/files/delete
+         https://developers.google.com/workspace/drive/api/guides/delete
+         A 404 here means it is already gone; that is still confirmed in step 3.
+      3. files.get must answer 404. Anything else — the file still listed (including
+         trashed), or no definitive answer — raises.
+
+    Raises TemporaryShareRefused (a RuntimeError) if the file fails verification, and
+    RuntimeError unless the file is confirmed gone. Callers keep the obligation either way.
+    """
+    access_token = _get_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        meta_resp = requests.get(
+            f"{_DRIVE_FILES_URL}/{file_id}",
+            headers=headers,
+            params={"fields": "id,name,mimeType,parents,trashed"},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive could not read file {file_id} to verify it: {exc}") from exc
+    if meta_resp.status_code == 404:
+        logger.info("delete_temporary_share: file_id=%s already gone", file_id)
+        return
+    if not meta_resp.ok:
+        raise RuntimeError(
+            f"Drive could not read file {file_id} to verify it: HTTP {meta_resp.status_code}"
+        )
+    try:
+        meta = meta_resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Drive returned unreadable metadata for file {file_id}") from exc
+    _check_temporary_copy(file_id, meta, provenance)
+
+    try:
+        revoke_share_link(file_id)
+    except RuntimeError as exc:
+        logger.warning(
+            "delete_temporary_share: revoke failed, deleting anyway: file_id=%s error=%s",
+            file_id, exc,
+        )
+    try:
+        resp = requests.delete(f"{_DRIVE_FILES_URL}/{file_id}", headers=headers, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Drive delete request failed for file {file_id}: {exc}") from exc
+    if not resp.ok and resp.status_code not in (204, 404):
+        raise RuntimeError(f"Drive delete failed for file {file_id}: HTTP {resp.status_code}")
+    try:
+        check = requests.get(
+            f"{_DRIVE_FILES_URL}/{file_id}",
+            headers=headers,
+            params={"fields": "id,trashed"},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"Drive could not confirm deletion of file {file_id}: {exc}"
+        ) from exc
+    if check.status_code == 404:
+        logger.info("delete_temporary_share: file_id=%s deleted and confirmed gone", file_id)
+        return
+    if check.ok:
+        raise RuntimeError(f"Drive file {file_id} still exists after delete")
+    raise RuntimeError(
+        f"Drive could not confirm deletion of file {file_id}: HTTP {check.status_code}"
+    )
 
 
 def extract_file_id(share_link: str) -> str:

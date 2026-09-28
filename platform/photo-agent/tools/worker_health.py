@@ -56,11 +56,13 @@ fresh" and "a link was created" cannot both hold. What the window actually
 produces is an inert queued job, and a shared video retained by
 tools/upload_cleanup.py until the heartbeat does go stale.
 
-The real single point of failure is elsewhere and is not a heartbeat problem: if
-the worker dies mid-attempt, after creating a link and before revoking it, the
-link is public and the obligation is recorded — but the drain that would revoke
-it, and the daily alert that would report it, both live in that same stopped
-worker. See docs/instagram/README.md.
+The remaining case is not a heartbeat problem either: the worker dies mid-attempt,
+after creating a link and before revoking it, so the link is public and the
+obligation is recorded. That used to be a single point of failure — the drain that
+would revoke it and the daily alert that would report it both lived in the stopped
+worker. They now live in tools/share_cleanup.py and run from upload_facebook.py as
+well (issue #80), so the temporary copy is deleted even if the Instagram cron never
+runs again. See docs/instagram/README.md.
 """
 
 import fcntl
