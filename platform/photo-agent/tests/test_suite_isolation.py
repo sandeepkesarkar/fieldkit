@@ -140,9 +140,9 @@ def test_an_unmocked_credential_lookup_reads_nothing_real(monkeypatch):
     assert not [p for p in opened if isinstance(p, (str, os.PathLike)) and _under_real_home(p)]
 
 
-def _child(code: str, env=None) -> subprocess.CompletedProcess:
+def _child(code: str, env=None, flags=()) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, *flags, "-c", code],
         cwd=str(_PHOTO_AGENT), env=env, capture_output=True, text=True, timeout=60,
     )
 
@@ -372,16 +372,18 @@ def test_a_child_python_process_is_refused_even_when_it_ignores_proxies():
 
 
 def test_a_proxy_aware_child_without_the_guard_is_refused_by_the_closed_proxy():
-    """With the guard removed from the child, the proxy variables alone still stop it."""
+    """With the guard removed from the child — no PYTHONPATH sitecustomize, and -s so the
+    isolated user site's guard .pth is not processed — the proxy variables alone stop it."""
     _require_child_network_isolation()
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
     result = _child(
-        "import urllib.request\n"
+        "import socket, urllib.request\n"
+        f"assert not getattr(socket.socket.connect, {_NETWORK_MARKER!r}, False), 'guard present'\n"
         "try:\n"
         f"    urllib.request.urlopen('http://{_UNROUTABLE}/', timeout=5); print('CONNECTED')\n"
         "except Exception as e:\n"
         "    print('REFUSED', type(e).__name__, e)\n",
-        env=env,
+        env=env, flags=("-s",),
     )
     assert result.stdout.startswith("REFUSED"), result.stdout + result.stderr
     assert "timed out" not in result.stdout  # refused at the proxy, not a direct attempt
@@ -399,3 +401,130 @@ def test_a_proxy_aware_non_python_child_is_refused(url):
     # 5 = couldn't resolve proxy, 7 = couldn't connect (to the proxy), 97 = proxy handshake.
     # 28 (a timeout) would mean it went direct instead, so it is not accepted.
     assert result.returncode in (5, 7, 97), (result.returncode, result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Child Python start-up: .pth files run before sitecustomize (round 5)
+# ---------------------------------------------------------------------------
+#
+# Python executes the import lines of .pth files in its site directories during start-up,
+# before `sitecustomize` is imported. So a child Python must never see the developer's real
+# per-user site (whose .pth files would run before any sitecustomize guard), and the .pth
+# files it does see must run after the guard.
+
+def _real_user_base() -> Path:
+    """Where Python puts the per-user base for the REAL home. -I -S: runs no site/.pth."""
+    probe = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", "import site; print(site.getuserbase())"],
+        env={"HOME": str(_REAL_HOME), "PATH": os.environ["PATH"]},
+        capture_output=True, text=True, check=True,
+    )
+    return Path(probe.stdout.strip()).resolve()
+
+
+_SITE_PROBE = (
+    "import json, site, sys\n"
+    "print(json.dumps({'user_site': site.getusersitepackages(),\n"
+    "                  'enabled': bool(site.ENABLE_USER_SITE), 'path': sys.path}))\n"
+)
+
+_CHILD_ENVS = {
+    "inherited env": lambda: None,
+    "hand-built PATH/HOME env": lambda: {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]},
+}
+
+
+def _child_user_site(env) -> dict:
+    result = _child(_SITE_PROBE, env=env)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("env_kind", list(_CHILD_ENVS))
+def test_a_child_python_never_sees_the_real_user_site(env_kind):
+    real_base = _real_user_base()
+    seen = _child_user_site(_CHILD_ENVS[env_kind]())
+    assert not Path(seen["user_site"]).resolve().is_relative_to(real_base)
+    leaked = [p for p in seen["path"] if p and Path(p).resolve().is_relative_to(real_base)]
+    assert not leaked, leaked
+    assert seen["enabled"]  # the isolated user site is processed — that is where the guard is
+
+
+def test_the_isolated_user_site_holds_only_the_guard_and_approved_packages():
+    from tests import _isolation
+    site_dir = getattr(_isolation, "ISOLATED_USER_SITE", None)
+    assert site_dir is not None, "no isolated per-user site is built"
+    names = {p.name for p in site_dir.iterdir()}
+    assert {n for n in names if n.endswith(".pth")} == {_isolation.GUARD_PTH_NAME}
+    # __pycache__ holds the guard module's own bytecode, written when children import it.
+    allowed = {_isolation.GUARD_PTH_NAME, f"{_isolation.GUARD_MODULE_NAME}.py", "__pycache__"}
+    others = names - allowed
+    assert all(
+        n.split(".")[0] in _isolation.APPROVED_USER_SITE_PACKAGES for n in others
+    ), others
+
+
+_PLANTED_LINE = (
+    "import os, socket; p = os.environ.get('FIELDKIT_PTH_PROBE'); "
+    "p and open(p + '.{tag}', 'w').write(str(bool(getattr("
+    f"socket.socket.connect, {_NETWORK_MARKER!r}, False))))\n"
+)
+
+
+@pytest.mark.parametrize("env_kind", list(_CHILD_ENVS))
+def test_a_pth_line_in_a_childs_site_runs_only_after_the_network_guard(env_kind, tmp_path):
+    """Plant .pth files with an executable line — one named to sort early, one late — in
+    the per-user site a child Python processes, and record whether the guard was already
+    installed when each ran. Refuses to plant anything unless that site is the suite's own
+    (never the developer's real one)."""
+    base_env = _CHILD_ENVS[env_kind]()
+    user_site = Path(_child_user_site(base_env)["user_site"])
+    assert not user_site.resolve().is_relative_to(_real_user_base()), (
+        "the child's per-user site is the developer's real one — not planting there"
+    )
+    planted = [user_site / "0-planted-probe.pth", user_site / "zz-planted-probe.pth"]
+    probe = tmp_path / "probe"
+    env = dict(base_env if base_env is not None else os.environ, FIELDKIT_PTH_PROBE=str(probe))
+    try:
+        for path in planted:
+            path.write_text(_PLANTED_LINE.format(tag=path.stem))
+        result = _child("pass", env=env)
+        assert result.returncode == 0, result.stderr
+    finally:
+        for path in planted:
+            path.unlink(missing_ok=True)
+    for path in planted:
+        record = Path(f"{probe}.{path.stem}")
+        assert record.exists(), f"{path.name} did not run"   # it ran...
+        assert record.read_text() == "True", path.name        # ...with the guard in place
+
+
+def test_a_hand_built_child_env_gets_the_network_guard_too():
+    """Children given only PATH/HOME carry no PYTHONPATH or proxy variables; the isolated
+    user site's .pth still installs the guard in them."""
+    result = _child(
+        "import socket\n"
+        f"if not getattr(socket.socket.connect, {_NETWORK_MARKER!r}, False):\n"
+        "    print('NO GUARD')  # and do not attempt anything\n"
+        "else:\n"
+        "    try:\n"
+        f"        socket.create_connection(('{_UNROUTABLE}', 80), timeout=2); print('CONNECTED')\n"
+        "    except Exception as e:\n"
+        "        print('REFUSED', e)\n",
+        env=_CHILD_ENVS["hand-built PATH/HOME env"](),
+    )
+    assert result.stdout.startswith("REFUSED") and "blocked in tests" in result.stdout, (
+        result.stdout + result.stderr
+    )
+
+
+def test_an_approved_user_site_package_still_imports_in_a_child():
+    """PyYAML, which install_client.sh needs, is reachable — as a package, not via .pth."""
+    import site
+    if not (Path(site.getusersitepackages()) / "yaml").exists():
+        pytest.skip("PyYAML is not in this developer's per-user site")
+    result = _child(
+        "import yaml; print(yaml.safe_load('a: 1'))",
+        env=_CHILD_ENVS["hand-built PATH/HOME env"](),
+    )
+    assert result.stdout.strip() == "{'a': 1}", result.stdout + result.stderr

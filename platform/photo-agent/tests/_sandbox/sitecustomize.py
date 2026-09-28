@@ -1,18 +1,22 @@
 """
-Network guard for the photo-agent test suite — stdlib only, installed in two places:
+Network guard for the photo-agent test suite — stdlib only, installed in three ways:
 
   - in the pytest process, by tests/_isolation.py (loaded from tests/conftest.py at import);
-  - in every child Python process that inherits the suite's environment, because
+  - in child Python processes whose per-user site is the suite's isolated one, by a .pth
+    file there that sorts first (tests/_isolation.py builds it). User-site .pth files are
+    processed before system site-packages ones, so this runs before any other .pth line;
+  - as a second layer, in child processes that inherit the suite's environment, because
     tests/_isolation.py prepends this directory to PYTHONPATH and Python imports a
-    `sitecustomize` module from sys.path at startup.
+    `sitecustomize` module from sys.path at startup — AFTER all .pth files have run.
 
 It refuses every AF_INET / AF_INET6 connection and datagram, loopback included, and every
 name lookup except for loopback names. AF_UNIX sockets are untouched. It patches the
 Python-level socket.socket class and module functions, which is what requests, urllib3,
 urllib, http.client, ssl and asyncio all go through.
 
-Active only while FIELDKIT_TEST_NETWORK_BLOCKED=1, so this directory being on a path by
-accident outside the suite does nothing.
+Active only while FIELDKIT_TEST_NETWORK_BLOCKED=1, or when forced by the isolated user
+site's .pth (which exists only inside the suite's temporary HOME), so this directory being
+on a path by accident outside the suite does nothing.
 """
 
 import ipaddress
@@ -46,9 +50,9 @@ def _refuse_inet(sock, address, what):
         raise RealNetworkBlocked(f"network {what} blocked in tests: {host}")
 
 
-def install() -> bool:
+def install(force: bool = False) -> bool:
     """Install the guard in this process. Idempotent. Returns True if it is active."""
-    if os.environ.get("FIELDKIT_TEST_NETWORK_BLOCKED") != "1":
+    if not force and os.environ.get("FIELDKIT_TEST_NETWORK_BLOCKED") != "1":
         return False
     if getattr(socket.socket.connect, MARKER, False):
         return True

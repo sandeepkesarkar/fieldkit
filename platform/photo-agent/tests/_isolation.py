@@ -42,23 +42,42 @@ Network — in this process (tests/_sandbox/sitecustomize.py):
   It is installed before any test module is imported, so it covers connections attempted
   while test modules (and the production modules they import) are being imported.
 
-Network — in child processes that inherit os.environ:
-  - tests/_sandbox is prepended to PYTHONPATH, so a child Python process installs the same
-    socket guard at startup (via sitecustomize) — including one that ignores proxy settings.
+Network — in child Python processes:
+  - The isolated HOME has its own per-user site (see _build_isolated_user_site), and the
+    developer's real one is never visible to children. Its only .pth file installs the
+    socket guard, forced on. Python runs .pth files during start-up, before sitecustomize,
+    and processes the per-user site before system site-packages (CPython site.main()), so in
+    any child Python that processes the per-user site — inherited env or a hand-built
+    {PATH, HOME} env — the guard is installed before any other .pth line runs. Only
+    approved packages (PyYAML) are linked in, as package code, never their .pth files.
+  - tests/_sandbox is also prepended to PYTHONPATH, so a child that inherits os.environ
+    installs the guard again via sitecustomize — a second layer, which runs after .pth files.
+
+Network — in other child processes that inherit os.environ:
   - HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (both cases) point at a closed loopback port and
-    NO_PROXY is empty, so proxy-aware non-Python tools fail to connect. curl is tested;
-    no test runs gws, so whether it honours these variables is not verified here.
+    NO_PROXY is empty, so proxy-aware tools fail to connect. curl is tested; no test runs
+    gws, so whether it honours these variables is not verified here.
 
 WHAT IT DOES NOT COVER
-  - A child process started with a hand-built env that leaves out PYTHONPATH and the proxy
-    variables (several existing tests pass only PATH/HOME). It still gets the isolated HOME
-    (they copy HOME from os.environ) but not the network guard. Those tests were audited:
-    they run local scripts and stubs and point FIELDKIT_ROOT at tmp_path.
-  - A non-Python child that ignores proxy variables and opens its own sockets.
-  - Native extension code that opens sockets without Python's socket module.
+  - The pytest process's own start-up: its .pth files ran before this conftest could be
+    imported. The in-process guard covers everything from conftest import onward.
+  - Child Pythons that do not process the per-user site: virtualenvs (e.g. the Hermes venv
+    the dispatch tests run — venvs disable the user site) and anything started with -s, -I,
+    or PYTHONNOUSERSITE. Their site-packages .pth files run before any guard; the
+    PYTHONPATH sitecustomize layer applies afterwards only if they inherit os.environ and
+    are not run with -E/-I.
+  - The ordering claim for SYSTEM site-packages .pth files rests on CPython's site.main()
+    order; the tests plant .pth files only in the isolated per-user site, since planting in
+    the Python installation would modify the developer's environment.
+  - A non-Python child that ignores proxy variables and opens its own sockets, and native
+    code that opens sockets without Python's socket module.
   - python-dotenv inside child processes (only the in-process loader is guarded). The
     subprocess tests that import scripts pass FIELDKIT_ROOT=tmp_path, so they load tmp .env
     files; with the isolated HOME none of them can reach ~/.hermes/.env.
+  - The Hermes code checkout (~/.hermes/hermes-agent) is linked in and readable through
+    HERMES_AGENT_DIR, and is treated as trusted source, not a secret-free sandbox: it
+    contains a .envrc (not opened by this work). Narrowing it to the files the dispatch
+    tests need is left to issue #77.
   - google-auth: not installed and not used by photo-agent; if it were, its requests/urllib3
     transport would hit the socket guard, but that route is not separately tested.
   - Filesystem writes into a real checkout's clients/ data, and the email-agent suite (this
@@ -90,6 +109,73 @@ class RealCredentialAccessBlocked(PermissionError):
     """Raised for an attempt to WRITE a .env outside the test sandbox."""
 
 
+# Packages child Python processes may import from the developer's per-user site-packages.
+# Only these are exposed, one symlink each, and never a .pth file. PyYAML is needed by
+# scripts/install_client.sh, which the install tests run under a hand-built {PATH, HOME} env.
+APPROVED_USER_SITE_PACKAGES = ("yaml", "_yaml")
+GUARD_PTH_NAME = "!fieldkit-test-network-guard.pth"
+GUARD_MODULE_NAME = "_fieldkit_test_netguard"
+ISOLATED_USER_BASE = None
+ISOLATED_USER_SITE = None
+
+
+def _build_isolated_user_site() -> None:
+    """Give child Python processes a per-user site that is ours, not the developer's.
+
+    Why not just expose the real one: Python executes the import lines of every .pth file in
+    its site directories during startup, before `sitecustomize` is imported. So with the real
+    per-user site visible, any installed package's .pth hook could read files or reach the
+    network before a sitecustomize-based guard existed — and what runs would depend on what
+    the developer happens to have installed.
+
+    Instead the isolated HOME gets its own per-user site, at exactly the path Python derives
+    for that HOME (so children with a hand-built {PATH, HOME} env find it too), containing:
+      - GUARD_PTH_NAME, whose single import line installs the network guard, forced on. It
+        is the only .pth file in the directory, and CPython's site.main() processes the
+        per-user site before system site-packages, so it runs before ANY other .pth line;
+      - GUARD_MODULE_NAME, the guard itself (a link to tests/_sandbox/sitecustomize.py);
+      - one symlink per APPROVED_USER_SITE_PACKAGES entry found in the real per-user site —
+        package code only, which runs only when imported, after the guard.
+    Nothing else of the real per-user site is visible, including its .pth files.
+    PYTHONUSERBASE is set to the same place for children that inherit os.environ, and
+    PYTHONNOUSERSITE is cleared so they do not skip it.
+    """
+    global ISOLATED_USER_BASE, ISOLATED_USER_SITE
+    import site
+    import subprocess
+    import sys
+
+    real_user_site = Path(site.getusersitepackages())  # cached at startup, real HOME
+    # Ask a bare interpreter where it would put the per-user site for the isolated HOME.
+    # -I ignores PYTHON* variables (e.g. a developer PYTHONUSERBASE); -S skips site
+    # initialisation, so no .pth file runs in this probe.
+    probe = subprocess.run(
+        [sys.executable, "-I", "-S", "-c",
+         "import site; print(site.getuserbase()); print(site.getusersitepackages())"],
+        env={"HOME": str(ISOLATED_HOME), "PATH": os.environ.get("PATH", "")},
+        capture_output=True, text=True, check=True,
+    )
+    user_base, user_site = probe.stdout.splitlines()[:2]
+    ISOLATED_USER_BASE, ISOLATED_USER_SITE = Path(user_base), Path(user_site)
+    ISOLATED_USER_SITE.mkdir(parents=True, exist_ok=True)
+
+    (ISOLATED_USER_SITE / f"{GUARD_MODULE_NAME}.py").symlink_to(
+        _SANDBOX_DIR / "sitecustomize.py"
+    )
+    (ISOLATED_USER_SITE / GUARD_PTH_NAME).write_text(
+        f"import {GUARD_MODULE_NAME}; {GUARD_MODULE_NAME}.install(force=True)\n"
+    )
+    for name in APPROVED_USER_SITE_PACKAGES:
+        for source in [real_user_site / name, *real_user_site.glob(f"{name}.*")]:
+            if source.suffix == ".pth" or not source.exists():
+                continue
+            target = ISOLATED_USER_SITE / source.name
+            if not target.exists():
+                target.symlink_to(source, target_is_directory=source.is_dir())
+    os.environ["PYTHONUSERBASE"] = str(ISOLATED_USER_BASE)
+    os.environ.pop("PYTHONNOUSERSITE", None)
+
+
 def _isolate_credentials() -> None:
     # The Hermes dispatch tests run the real Hermes CODE checkout at
     # ~/.hermes/hermes-agent (some via HERMES_AGENT_DIR, some via Path.home()). Moving HOME
@@ -103,18 +189,7 @@ def _isolate_credentials() -> None:
         link.parent.mkdir(parents=True, exist_ok=True)
         if not link.exists():
             link.symlink_to(real_agent, target_is_directory=True)
-    # Python's per-user site-packages (where e.g. PyYAML may be installed) is located from
-    # $HOME. Child processes — including those given a hand-built env with only PATH/HOME —
-    # must still find installed packages, so the real per-user base directory (a package
-    # directory, not a credential store) is symlinked to the same relative place inside the
-    # isolated HOME, and nothing else from the real home is.
-    import site
-    user_base = Path(site.getuserbase())
-    if user_base.is_relative_to(REAL_HOME) and user_base.is_dir():
-        link = ISOLATED_HOME / user_base.relative_to(REAL_HOME)
-        link.parent.mkdir(parents=True, exist_ok=True)
-        if not link.exists():
-            link.symlink_to(user_base, target_is_directory=True)
+    _build_isolated_user_site()
     os.environ["HOME"] = str(ISOLATED_HOME)
     os.environ["XDG_CONFIG_HOME"] = str(ISOLATED_HOME / ".config")
     os.environ["HERMES_HOME"] = str(ISOLATED_HOME / ".hermes")
