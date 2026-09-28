@@ -269,3 +269,134 @@ def test_watermark_empty_font_path_skips_gracefully(tmp_path, gen, single_image,
     assert result == output
     assert output.exists()
     assert "Watermark font path is empty" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Watermark text fidelity (issue #86)
+# ---------------------------------------------------------------------------
+
+# Each case is a watermark a client could plausibly configure. Short strings that
+# begin with "%{" are embedded in words because Tesseract misreads them in
+# isolation, not because the generator treats them differently.
+_SPECIAL_WATERMARKS = [
+    pytest.param("Save 100% today", id="percent"),
+    pytest.param("Hours: 9 to 5", id="colon"),
+    pytest.param("Joe's Roofing", id="apostrophe"),
+    pytest.param("Back\\slash Co", id="backslash"),
+    pytest.param("Open %{pts} now", id="percent-brace"),
+    pytest.param("Smith and Sons Ltd", id="spaces"),
+    pytest.param("50%% off %{n}", id="double-percent"),
+    pytest.param("Foo's Bar: 100% \\Cool\\", id="combined"),
+]
+
+# Wide enough that the longest case fits at drawtext's fixed fontsize=28.
+_OCR_CONFIG = {
+    "width": 540, "height": 960, "fps": 10, "seconds_per_photo": 1,
+    "bitrate": "500k", "freeze_duration": 0,
+}
+
+
+def _has_ocr_filter() -> bool:
+    """Check if FFmpeg has the Tesseract-backed ocr filter (Homebrew ffmpeg-full has it)."""
+    if FFMPEG is None:
+        return False
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, check=False
+    )
+    return any(line.split()[1:2] == ["ocr"] for line in result.stdout.splitlines())
+
+
+def _ocr_watermark(video: Path) -> str:
+    """OCR the first frame's bottom strip (where the watermark sits) using ffmpeg's ocr filter."""
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(video),
+            "-vf", "crop=iw:60:0:ih-60,scale=iw*2:-1,ocr,metadata=print:key=lavfi.ocr.text:file=-",
+            "-frames:v", "1", "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    texts = [
+        line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("lavfi.ocr.text=")
+    ]
+    assert texts, f"ocr filter produced no text: {result.stdout!r}"
+    return texts[0].strip()
+
+
+@pytest.fixture
+def black_image(tmp_path):
+    """Return a single-element list with a black JPEG at _OCR_CONFIG size (clean OCR background)."""
+    path = tmp_path / "black.jpg"
+    _make_test_image(path, "black", VideoConfig(**_OCR_CONFIG))
+    return [path]
+
+
+@pytest.mark.parametrize("watermark", _SPECIAL_WATERMARKS)
+def test_watermark_special_characters_render_valid_video(tmp_path, gen, single_image, watermark):
+    """A real N=1 video renders for watermarks containing %, :, ', \\, %{ and spaces."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=1,
+        watermark_text=watermark,
+        watermark_font_path="/System/Library/Fonts/Helvetica.ttc",
+        freeze_duration=0,
+    )
+    output = tmp_path / "out.mp4"
+    assert gen.generate(single_image, cfg, output) == output
+    assert output.stat().st_size > 0
+
+
+@pytest.mark.parametrize("watermark", _SPECIAL_WATERMARKS)
+def test_watermark_rendered_text_matches_config(tmp_path, gen, black_image, watermark):
+    """OCR of the rendered frame reads back exactly the configured watermark — no characters dropped or altered."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    if not _has_ocr_filter():
+        pytest.skip("ocr filter not available — FFmpeg needs libtesseract support")
+    cfg = VideoConfig(
+        **_OCR_CONFIG,
+        watermark_text=watermark,
+        watermark_font_path="/System/Library/Fonts/Helvetica.ttc",
+    )
+    output = tmp_path / "out.mp4"
+    gen.generate(black_image, cfg, output)
+    assert _ocr_watermark(output) == watermark
+
+
+def test_watermark_multi_photo_with_special_characters(tmp_path, gen, three_images):
+    """The N≥2 (xfade) command path also renders a watermark full of special characters."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=2, crossfade_duration=0.5,
+        watermark_text="Foo's Bar: 100% \\Cool\\ %{pts}",
+        watermark_font_path="/System/Library/Fonts/Helvetica.ttc",
+    )
+    output = tmp_path / "out.mp4"
+    assert gen.generate(three_images, cfg, output) == output
+    assert output.stat().st_size > 0
+
+
+def test_watermark_font_path_with_quote_and_filtergraph_chars(tmp_path, gen, single_image):
+    """A font path containing ' : , [ ] ; \\ and spaces still loads (two-level path escaping)."""
+    if not _has_drawtext_filter():
+        pytest.skip("drawtext filter not available — FFmpeg needs libfreetype support")
+    system_font = Path("/System/Library/Fonts/Helvetica.ttc")
+    if not system_font.exists():
+        pytest.skip("System font not available")
+    font_dir = tmp_path / "it's: [odd], dir; \\x"
+    font_dir.mkdir()
+    test_font = font_dir / "Font's File.ttc"
+    shutil.copy(system_font, test_font)
+    cfg = VideoConfig(
+        width=108, height=192, fps=10, seconds_per_photo=1,
+        watermark_text="Demo",
+        watermark_font_path=str(test_font),
+        freeze_duration=0,
+    )
+    output = tmp_path / "out.mp4"
+    assert gen.generate(single_image, cfg, output) == output
+    assert output.stat().st_size > 0

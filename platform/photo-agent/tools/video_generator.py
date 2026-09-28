@@ -6,12 +6,14 @@ FFmpegVideoGenerator implementation, and VideoGenerationError.
 Generates 1080×1920 portrait MP4 slideshow videos from a list of photos
 using FFmpeg via subprocess with crossfade transitions.
 
-No files are read or written by this module directly; the caller provides
-photo paths and an output path. FFmpeg must be installed on the host.
+The caller provides photo paths and an output path. The only file this module
+writes itself is a short-lived watermark text file in the system temp directory
+(see FFmpegVideoGenerator.generate). FFmpeg must be installed on the host.
 """
 
 import logging
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -72,16 +74,21 @@ class FFmpegVideoGenerator:
             raise VideoGenerationError("photos list must not be empty")
 
         n = len(photos)
-        if n == 1:
-            cmd = _build_single_photo_cmd(photos[0], config, output_path)
-        else:
-            cmd = _build_multi_photo_cmd(photos, config, output_path)
+        # The watermark is handed to drawtext via textfile= rather than text=, so
+        # the client's text never passes through filtergraph escaping (see
+        # _watermark_filter). The temp dir is removed on every exit path.
+        with tempfile.TemporaryDirectory(prefix="fieldkit-watermark-") as tmp_dir:
+            watermark_textfile = _write_watermark_textfile(config, Path(tmp_dir))
+            if n == 1:
+                cmd = _build_single_photo_cmd(photos[0], config, output_path, watermark_textfile)
+            else:
+                cmd = _build_multi_photo_cmd(photos, config, output_path, watermark_textfile)
 
-        logger.debug("Running FFmpeg command with %d input(s)", n)
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired as e:
-            raise VideoGenerationError("FFmpeg timed out after 600s") from e
+            logger.debug("Running FFmpeg command with %d input(s)", n)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            except subprocess.TimeoutExpired as e:
+                raise VideoGenerationError("FFmpeg timed out after 600s") from e
         if result.stdout:
             logger.debug("FFmpeg stdout: %s", result.stdout)
         if result.returncode != 0:
@@ -124,50 +131,69 @@ def _scale_crop_filter(i: int, config: VideoConfig, output_duration: float | Non
     )
 
 
-def _escape_for_quoted_filtergraph_value(text: str) -> str:
-    r"""Escape text for use inside SINGLE-QUOTED ffmpeg filtergraph option values.
+# Characters that must be backslash-escaped at each of ffmpeg's two filtergraph
+# parsing levels (ffmpeg-filters(1), "Notes on filtergraph escaping"):
+#   level 1 — a single filter option value: the escaping chars \ and ', plus the
+#             option separator :
+#   level 2 — the whole filtergraph description: \ and ', plus [ ] , ;
+_OPTION_VALUE_SPECIALS = "\\':"
+_FILTERGRAPH_SPECIALS = "\\'[],;"
 
-    FFmpeg's filtergraph parser has TWO parsing layers, and empirical testing shows
-    that COLONS are special even inside single-quoted values — they must be
-    backslash-escaped to prevent misinterpretation as option separators.
 
-    Escaping rules for text inside 'text=...' or 'fontfile=...':
-    1. Backslash: \ → \\ (backslash retains escape role)
-    2. Single quote: ' → '\'' (close quote, escaped quote outside, reopen)
-       CANNOT use \' inside quotes — that terminates the quote early
-    3. Colon: : → \: (empirically required even inside quotes — see round 2 bug)
-    4. Everything else (spaces, %, [, ], etc.) is protected by quotes
+def _backslash_escape(text: str, specials: str) -> str:
+    """Prefix every character of text that appears in specials with a backslash."""
+    return "".join("\\" + ch if ch in specials else ch for ch in text)
+
+
+def _escape_filtergraph_path(path: str) -> str:
+    r"""Escape a file path for use as an unquoted option value in a filtergraph.
+
+    Applies ffmpeg's documented two-level escaping: first as a filter option
+    value, then as part of the filtergraph description. For example the docs'
+    own sample value ``this is a 'string': one, or more`` becomes
+    ``this is a \\\'string\\\'\\: one\, or more``.
+
+    Only used for file paths (fontfile=, textfile=). Watermark text is never
+    escaped — it is passed through a text file instead.
 
     Args:
-        text: Raw text value (e.g. "Foo's Bar: 100%" or "/tmp/test: fonts/Font.ttc")
+        path: Raw filesystem path, e.g. "/tmp/test: fonts/Font's.ttc".
 
     Returns:
-        Escaped text suitable for INSIDE single quotes in filter option values
-
-    Examples:
-        "Foo's Bar: 100%" → "Foo'\''s Bar\: 100%" → wrapped as 'Foo'\''s Bar\: 100%'
-        "/test: fonts/Font File.ttc" → "/test\: fonts/Font File.ttc"
-        "Test\Path" → "Test\\Path"
+        The escaped path, to be placed directly after "fontfile=" / "textfile=".
     """
-    # Order is critical: backslash first, then colon, then single quote
-    text = text.replace("\\", "\\\\")  # \ → \\ (must be first!)
-    text = text.replace(":", "\\:")    # : → \: (required even inside quotes)
-    text = text.replace("'", "'\\''")  # ' → '\'' (close, escaped quote, reopen)
-    # Spaces, %, etc. are protected by the single quotes (no escaping needed)
-    return text
+    return _backslash_escape(
+        _backslash_escape(path, _OPTION_VALUE_SPECIALS), _FILTERGRAPH_SPECIALS
+    )
 
 
-def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str] | None:
+def _write_watermark_textfile(config: VideoConfig, tmp_dir: Path) -> Path | None:
+    """Write config.watermark_text verbatim (UTF-8, no trailing newline) into tmp_dir.
+
+    Returns the file path, or None when no watermark is configured.
+    """
+    if not config.watermark_text:
+        return None
+    textfile = tmp_dir / "watermark.txt"
+    textfile.write_bytes(config.watermark_text.encode("utf-8"))
+    return textfile
+
+
+def _watermark_filter(
+    config: VideoConfig, source_label: str, watermark_textfile: Path | None
+) -> tuple[str, str] | None:
     """Build a drawtext filter segment for the watermark if configured.
 
     Args:
         config: Video configuration (uses watermark_text and watermark_font_path).
         source_label: Bracketed input label, e.g. "[vout]" or "[v0]".
+        watermark_textfile: File holding the watermark text verbatim
+            (from _write_watermark_textfile), or None if there is no watermark.
 
     Returns (filter_segment, output_label) tuple if watermark is configured and
             font file exists, otherwise None. Output label is always "[vwm]".
     """
-    if not config.watermark_text:
+    if not config.watermark_text or watermark_textfile is None:
         return None
 
     # BLOCKING FIX #3: Check for non-empty string AND is_file() (not just exists()).
@@ -189,35 +215,25 @@ def _watermark_filter(config: VideoConfig, source_label: str) -> tuple[str, str]
         )
         return None
 
-    # ROUND 2 FIX: Use SINGLE-QUOTED filtergraph values (text='...', fontfile='...')
-    # to handle TWO-LAYER parsing correctly. The round 1 fix used bare backslash
-    # escaping (text=Foo\'s\ Bar\:...), but that only protects against the OUTER
-    # filtergraph parser consuming one layer of escaping — the resulting literal
-    # unescaped : is still seen as an option separator by the parser, causing
-    # "Error parsing a filter description" / "No option name near ...".
-    #
-    # Correct approach per ffmpeg filtergraph quoting rules: wrap values in single
-    # quotes, where only \ and ' need escaping (everything else is protected).
-    escaped_text = _escape_for_quoted_filtergraph_value(config.watermark_text)
-    escaped_font_path = _escape_for_quoted_filtergraph_value(str(font_path))
+    # The text goes in via textfile= with expansion=none (issue #86). Passing it
+    # inline as text= needs two levels of filtergraph escaping, which previously
+    # broke on an apostrophe: the value swallowed ":expansion=none", and ffmpeg 9
+    # then rejected a lone % with "Stray %". textfile= is the approach the
+    # ffmpeg-filters docs recommend; expansion=none makes drawtext render the
+    # file's contents literally (no %{...} or \ processing). Only the two file
+    # paths, which we control or come from config, need escaping.
+    escaped_textfile = _escape_filtergraph_path(str(watermark_textfile))
+    escaped_font_path = _escape_filtergraph_path(str(font_path))
 
     # Semi-opaque background box for legibility against arbitrary photo backgrounds.
     # Position at bottom-right with padding. Font size 28 for 1080px width.
     # box=1 enables background box, boxcolor with @alpha for opacity.
     # x position clamped to avoid negative/clipped rendering for long names on narrow output.
-    #
-    # ROUND 3/4 FIX: Add expansion=none to disable drawtext's %{...} expansion.
-    # After filtergraph parsing strips the quotes, drawtext's text-expansion stage
-    # would interpret %{pts}, %{n}, etc. as metadata — a literal % in a client
-    # display name (e.g. "100%") would be at risk of misinterpretation. Setting
-    # expansion=none (NOT text_expansion — that was a round 4 typo) treats the
-    # text value as fully literal with no dynamic expansion, which is exactly
-    # what's wanted for a static display name.
     filter_segment = (
         f"{source_label}drawtext="
-        f"text='{escaped_text}':"
+        f"textfile={escaped_textfile}:"
         f"expansion=none:"
-        f"fontfile='{escaped_font_path}':"
+        f"fontfile={escaped_font_path}:"
         f"fontsize=28:"
         f"fontcolor=white:"
         f"box=1:"
@@ -257,13 +273,15 @@ def _output_flags(config: VideoConfig) -> list[str]:
     ]
 
 
-def _build_single_photo_cmd(photo: Path, config: VideoConfig, output_path: Path) -> list[str]:
+def _build_single_photo_cmd(
+    photo: Path, config: VideoConfig, output_path: Path, watermark_textfile: Path | None = None
+) -> list[str]:
     """FFmpeg command for N=1: read the still image once; zoompan expands it to full duration."""
     filters = [_scale_crop_filter(0, config)]
     map_label = "[v0]"
 
     # Apply watermark if configured (after zoompan, before freeze)
-    watermark_result = _watermark_filter(config, "[v0]")
+    watermark_result = _watermark_filter(config, "[v0]", watermark_textfile)
     if watermark_result:
         watermark_filter, map_label = watermark_result
         filters.append(watermark_filter)
@@ -283,7 +301,9 @@ def _build_single_photo_cmd(photo: Path, config: VideoConfig, output_path: Path)
     ]
 
 
-def _build_multi_photo_cmd(photos: list[Path], config: VideoConfig, output_path: Path) -> list[str]:
+def _build_multi_photo_cmd(
+    photos: list[Path], config: VideoConfig, output_path: Path, watermark_textfile: Path | None = None
+) -> list[str]:
     """FFmpeg command for N≥2: per-photo zoompan followed by an xfade chain."""
     n = len(photos)
     spp = config.seconds_per_photo
@@ -316,7 +336,7 @@ def _build_multi_photo_cmd(photos: list[Path], config: VideoConfig, output_path:
     map_label = "[xout]"
 
     # Apply watermark if configured (after xfade chain, before freeze)
-    watermark_result = _watermark_filter(config, "[xout]")
+    watermark_result = _watermark_filter(config, "[xout]", watermark_textfile)
     if watermark_result:
         watermark_filter, map_label = watermark_result
         filters.append(watermark_filter)
