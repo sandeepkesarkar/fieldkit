@@ -1044,13 +1044,14 @@ def is_published(idempotency_key: str) -> bool:
 # ---------------------------------------------------------------------------
 #
 # Publishing a Reel requires briefly making the approved video publicly readable on
-# Drive (Instagram fetches it by URL; see tools/drive.py). Revoking that link is a
+# Drive (Instagram fetches it by URL; see tools/drive.py). Ending that exposure — by
+# permanently deleting the temporary copy, confirmed (drive.delete_temporary_share) — is a
 # SEPARATE concern from the publish itself: the Reel can be genuinely live while the
-# revoke call fails on a transient Drive error.
+# cleanup fails on a transient Drive error.
 #
 # Treating that as an acceptable success would leave a client's video publicly
 # reachable forever with nothing recording the fact — the failure mode the privacy
-# gate exists to prevent. So a failed revoke is written down here instead, durably,
+# gate exists to prevent. So a failed cleanup is written down here instead, durably,
 # and retried on every subsequent cron tick until it succeeds — by BOTH cron workers
 # (tools/share_cleanup.py), so the retry survives either one stopping (issue #80). This
 # list is keyed by Drive file id and is deliberately independent of the upload job's
@@ -1109,7 +1110,7 @@ def record_share_intent(file_id: str, project_name: str, owner: str | None = Non
 def record_share_cleanup(
     file_id: str, project_name: str, *, create_if_missing: bool = True
 ) -> dict | None:
-    """Record that file_id's public Drive permission still needs revoking.
+    """Record that file_id's temporary Drive copy still needs deleting (a cleanup failed).
 
     Returns the entry dict when the admin SHOULD BE ALERTED right now, or None when they
     should not. That decision is made here rather than by the caller because it needs the

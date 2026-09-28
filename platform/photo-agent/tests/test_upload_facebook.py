@@ -1199,7 +1199,7 @@ def _cleanup_ids():
 @pytest.fixture
 def revoke(mocker):
     import tools.drive as drive
-    return mocker.patch.object(drive, "revoke_share_link")
+    return mocker.patch.object(drive, "delete_temporary_share")
 
 
 def test_share_drain_runs_with_instagram_unconfigured_and_no_job(base, revoke):

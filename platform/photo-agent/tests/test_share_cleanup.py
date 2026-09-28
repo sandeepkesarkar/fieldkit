@@ -6,7 +6,7 @@ Uses the REAL instagram_state against an isolated tmp file and REAL flock (owner
 the drain lock), so ownership and locking are exercised as they run in production. flock
 locks belong to an open file description, so a fence held by this process is seen as held
 by a second open of the same file — exactly how a drain sees another process's attempt.
-Only drive.revoke_share_link is mocked. No network, Drive, Telegram, or client data.
+Only drive.delete_temporary_share is mocked. No network, Drive, Telegram, or client data.
 """
 
 import ast
@@ -35,7 +35,7 @@ def isolated_state(tmp_path, monkeypatch):
 
 @pytest.fixture
 def revoke(mocker):
-    return mocker.patch.object(share_cleanup.drive, "revoke_share_link")
+    return mocker.patch.object(share_cleanup.drive, "delete_temporary_share")
 
 
 @pytest.fixture
@@ -122,55 +122,45 @@ def test_live_owners_link_just_under_the_threshold_is_left_alone(revoke, live_ow
 
 
 @pytest.mark.parametrize("holds_instagram_lock", [False, True])
-def test_live_owners_overdue_link_is_revoked_every_tick_but_never_cleared(
+def test_live_owners_overdue_copy_is_deleted_and_the_obligation_retired(
     revoke, live_owner, holds_instagram_lock
 ):
-    """The stalled attempt may still grant the permission, so the obligation must outlive
-    every revoke until the attempt is provably done."""
+    """A stalled attempt's exposure is ended by deleting its copy. Retiring the obligation
+    while the attempt still lives is safe ONLY because the deletion is confirmed: nothing
+    can make a file that no longer exists public again."""
     _, token = live_owner
     ig_state.record_share_intent("stalled_file", _PROJECT, owner=token)
     _age_entry("stalled_file", _OVERDUE)
-    for _ in range(3):
-        share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=holds_instagram_lock)
-    assert revoke.call_count == 3
-    assert _file_ids() == ["stalled_file"]
+    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=holds_instagram_lock)
+    revoke.assert_called_once_with("stalled_file")
+    assert _file_ids() == []
 
 
-def test_live_owners_failed_revoke_is_due_but_not_cleared(revoke, live_owner):
+def test_live_owners_failed_cleanup_is_due_at_once(revoke, live_owner):
     _, token = live_owner
     ig_state.record_share_intent("f", _PROJECT, owner=token)
-    ig_state.record_share_cleanup("f", _PROJECT)  # the attempt's own revoke failed
+    ig_state.record_share_cleanup("f", _PROJECT)  # the attempt's own cleanup failed
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
     revoke.assert_called_once_with("f")
-    assert _file_ids() == ["f"]
-
-
-def test_obligation_is_cleared_on_the_first_drain_after_the_owner_is_done(revoke, live_owner):
-    stack, token = live_owner
-    ig_state.record_share_intent("f", _PROJECT, owner=token)
-    _age_entry("f", _OVERDUE)
-    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
-    assert _file_ids() == ["f"]
-    stack.close()  # the stalled attempt finally ends
-    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
     assert _file_ids() == []
-    assert revoke.call_count == 2
 
 
-def test_liveness_is_decided_before_the_revoke(mocker, live_owner):
-    """An owner that finishes DURING the revoke may have granted just before finishing —
-    this drain's revoke might predate that, so only a later drain may clear."""
-    stack, token = live_owner
+def test_unconfirmed_deletion_never_retires_an_obligation(mocker, live_owner):
+    """Whoever owns it, and however often it is retried, an obligation outlives every
+    deletion that is not confirmed."""
+    _, token = live_owner
     ig_state.record_share_intent("f", _PROJECT, owner=token)
-    _age_entry("f", _OVERDUE)
-    revoke = mocker.patch.object(
-        share_cleanup.drive, "revoke_share_link", side_effect=lambda fid: stack.close()
+    ig_state.record_share_intent("g", _PROJECT, owner=_dead_owner())
+    ig_state.record_share_intent("h", _PROJECT)  # no owner token
+    for fid in ("f", "g", "h"):
+        _age_entry(fid, _OVERDUE)
+    mocker.patch.object(
+        share_cleanup.drive, "delete_temporary_share",
+        side_effect=RuntimeError("Drive file f still exists after delete"),
     )
-    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
-    assert _file_ids() == ["f"]
-    share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
-    assert _file_ids() == []
-    assert revoke.call_count == 2
+    for holds in (False, True, False):
+        share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=holds)
+    assert sorted(_file_ids()) == ["f", "g", "h"]
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +208,12 @@ def test_ownerless_fresh_entry_is_left_alone_by_other_callers(revoke):
     revoke.assert_not_called()
 
 
-def test_ownerless_overdue_entry_is_revoked_but_not_cleared_by_other_callers(revoke):
+def test_ownerless_overdue_entry_is_deleted_and_retired_by_other_callers(revoke):
     ig_state.record_share_intent("legacy", _PROJECT)
     _age_entry("legacy", _OVERDUE)
     share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
     revoke.assert_called_once_with("legacy")
-    assert _file_ids() == ["legacy"]
+    assert _file_ids() == []
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +267,7 @@ def test_retry_failure_does_not_resurrect_an_entry_another_worker_cleared(mocker
         raise RuntimeError("Drive down")
 
     mocker.patch.object(
-        share_cleanup.drive, "revoke_share_link",
+        share_cleanup.drive, "delete_temporary_share",
         side_effect=_other_worker_cleared_it_then_drive_failed,
     )
     alerts = []
@@ -329,7 +319,7 @@ def test_drain_skips_without_waiting_when_another_drain_holds_the_lock(revoke, i
 def test_drain_lock_is_released_after_a_drain_that_raised(mocker, isolated_state):
     ig_state.record_share_intent("f1", _PROJECT, owner=_dead_owner())
     mocker.patch.object(
-        share_cleanup.drive, "revoke_share_link", side_effect=ValueError("unexpected")
+        share_cleanup.drive, "delete_temporary_share", side_effect=ValueError("unexpected")
     )
     with pytest.raises(ValueError):
         share_cleanup.drain(_NO_ALERTS, holds_instagram_lock=False)
@@ -379,3 +369,41 @@ def test_module_uses_only_instagram_states_public_api():
     ]
     assert private == []
     assert "STATE_FILE" not in source
+
+
+# ---------------------------------------------------------------------------
+# Sweeping owner files left by attempts killed before registering anything
+# ---------------------------------------------------------------------------
+
+def _owner_file(isolated_state, token, age_seconds):
+    import os
+    path = isolated_state / share_cleanup.OWNER_DIRNAME / f"{token}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+    then = datetime.now(timezone.utc).timestamp() - age_seconds
+    os.utime(path, (then, then))
+    return path
+
+
+def test_sweep_removes_old_unlocked_unreferenced_owner_files(isolated_state):
+    path = _owner_file(isolated_state, "ab" * 16, _OVERDUE)
+    assert share_cleanup.sweep_dead_owner_files() == 1
+    assert not path.exists()
+
+
+def test_sweep_keeps_young_referenced_or_live_owner_files(isolated_state, live_owner):
+    young = _owner_file(isolated_state, "cd" * 16, 60)          # may be mid-creation
+    referenced = _owner_file(isolated_state, "ef" * 16, _OVERDUE)
+    ig_state.record_share_intent("f", _PROJECT, owner="ef" * 16)
+    _, live_token = live_owner
+    live = isolated_state / share_cleanup.OWNER_DIRNAME / f"{live_token}.lock"
+    import os
+    then = datetime.now(timezone.utc).timestamp() - _OVERDUE
+    os.utime(live, (then, then))
+    assert share_cleanup.sweep_dead_owner_files() == 0
+    assert young.exists() and referenced.exists() and live.exists()
+
+
+def test_sweep_creates_nothing_when_there_is_no_owner_directory(isolated_state):
+    assert share_cleanup.sweep_dead_owner_files() == 0
+    assert not isolated_state.exists()

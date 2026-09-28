@@ -23,6 +23,7 @@ from tools.drive import (
     find_folder,
     folder_link,
     list_photos,
+    delete_temporary_share,
     revoke_share_link,
     upload,
 )
@@ -755,3 +756,100 @@ def test_the_anyone_permission_carries_no_expiration_time(mocker, share_env, vid
     assert "expirationTime" not in body
     # allowFileDiscovery left unset keeps this link-access rather than search-discoverable.
     assert "allowFileDiscovery" not in body
+
+
+# --- delete_temporary_share (issue #80 round 3) ---
+#
+# A revoke proves only that no public permission is visible at that moment; a permission
+# POST whose response was lost may still land afterwards. Only a confirmed permanent
+# deletion ends the exposure for good, so this function must raise unless files.get
+# answers 404 after files.delete.
+
+def _status(code: int) -> MagicMock:
+    m = MagicMock()
+    m.status_code = code
+    m.ok = 200 <= code < 300
+    m.json.return_value = {"id": _FILE_ID, "trashed": False}
+    return m
+
+
+@pytest.fixture
+def share_delete(mocker):
+    mocker.patch("tools.drive._get_access_token", return_value="tok")
+    revoke = mocker.patch("tools.drive.revoke_share_link")
+    delete = mocker.patch("requests.delete", return_value=_status(204))
+    get = mocker.patch("requests.get", return_value=_status(404))
+    return revoke, delete, get
+
+
+def test_delete_temporary_share_revokes_then_permanently_deletes_then_confirms(share_delete):
+    revoke, delete, get = share_delete
+    delete_temporary_share(_FILE_ID)
+    revoke.assert_called_once_with(_FILE_ID)
+    assert delete.call_args.args[0].endswith(f"/files/{_FILE_ID}")   # files.delete,
+    assert get.call_args.args[0].endswith(f"/files/{_FILE_ID}")      # then files.get
+
+
+def test_delete_temporary_share_never_trashes(share_delete, mocker):
+    """Trash is not the end of exposure: a trashed file stays reachable to others."""
+    patch_ = mocker.patch("requests.patch")
+    post = mocker.patch("requests.post")
+    delete_temporary_share(_FILE_ID)
+    patch_.assert_not_called()
+    post.assert_not_called()
+
+
+def test_delete_temporary_share_raises_if_the_file_is_still_there(share_delete):
+    _, _, get = share_delete
+    get.return_value = _status(200)          # e.g. still present, or merely trashed
+    with pytest.raises(RuntimeError, match="still exists"):
+        delete_temporary_share(_FILE_ID)
+
+
+@pytest.mark.parametrize("code", [500, 503, 403])
+def test_delete_temporary_share_raises_if_deletion_cannot_be_confirmed(share_delete, code):
+    _, _, get = share_delete
+    get.return_value = _status(code)
+    with pytest.raises(RuntimeError, match="could not confirm"):
+        delete_temporary_share(_FILE_ID)
+
+
+def test_delete_temporary_share_raises_if_the_confirming_read_times_out(share_delete):
+    import requests as _requests
+    _, _, get = share_delete
+    get.side_effect = _requests.exceptions.ReadTimeout("read timed out")
+    with pytest.raises(RuntimeError, match="could not confirm"):
+        delete_temporary_share(_FILE_ID)
+
+
+@pytest.mark.parametrize("code", [500, 503, 403])
+def test_delete_temporary_share_raises_on_a_failed_delete(share_delete, code):
+    _, delete, get = share_delete
+    delete.return_value = _status(code)
+    with pytest.raises(RuntimeError, match="delete failed"):
+        delete_temporary_share(_FILE_ID)
+    get.assert_not_called()
+
+
+def test_delete_temporary_share_raises_on_a_delete_that_times_out(share_delete):
+    """A delete whose response is lost is itself ambiguous — never taken as success."""
+    import requests as _requests
+    _, delete, _ = share_delete
+    delete.side_effect = _requests.exceptions.ReadTimeout("read timed out")
+    with pytest.raises(RuntimeError, match="delete request failed"):
+        delete_temporary_share(_FILE_ID)
+
+
+def test_delete_temporary_share_accepts_an_already_deleted_file_once_confirmed(share_delete):
+    _, delete, get = share_delete
+    delete.return_value = _status(404)
+    delete_temporary_share(_FILE_ID)          # must not raise
+    get.assert_called_once()
+
+
+def test_delete_temporary_share_still_deletes_when_the_revoke_fails(share_delete):
+    """The revoke is only the fast first step; deletion ends the exposure regardless."""
+    revoke, delete, _ = share_delete
+    revoke.side_effect = RuntimeError("Drive revoke share link failed: HTTP 503")
+    delete_temporary_share(_FILE_ID)
+    delete.assert_called_once()

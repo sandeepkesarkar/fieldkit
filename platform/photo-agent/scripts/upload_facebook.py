@@ -77,17 +77,18 @@ nobody. Deletion now happens only when every enabled platform has resolved this
 approval; see tools/upload_cleanup.py.
 
 Instagram share-link cleanup (issue #80). Publishing a Reel briefly makes the approved
-video publicly readable on Drive, and the obligation to revoke that link is recorded in
-instagram_state's pending_share_cleanups. This script drains that list too, every tick,
-through tools/share_cleanup.py — so a link is still revoked, and a link that cannot be
-revoked is still re-alerted daily, if upload_instagram.py dies mid-attempt or its cron is
-removed. Revoking needs Drive credentials only, so the drain runs on every tick regardless
+video publicly readable on Drive (as a disposable copy), and the obligation to delete that
+copy is recorded in instagram_state's pending_share_cleanups. This script drains that list
+too, every tick, through tools/share_cleanup.py — so the copy is still deleted, and one
+that cannot be deleted is still re-alerted daily, if upload_instagram.py dies mid-attempt
+or its cron is removed. Deleting needs Drive credentials only, so the drain runs on every tick regardless
 of Instagram being configured, of a Meta token, or of there being a Facebook job. It is
 isolated from this script's own work: it runs only AFTER the Facebook publish path has
 finished (so a slow or failing Drive never delays a Facebook post), it only takes its own
 drain lock, non-blocking, it creates nothing for a client with no Instagram state, and any
-error in it is logged and swallowed (see _drain_share_cleanups). Which entries it may
-revoke, and which it may retire, is explained in tools/share_cleanup.py.
+error in it is logged and swallowed (see _drain_share_cleanups). When it may act on an
+entry, and why only a confirmed deletion retires one, is explained in
+tools/share_cleanup.py.
 
 FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
@@ -295,12 +296,12 @@ def _run_facebook_tick(page_token: str, page_id: str, chat_id: str) -> None:
 
 
 def _drain_share_cleanups(chat_id: str) -> None:
-    """Revoke Instagram share links whose worker can no longer be relied on to (issue #80).
+    """Delete Instagram share copies whose worker can no longer be relied on to (issue #80).
 
-    Delegates to tools/share_cleanup.drain() with holds_instagram_lock=False: it revokes a
-    link a live Instagram attempt may be using only once that link is overdue, and retires
-    an obligation only once its owning attempt is provably done — see that module for the
-    rule and why. It never takes upload_instagram.lock, and skips (never waits) if the
+    Delegates to tools/share_cleanup.drain() with holds_instagram_lock=False: it deletes a
+    copy a live Instagram attempt may be using only once that entry is overdue, and retires
+    an obligation only on a confirmed permanent deletion — see that module for the rule and
+    why. It never takes upload_instagram.lock, and skips (never waits) if the
     Instagram worker's drain is running, so it cannot block or be blocked by an Instagram
     publish (FR-013). main() calls it only after this tick's Facebook work.
 

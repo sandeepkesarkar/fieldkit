@@ -61,8 +61,8 @@ after creating a link and before revoking it, so the link is public and the
 obligation is recorded. That used to be a single point of failure — the drain that
 would revoke it and the daily alert that would report it both lived in the stopped
 worker. They now live in tools/share_cleanup.py and run from upload_facebook.py as
-well (issue #80), so the link is revoked even if the Instagram cron never runs
-again. See docs/instagram/README.md.
+well (issue #80), so the temporary copy is deleted even if the Instagram cron never
+runs again. See docs/instagram/README.md.
 """
 
 import fcntl
