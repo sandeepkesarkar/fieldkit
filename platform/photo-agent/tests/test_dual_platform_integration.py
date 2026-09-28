@@ -885,3 +885,146 @@ def test_an_exhausted_job_that_never_published_stays_re_approvable(cron, video):
     assert ig_state.get_pending_upload() is None
     assert ig_state.has_unresolved_publish(_IDEM_KEY) is False
     assert ig_state.list_publish_reconciliations() == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #80 — share-link revocation survives the Instagram worker stopping
+# ---------------------------------------------------------------------------
+
+class _WorkerKilled(BaseException):
+    """Stands in for SIGKILL / OOM / power loss: no except clause and no finally-revoke runs.
+
+    A BaseException, not an Exception, so none of upload_instagram.py's handlers — which
+    are where the per-attempt revoke lives — can catch it.
+    """
+
+
+def _age_share_intents(seconds):
+    """Rewind every pending_share_cleanups recorded_at by `seconds` (test harness only).
+
+    Edits the tmp state file directly, as _edit_pending_record does: simulating the clock
+    moving on is a harness concern, not something the production API should offer.
+    """
+    from datetime import datetime, timedelta, timezone
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    then = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    for entry in raw["pending_share_cleanups"]:
+        entry["recorded_at"] = then
+    ig_state.STATE_FILE.write_text(json.dumps(raw, indent=2))
+
+
+def _share_alerts(*mods):
+    return [
+        c.args[1]
+        for mod in mods
+        for c in mod.telegram_api.send_message.call_args_list
+        if "could not remove the temporary public link" in c.args[1]
+    ]
+
+
+def test_link_left_by_a_killed_instagram_worker_is_revoked_by_the_facebook_worker(
+    cron, video, monkeypatch
+):
+    """THE issue #80 scenario, end to end through both real state machines.
+
+    The Instagram worker dies after the share link exists and before any revoke. Its cron
+    never runs again (and Instagram is then unconfigured, with no Meta token either). The
+    next upload_facebook.py tick that can tell the link is orphaned revokes it and clears
+    the obligation.
+    """
+    import scripts.upload_instagram as ui
+    ui.instagram_api.create_media_container.side_effect = _WorkerKilled()
+
+    with pytest.raises(_WorkerKilled):
+        ig_main([])
+
+    # The link exists and is recorded, and nothing revoked it.
+    assert [e["file_id"] for e in ig_state.list_share_cleanups()] == ["drive_file_1"]
+    ui.drive.revoke_share_link.assert_not_called()
+
+    # Before it can know the attempt is dead, the Facebook worker leaves the link alone
+    # (it could be a live attempt's) — while publishing its own job normally.
+    fb_main([])
+    ui.drive.revoke_share_link.assert_not_called()
+    assert fb_state.is_published(_IDEM_KEY) is True
+
+    # The Instagram cron is gone for good and so is its config; a day passes. (The exact
+    # threshold is covered in test_share_cleanup.py; this test deliberately does not
+    # import that module, so it runs — and fails — against code that predates it.)
+    monkeypatch.delenv("IG_BUSINESS_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("FB_PAGE_ACCESS_TOKEN", raising=False)
+    _age_share_intents(24 * 60 * 60)
+
+    with pytest.raises(SystemExit):  # Facebook now misconfigured too — reported, after...
+        fb_main([])
+
+    # ...the link was revoked, with no Instagram config and no Meta token at all.
+    ui.drive.revoke_share_link.assert_called_once_with("drive_file_1")
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_facebook_tick_during_a_live_instagram_attempt_does_not_revoke_its_link(cron, video):
+    """A Facebook tick that lands while Instagram is still fetching the video must not
+    pull the link out from under it."""
+    import scripts.upload_instagram as ui
+    revokes_seen_by_facebook_tick = []
+
+    def _container_created_while_facebook_ticks(page_token, account_id, share_link):
+        # Instagram's servers are fetching share_link right now. A Facebook tick fires.
+        fb_main([])
+        revokes_seen_by_facebook_tick.append(ui.drive.revoke_share_link.call_count)
+        return _CONTAINER_ID
+
+    ui.instagram_api.create_media_container.side_effect = _container_created_while_facebook_ticks
+
+    ig_main([])
+
+    assert revokes_seen_by_facebook_tick == [0]
+    assert ig_state.is_published(_IDEM_KEY) is True
+    # Instagram's own exit path revoked it, exactly once.
+    ui.drive.revoke_share_link.assert_called_once_with("drive_file_1")
+    assert ig_state.list_share_cleanups() == []
+
+
+def test_both_workers_retrying_one_failing_link_alert_once_per_interval(cron, video):
+    """Two drains on one dangling link never double the admin's reminders."""
+    import scripts.upload_facebook as uf
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+
+    ig_main([])  # publishes; its own revoke fails -> first alert
+    for _ in range(3):
+        fb_main([])
+        ig_main([])
+
+    assert len(_share_alerts(ui, uf)) == 1
+    assert ig_state.list_share_cleanups()[0]["attempts"] == 7
+
+
+def test_daily_reminder_still_arrives_from_facebook_after_the_instagram_cron_stops(
+    cron, video
+):
+    """The re-alert is reachable from the surviving worker, and only once per interval."""
+    import scripts.upload_facebook as uf
+    import scripts.upload_instagram as ui
+    ui.drive.revoke_share_link.side_effect = RuntimeError("Drive down")
+    ig_main([])
+    assert len(_share_alerts(ui)) == 1
+
+    # The Instagram cron is removed. A day passes.
+    raw = json.loads(ig_state.STATE_FILE.read_text())
+    raw["pending_share_cleanups"][0]["last_alerted_at"] = "2020-01-01T00:00:00+00:00"
+    ig_state.STATE_FILE.write_text(json.dumps(raw, indent=2))
+
+    fb_main([])
+    fb_main([])
+
+    reminders = _share_alerts(uf)
+    assert len(reminders) == 1
+    assert "drive_file_1" in reminders[0]
+    assert _SHARE_LINK not in reminders[0]
+    assert len(_share_alerts(ui)) == 1  # nothing further from the stopped worker
+
+    ui.drive.revoke_share_link.side_effect = None
+    fb_main([])
+    assert ig_state.list_share_cleanups() == []

@@ -186,7 +186,10 @@ thing: the cron is not running, and approvals will not queue Instagram jobs.
 
 The two upload scripts are independent: separate state files, separate lock
 files, separate claim namespaces. Neither serializes against the other, and
-neither can block, retry, or roll back the other's post.
+neither can block, retry, or roll back the other's post. The one thing they
+share is the job of revoking dangling Drive share links (see "If the Instagram
+cron stops entirely" below), and that is arranged so neither can delay the other:
+each only ever tries the shared drain lock without waiting.
 
 A tick with nothing to do — no pending job, a claim declined, or Instagram not
 configured for this client — exits `0` silently and costs nothing.
@@ -295,13 +298,18 @@ The Drive API's `permissions.expirationTime` is restricted to user and group
 permissions — an `anyone` permission cannot carry one — so there is no server-side
 way to make an anonymous link self-destruct. Enforcement is FieldKit's, and it is
 enforced before the exposure exists: worst case, one attempt plus one cron tick,
-even if the process is killed at the worst possible moment.
+even if the process is killed at the worst possible moment — as long as the
+Instagram cron keeps running. If it does not, `upload_facebook.py` revokes the
+link instead, within 30 minutes plus a tick (see "If the Instagram cron stops
+entirely").
 
 **If a revoke fails**, it is never written off as success. The Drive file ID is
 recorded durably in `instagram_state.json` under `pending_share_cleanups`, the
 admin gets a Telegram alert naming that specific file, and **every subsequent cron
-tick retries the revocation** — including ticks with no new video to publish —
-until it succeeds, at which point the entry is cleared. A public link can never be
+tick retries the revocation** — including ticks with no new video to publish, and
+ticks of `upload_facebook.py` as well as `upload_instagram.py` — until it succeeds,
+at which point the entry is cleared. The retry loop itself lives in
+`tools/share_cleanup.py`, shared by both workers. A public link can never be
 left dangling with nothing recording it.
 
 Two properties of that retry loop are load-bearing:
@@ -311,12 +319,17 @@ Two properties of that retry loop are load-bearing:
   client's Instagram config or letting its Meta token expire does *not* strand a
   link that is already public. Revoking a Drive permission needs Drive credentials
   and nothing else. (The only thing that gates it is `FIELDKIT_DATA_DIR` /
-  `FIELDKIT_LOG_DIR`, which the state file itself lives under.)
+  `FIELDKIT_LOG_DIR`, which the state file itself lives under.) The same holds for
+  the copy of the drain in `upload_facebook.py`: it runs before that script's own
+  Facebook config check, whether or not Instagram is configured and whether or not
+  there is a Facebook job.
 - **The admin is reminded daily, not once.** The first failure alerts immediately;
   after that, a still-unrevoked link re-alerts every 24 hours
   (`_SHARE_CLEANUP_ALERT_INTERVAL_SECONDS` in `instagram_state.py`), reporting the
   running failure count. A single alert would let a permanently-failing cleanup go
-  quiet while the video stayed public.
+  quiet while the video stayed public. The decision to alert is taken and stamped
+  inside one state-file transaction, so with both workers retrying you still get one
+  reminder per day, from whichever worker happens to retry first.
 
 To audit: `pending_share_cleanups` in `instagram_state.json` is the authoritative
 list of links that may still be public. An empty list means nothing is outstanding.
@@ -535,13 +548,44 @@ entries keep blocking, so that is reported rather than silent: each one alerts (
 same daily schedule, without counting as a check that never happened) naming
 `FB_PAGE_ACCESS_TOKEN` as the reason and the reconnect as the fix.
 
-**If the Instagram cron stops entirely**, that is a different matter and worth stating
-plainly. Every revocation path lives in `upload_instagram.py`: the per-attempt revoke, the
-`pending_share_cleanups` drain, and the daily reminder about a link still dangling. So a
-worker that dies *mid-attempt* — after creating a link and before revoking it — leaves the
-link public, the obligation correctly recorded, and nothing running that would act on
-either. The heartbeat does not help here and is not meant to: the worker was genuinely
-alive when it created the link.
+**If the Instagram cron stops entirely**, a dangling link is still revoked (issue #80).
+The per-attempt revoke lives in `upload_instagram.py`, but the `pending_share_cleanups`
+drain and the daily reminder about a link still dangling live in `tools/share_cleanup.py`,
+which **both** upload crons run on every tick. So when the Instagram worker dies
+*mid-attempt* — after creating a link and before revoking it — or its cron entry is
+removed afterwards, `upload_facebook.py` picks the recorded obligation up, revokes the
+link, and clears it; if the revoke keeps failing, it is the one that re-alerts daily.
+It needs Drive credentials and nothing else: no `IG_BUSINESS_ACCOUNT_ID`, no Meta token,
+no Facebook job.
+
+What it deliberately does *not* do is revoke a link Instagram might still be fetching.
+An obligation is written the moment the Drive file exists, so a live attempt's link is
+on the list too, and pulling it mid-attempt would break that publish. The rule:
+
+- `upload_instagram.py` drains while holding `upload_instagram.lock` and before starting
+  an attempt of its own, so nothing else can be using any listed link: it revokes them all.
+- `upload_facebook.py` cannot see whether an Instagram attempt is in flight, and does not
+  take `upload_instagram.lock` to find out (that would let a Facebook tick make an
+  Instagram tick skip). It revokes an entry only when it is **due regardless of any live
+  attempt**: a revoke has already failed at least once (which only happens after the
+  attempt that used the link is over), or the entry is older than 30 minutes
+  (`share_cleanup.ORPHANED_INTENT_AFTER_SECONDS`, equal to the Instagram claim lease — the
+  point at which Instagram itself treats an attempt as abandoned).
+
+So the worst case after the Instagram worker dies mid-attempt and never comes back is
+about 30 minutes plus one tick of public exposure, not "until someone notices".
+
+The two drains never run at the same moment: each takes `share_cleanup.lock` (next to
+`instagram_state.json`) without waiting and simply skips its drain that tick if the other
+has it. Neither publishing path takes that lock, so a slow Drive call during one worker's
+drain never delays the other worker's post. Every change to the list still goes through
+`instagram_state.py`'s single transactional write path. A drain failure inside
+`upload_facebook.py` — a Drive outage, or an unreadable `instagram_state.json` — is logged
+and ignored for that tick; it never stops the Facebook post, and the obligation stays
+recorded for the next tick.
+
+The heartbeat is not what protects this case and is not meant to: the worker was
+genuinely alive when it created the link.
 
 What the heartbeat's one-hour staleness window does **not** do is create this situation.
 The only production caller of `drive.create_temporary_share_link()` is
@@ -549,9 +593,7 @@ The only production caller of `drive.create_temporary_share_link()` is
 worker whose absence is in question. A link's only creator is the thing that is dead, so
 "heartbeat wrongly fresh" and "a link was created" cannot both hold. During that window an
 approval queues an inert job, and `upload_cleanup` retains the shared video until the
-heartbeat goes stale; no public link is created. Recovering the dangling-link case needs a
-revocation path that survives this worker, which is tracked separately rather than bolted
-on here.
+heartbeat goes stale; no public link is created.
 
 ### Resolving a quarantine by hand
 

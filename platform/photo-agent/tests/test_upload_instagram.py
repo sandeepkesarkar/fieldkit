@@ -612,7 +612,11 @@ def test_failed_cleanup_retry_stays_recorded(base):
     ui.drive.revoke_share_link.side_effect = RuntimeError("still down")
     main([])
     ui.instagram_state.clear_share_cleanup.assert_not_called()
-    ui.instagram_state.record_share_cleanup.assert_called_once_with("stale_file_1", _PROJECT)
+    # create_if_missing=False: a retry bumps the existing entry and never resurrects one
+    # that the other worker's drain has already revoked and cleared (issue #80).
+    ui.instagram_state.record_share_cleanup.assert_called_once_with(
+        "stale_file_1", _PROJECT, create_if_missing=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +679,37 @@ def test_cleanup_is_skipped_when_the_lock_is_held(base, mocker):
     ]
     main([])
     ui.drive.revoke_share_link.assert_not_called()
+
+
+def test_cleanup_skips_without_waiting_when_the_facebook_drain_is_running(
+    with_pending, mocker
+):
+    """upload_facebook.py drains the same list (issue #80). If its drain holds the drain
+    lock, this tick skips its own drain — and still publishes, undelayed (FR-013)."""
+    import scripts.upload_instagram as ui
+    mocker.patch.object(ui.share_cleanup, "_try_acquire_drain_lock", return_value=None)
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "stale_file_1", "project_name": _PROJECT, "attempts": 1},
+    ]
+    main([])
+    revoked = [c.args[0] for c in ui.drive.revoke_share_link.call_args_list]
+    assert "stale_file_1" not in revoked
+    ui.instagram_state.mark_published.assert_called_once()
+    # The attempt's own link is still revoked on its own exit path, lock or no lock.
+    assert revoked == [_SHARE_FILE_ID]
+
+
+def test_instagram_drain_revokes_a_fresh_intent_left_by_a_killed_attempt(base):
+    """Holding upload_instagram.lock, no attempt can be live: even a fresh intent is orphaned."""
+    import scripts.upload_instagram as ui
+    from datetime import datetime, timezone
+    ui.instagram_state.list_share_cleanups.return_value = [
+        {"file_id": "killed_file", "project_name": _PROJECT, "attempts": 0,
+         "recorded_at": datetime.now(timezone.utc).isoformat()},
+    ]
+    main([])
+    ui.drive.revoke_share_link.assert_called_once_with("killed_file")
+    ui.instagram_state.clear_share_cleanup.assert_called_once_with("killed_file")
 
 
 @pytest.mark.parametrize("var", ["FIELDKIT_DATA_DIR", "FIELDKIT_LOG_DIR"])

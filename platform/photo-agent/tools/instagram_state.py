@@ -20,6 +20,11 @@ independence): a Facebook job's state, lock, and claim namespace are never
 touched by an Instagram job for the same video, and vice versa. The two are
 correlated only by sharing the same idempotency_key.
 
+One narrow exception: pending_share_cleanups is also drained from upload_facebook.py, via
+tools/share_cleanup.py, so a public Drive link is revoked even if the Instagram cron stops
+(issue #80). That drain touches only that list and only through the functions below, so
+it goes through _transaction() like every other write.
+
 pending_instagram_upload is always cleared (set back to null) once a job
 resolves — via mark_published() or mark_failed(), both terminal.
 
@@ -1046,11 +1051,12 @@ def is_published(idempotency_key: str) -> bool:
 # Treating that as an acceptable success would leave a client's video publicly
 # reachable forever with nothing recording the fact — the failure mode the privacy
 # gate exists to prevent. So a failed revoke is written down here instead, durably,
-# and retried on every subsequent cron tick until it succeeds. This list is keyed by
-# Drive file id and is deliberately independent of the upload job's lifecycle: the
-# job is terminal, the cleanup is not — and it is deliberately not gated on Instagram
-# still being configured for the client, since a link that is already public stays public
-# whether or not anyone intends to publish another Reel.
+# and retried on every subsequent cron tick until it succeeds — by BOTH cron workers
+# (tools/share_cleanup.py), so the retry survives either one stopping (issue #80). This
+# list is keyed by Drive file id and is deliberately independent of the upload job's
+# lifecycle: the job is terminal, the cleanup is not — and it is deliberately not gated
+# on Instagram still being configured for the client, since a link that is already
+# public stays public whether or not anyone intends to publish another Reel.
 
 
 def record_share_intent(file_id: str, project_name: str) -> None:
@@ -1094,7 +1100,9 @@ def record_share_intent(file_id: str, project_name: str) -> None:
     )
 
 
-def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
+def record_share_cleanup(
+    file_id: str, project_name: str, *, create_if_missing: bool = True
+) -> dict | None:
     """Record that file_id's public Drive permission still needs revoking.
 
     Returns the entry dict when the admin SHOULD BE ALERTED right now, or None when they
@@ -1109,6 +1117,12 @@ def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
     publicly reachable indefinitely, and after one message nothing would ever mention it
     again. The returned entry carries `attempts` and `recorded_at` so the caller can say how
     long this has been going on.
+
+    create_if_missing=False is for a RETRY of an existing entry (tools/share_cleanup.py's
+    drain, which runs from both cron workers). If the entry is already gone — another
+    worker revoked it and cleared it between this caller's read and its failed retry —
+    nothing is written and None is returned, rather than resurrecting a settled obligation
+    and alerting about it.
     """
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
@@ -1135,6 +1149,8 @@ def record_share_cleanup(file_id: str, project_name: str) -> dict | None:
             )
             return dict(entry) if should_alert else None
 
+        if not create_if_missing:
+            return None
         entry = {
             "file_id": file_id,
             "project_name": project_name,

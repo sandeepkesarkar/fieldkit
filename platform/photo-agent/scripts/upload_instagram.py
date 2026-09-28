@@ -28,11 +28,13 @@ Instagram-specific differences from upload_facebook.py:
     approved video is briefly shared through Drive and unshared again. The link
     is revoked on EVERY exit path: success, transient failure, and token expiry.
     A revoke that FAILS is recorded durably in instagram_state and retried on every
-    later tick until it succeeds (see _drain_share_cleanups) — never written off as
+    later tick until it succeeds (see tools/share_cleanup.py) — never written off as
     an acceptable success, because that would leave a client's video publicly
-    reachable indefinitely with nothing recording it. The video shared is the same
-    already-approved, already-metadata-stripped asset the Facebook upload posts,
-    never a re-processed copy (FR-014).
+    reachable indefinitely with nothing recording it. That retry runs from BOTH cron
+    workers, this one and upload_facebook.py, so a link this worker leaves behind by
+    dying mid-attempt is still revoked if this cron never runs again (issue #80).
+    The video shared is the same already-approved, already-metadata-stripped asset
+    the Facebook upload posts, never a re-processed copy (FR-014).
 
     The cleanup obligation is registered BEFORE the file is made public, not after
     the share call returns (see _register_share and drive.create_temporary_share_link's
@@ -44,7 +46,10 @@ Instagram-specific differences from upload_facebook.py:
     became public is a harmless no-op. An anonymous Drive permission cannot carry
     an expirationTime — the API restricts that to user and group permissions — so
     this pre-registration plus the per-tick drain IS the time bound: at worst one
-    attempt plus one cron tick, even if this process is killed at the worst moment.
+    attempt plus one cron tick while this cron keeps running, even if this process is
+    killed at the worst moment; and if it never runs again, upload_facebook.py's drain
+    revokes the orphaned link once it is share_cleanup.ORPHANED_INTENT_AFTER_SECONDS
+    old (it cannot tell sooner that no live attempt is still using it).
 
   - Duplicate-publish reconciliation (FR-011). publish_container() is the
     irreversible external side effect; mark_published() is the durable record of
@@ -116,6 +121,12 @@ Instagram-specific differences from upload_facebook.py:
 Platform independence (FR-013): instagram_state.json, upload_instagram.lock, and
 this script's claim namespace are all separate from the Facebook equivalents. A
 Facebook failure can neither block nor retry an Instagram job, and vice versa.
+One deliberate, narrow exception: upload_facebook.py also drains
+instagram_state's pending_share_cleanups (tools/share_cleanup.py), so a public Drive link
+is revoked even if this cron stops (issue #80). It touches only that list, only through
+instagram_state's own transactional functions, never the Instagram job record or
+upload_instagram.lock, and it only ever takes the drain lock non-blocking — so neither
+worker's publish can be blocked or delayed by the other's drain.
 
 No new credential is introduced: Instagram Graph API calls reuse
 FB_PAGE_ACCESS_TOKEN from Feature 003. FB_APP_SECRET is never read here.
@@ -170,6 +181,7 @@ from tools import (
     instagram_logger,
     instagram_state,
     paths,
+    share_cleanup,
     telegram_api,
     upload_cleanup,
     worker_health,
@@ -266,7 +278,8 @@ def main(argv=None) -> None:
         # for a client, or letting its Page token expire, permanently stranded any link
         # that was already dangling: still publicly reachable, with no code path left
         # that would ever retry it. A link that is already public stays public whether
-        # or not anyone intends to publish another Reel.
+        # or not anyone intends to publish another Reel. upload_facebook.py runs the same
+        # drain (tools/share_cleanup.py), so it also survives this cron stopping.
         _drain_share_cleanups(chat_id)
 
         # Unresolved publishes are drained next, and — like the share-link drain above —
@@ -1064,8 +1077,9 @@ def _revoke_share_link(file_id: str | None, project_name: str, chat_id: str) -> 
     A revoke failure must not undo a live post or mask the real upload error, so it does
     not raise here. But it is emphatically NOT treated as success: the file id stays in
     instagram_state's pending-cleanup list, is retried on every later tick by
-    _drain_share_cleanups(), and the admin is alerted, naming the specific file, so a
-    public link can never be left dangling with no record of it.
+    tools/share_cleanup.py's drain (run from this worker AND upload_facebook.py), and the
+    admin is alerted, naming the specific file, so a public link can never be left
+    dangling with no record of it.
     """
     if not file_id:
         return
@@ -1079,7 +1093,7 @@ def _revoke_share_link(file_id: str | None, project_name: str, chat_id: str) -> 
         )
         entry = instagram_state.record_share_cleanup(file_id, project_name)
         if entry:
-            _send_alert(chat_id, _share_cleanup_alert(entry))
+            _send_alert(chat_id, share_cleanup.alert_text(entry))
         return
     # Revoked for real — retire the obligation registered before the file was shared.
     instagram_state.clear_share_cleanup(file_id)
@@ -1093,52 +1107,20 @@ def _drain_share_cleanups(chat_id: str) -> None:
     privacy problem that outlives both the job that created it and the feature being
     enabled at all.
 
+    The drain itself is tools/share_cleanup.py, shared with upload_facebook.py so that
+    revocation survives this worker stopping (issue #80). This caller holds
+    upload_instagram.lock and has not started an attempt yet, so no live attempt can be
+    using any recorded link: it drains every entry, including bare intents a killed
+    attempt left behind. If upload_facebook.py's drain holds the drain lock this tick, this
+    one skips — it does not wait, so the publish below is never delayed by it.
+
     An entry that fails again stays recorded with its attempt count bumped, and the admin
     is re-alerted on the schedule instagram_state.record_share_cleanup() decides — so a
     link that never gets revoked keeps surfacing instead of being mentioned once and then
     silently retried forever.
     """
-    for entry in instagram_state.list_share_cleanups():
-        file_id = entry.get("file_id")
-        project_name = entry.get("project_name", "unknown")
-        if not file_id:
-            continue
-        try:
-            drive.revoke_share_link(file_id)
-        except RuntimeError as exc:
-            _log.error(
-                "retry of share-link revocation still failing: project=%s file_id=%s error=%s",
-                project_name, file_id, exc,
-            )
-            updated = instagram_state.record_share_cleanup(file_id, project_name)
-            if updated:
-                _send_alert(chat_id, _share_cleanup_alert(updated))
-            continue
-        instagram_state.clear_share_cleanup(file_id)
-        _log.info(
-            "share-link revocation succeeded on retry: project=%s file_id=%s",
-            project_name, file_id,
-        )
-
-
-def _share_cleanup_alert(entry: dict) -> str:
-    """Build the admin alert for a Drive share link that could not be revoked.
-
-    The first alert and every re-escalation use this same wording, differing only in the
-    attempt count, so the message never promises follow-up it does not deliver: FieldKit
-    really does keep retrying, and really does keep reminding.
-    """
-    attempts = entry.get("attempts", 1)
-    project_name = entry.get("project_name", "unknown")
-    file_id = entry.get("file_id", "unknown")
-    since = entry.get("recorded_at", "unknown")
-    return (
-        f"⚠️ Instagram: could not remove the temporary public link for {project_name} "
-        f"(Drive file {file_id}). The video may still be publicly reachable.\n"
-        f"Failed attempts: {attempts}, first failed: {since}.\n"
-        "FieldKit keeps retrying every cron tick and will remind you daily until it "
-        "succeeds. To fix it now, remove the file's 'Anyone with the link' permission "
-        "in Drive."
+    share_cleanup.drain(
+        lambda text: _send_alert(chat_id, text), holds_instagram_lock=True
     )
 
 
