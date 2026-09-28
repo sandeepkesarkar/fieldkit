@@ -1411,22 +1411,48 @@ def test_a_lost_publish_response_that_cannot_be_settled_is_quarantined(with_pend
     assert "blocked" in text
 
 
-def test_a_lost_publish_response_that_instagram_settles_is_not_quarantined(with_pending):
-    """A definitive FINISHED means the publish did NOT land — an ordinary failure.
+def test_a_lost_publish_response_that_instagram_expires_is_not_quarantined(with_pending):
+    """A definitive EXPIRED means the publish did NOT land and never can — an ordinary failure.
 
-    Quarantining here would block a re-approval for no reason. Instagram's own word for
-    "ingested but not published" is authoritative, so the owner is told plainly that
-    nothing went live and the video can be re-approved.
+    Quarantining here would block a re-approval for no reason, so the owner is told plainly
+    that nothing went live and the video can be re-approved.
     """
     import scripts.upload_instagram as ui
     with_pending["attempt_count"] = 2
     ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
-    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    # The ingest poll reaches FINISHED, the publish response is lost, the settle reads EXPIRED.
+    ui.instagram_api.get_container_status.side_effect = ["FINISHED", "EXPIRED"]
     main([])
+    ui.instagram_api.publish_container.assert_called_once()
+    ui.instagram_state.mark_publish_settled.assert_called_once_with(
+        _IDEM_KEY, _CONTAINER_ID, "EXPIRED"
+    )
     ui.instagram_state.record_publish_reconciliation.assert_not_called()
     text = ui.telegram_api.send_message.call_args.args[1]
     assert "MAY already be live" not in text
     assert "can be re-approved" in text
+
+
+@pytest.mark.parametrize("status", ["FINISHED", "ERROR"])
+def test_a_lost_publish_response_reading_not_yet_published_is_quarantined(with_pending, status):
+    """Issue #88: FINISHED right after a lost publish is "not published YET", not "never".
+
+    Meta's troubleshooting for a media_publish that returned no ID is to keep polling for
+    up to 5 minutes — the publish can still land. ERROR is not documented as terminal. So
+    neither may release the key; the container is quarantined and the owner warned.
+    """
+    import scripts.upload_instagram as ui
+    with_pending["attempt_count"] = 2
+    ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
+    ui.instagram_api.get_container_status.side_effect = ["FINISHED", status]
+    main([])
+    ui.instagram_api.publish_container.assert_called_once()
+    ui.instagram_state.mark_publish_settled.assert_not_called()
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
+    text = ui.telegram_api.send_message.call_args.args[1]
+    assert "MAY already be live" in text
 
 
 def test_a_terminal_failure_that_settles_as_published_is_recorded_not_failed(with_pending):
@@ -1734,9 +1760,9 @@ def test_the_drain_resolves_a_container_instagram_reports_as_published(with_quar
     assert "posted twice" in text
 
 
-@pytest.mark.parametrize("status", ["FINISHED", "ERROR", "EXPIRED"])
+@pytest.mark.parametrize("status", ["EXPIRED"])
 def test_the_drain_releases_a_container_that_never_published(with_quarantine, status):
-    """All three mean the same thing — it never went live — so the key is released."""
+    """EXPIRED — "not published within 24 hours" — is final, so the key is released."""
     ui = with_quarantine
     ui.instagram_api.get_container_status.return_value = status
     main([])
@@ -1749,7 +1775,7 @@ def test_the_drain_releases_a_container_that_never_published(with_quarantine, st
     assert "re-approve" in text
 
 
-@pytest.mark.parametrize("status", ["IN_PROGRESS", "SOMETHING_NEW"])
+@pytest.mark.parametrize("status", ["FINISHED", "ERROR", "IN_PROGRESS", "SOMETHING_NEW"])
 def test_the_drain_keeps_an_undetermined_container_quarantined(with_quarantine, status):
     """Anything short of a definitive answer leaves the block in place. That is the point."""
     ui = with_quarantine
@@ -1803,7 +1829,7 @@ def test_the_drain_runs_before_any_upload_work(with_pending):
     """
     import scripts.upload_instagram as ui
     ui.instagram_state.list_publish_reconciliations.return_value = [dict(_QUARANTINE_ENTRY)]
-    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    ui.instagram_api.get_container_status.return_value = "EXPIRED"
     order = []
     ui.instagram_state.clear_publish_reconciliation.side_effect = (
         lambda *a, **k: order.append("drained") or True
@@ -1868,21 +1894,63 @@ def test_a_prior_attempts_publish_marker_drives_the_terminal_decision(base, tmp_
     assert "MAY already be live" in text
 
 
-def test_a_finished_container_clears_a_stale_publish_marker(with_pending):
-    """Instagram saying FINISHED is authoritative: nothing was published from it.
+def test_an_expired_container_clears_a_stale_publish_marker(with_pending):
+    """Instagram saying EXPIRED is authoritative: nothing was published from it, ever.
 
     So an earlier attempt's marker must not survive to quarantine the job later — the
-    question has been answered.
+    question has been answered — and a fresh container is safe.
     """
     import scripts.upload_instagram as ui
     with_pending["container_id"] = _CONTAINER_ID
     with_pending["publish_attempted_at"] = "2026-08-31T14:05:00Z"
     _set_attempt(with_pending, 2)
-    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    # Prior container EXPIRED; the fresh one's ingest poll FINISHED; its publish response
+    # is lost and the terminal settle reads EXPIRED too.
+    ui.instagram_api.get_container_status.side_effect = ["EXPIRED", "FINISHED", "EXPIRED"]
     ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
-    # The terminal settle also reports FINISHED -> definitively unpublished.
     main([])
-    ui.instagram_state.record_publish_reconciliation.assert_not_called()
+    ui.instagram_state.mark_publish_settled.assert_any_call(_IDEM_KEY, _CONTAINER_ID, "EXPIRED")
+    ui.instagram_api.create_media_container.assert_called_once()
+
+
+@pytest.mark.parametrize("status", ["FINISHED", "ERROR"])
+def test_a_not_yet_published_container_after_a_publish_attempt_is_left_alone(
+    with_pending, status
+):
+    """Issue #88: after an attempted publish, FINISHED/ERROR settle nothing and act on nothing.
+
+    No settlement, no second container, and no second media_publish on this one: the
+    first publish request may still land, and either action could leave two Reels. The
+    attempt fails, and on the final attempt the container is quarantined.
+    """
+    import scripts.upload_instagram as ui
+    with_pending["container_id"] = _CONTAINER_ID
+    with_pending["publish_attempted_at"] = "2026-08-31T14:05:00Z"
+    _set_attempt(with_pending, 2)
+    ui.instagram_api.get_container_status.return_value = status
+    main([])
+    ui.instagram_state.mark_publish_settled.assert_not_called()
+    ui.instagram_api.create_media_container.assert_not_called()
+    ui.instagram_api.publish_container.assert_not_called()
+    ui.instagram_state.record_publish_reconciliation.assert_called_once_with(
+        _CONTAINER_ID, project_name=_PROJECT, idempotency_key=_IDEM_KEY
+    )
+
+
+@pytest.mark.parametrize("status,reused", [("FINISHED", True), ("ERROR", False)])
+def test_a_never_published_prior_container_is_still_reused_or_replaced(
+    with_pending, status, reused
+):
+    """Without a publish attempt, Meta cannot have published the container, so the old
+    behaviour stands: FINISHED is reused, ERROR is replaced by a fresh container."""
+    import scripts.upload_instagram as ui
+    with_pending["container_id"] = _CONTAINER_ID
+    # Prior container's status, then (if replaced) the new container's ingest poll.
+    ui.instagram_api.get_container_status.side_effect = [status, "FINISHED"]
+    main([])
+    ui.instagram_state.mark_publish_settled.assert_not_called()
+    assert ui.instagram_api.create_media_container.called is (not reused)
+    ui.instagram_api.publish_container.assert_called_once()
 
 
 def test_the_publish_marker_is_written_before_the_publish_call(with_pending):
@@ -2010,10 +2078,10 @@ def test_a_definitively_unpublished_container_clears_its_marker(with_pending):
     import scripts.upload_instagram as ui
     with_pending["attempt_count"] = 2
     ui.instagram_api.publish_container.side_effect = InstagramUploadError("connection reset")
-    ui.instagram_api.get_container_status.return_value = "FINISHED"
+    ui.instagram_api.get_container_status.side_effect = ["FINISHED", "EXPIRED"]
     main([])
     ui.instagram_state.mark_publish_settled.assert_called_once_with(
-        _IDEM_KEY, _CONTAINER_ID, "FINISHED"
+        _IDEM_KEY, _CONTAINER_ID, "EXPIRED"
     )
     ui.instagram_state.record_publish_reconciliation.assert_not_called()
 

@@ -1093,13 +1093,13 @@ def test_a_published_key_is_not_quarantined_on_a_stale_claim(valid_record):
 # --- mark_publish_settled keeps the invariant honest in the other direction ---
 
 def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_record):
-    """Instagram said FINISHED, so blocking the re-approval would be wrong.
+    """Instagram said EXPIRED, so blocking the re-approval would be wrong.
 
     Without clearing the marker, the safety net in mark_failed() would quarantine a video
     Instagram has just confirmed was never posted — trading one failure mode for another.
     """
     _store_unresolved(valid_record, attempts=0)
-    ig_state.mark_publish_settled("42", "container_abc", "FINISHED")
+    ig_state.mark_publish_settled("42", "container_abc", "EXPIRED")
     ig_state.mark_failed("42")
     assert ig_state.list_publish_reconciliations() == []
     ig_state.set_pending_upload(valid_record)            # re-approvable again
@@ -1108,7 +1108,7 @@ def test_a_settled_publish_is_not_quarantined_by_a_later_mark_failed(valid_recor
 def test_mark_publish_settled_keeps_the_container_id(valid_record):
     """Only the open question is closed; the handle stays for debugging and retries."""
     _store_unresolved(valid_record, attempts=0)
-    ig_state.mark_publish_settled("42", "container_abc", "FINISHED")
+    ig_state.mark_publish_settled("42", "container_abc", "EXPIRED")
     record = ig_state.get_pending_upload()
     assert record["publish_attempted_at"] is None
     assert record["container_id"] == "container_abc"
@@ -1398,7 +1398,7 @@ _MUTATORS = {
     ),
     "mark_publish_attempted": lambda r: ig_state.mark_publish_attempted("42"),
     "mark_publish_settled": lambda r: ig_state.mark_publish_settled(
-        "42", "container_abc", "FINISHED"
+        "42", "container_abc", "EXPIRED"
     ),
     "record_publish_reconciliation": lambda r: ig_state.record_publish_reconciliation(
         "container_other", project_name="other", idempotency_key="99"
@@ -1461,7 +1461,7 @@ def test_no_mutation_entry_point_can_destroy_an_unresolved_obligation(
     _store_marker_bearing(valid_record)
     if meta_answered:
         ig_state.mark_publish_settled(                # the TEST performed the settlement
-            "42", "container_abc", "FINISHED"
+            "42", "container_abc", "EXPIRED"
         )
 
     _MUTATORS[name](valid_record)
@@ -1958,7 +1958,7 @@ def test_settling_the_wrong_container_is_refused(valid_record):
     """
     _store_unresolved(valid_record, container="container_A")
     with pytest.raises(ValueError, match="but the pending record holds"):
-        ig_state.mark_publish_settled("42", "container_SOMETHING_ELSE", "FINISHED")
+        ig_state.mark_publish_settled("42", "container_SOMETHING_ELSE", "EXPIRED")
     assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
 
 
@@ -1996,3 +1996,40 @@ def test_a_settlement_with_real_evidence_still_works(valid_record):
     assert record["publish_attempted_at"] is None
     assert record["publish_settled_at"] is not None
     assert record["container_id"] == "container_A"
+
+
+# --- issue #88: only EXPIRED is a definitive "never published" ---
+
+@pytest.mark.parametrize("status", ["FINISHED", "ERROR"])
+def test_settling_on_a_not_yet_published_status_is_refused(valid_record, status):
+    """FINISHED ("ready to be published") and ERROR (not documented as terminal) describe
+    the present, not the past. A lost publish can still land after either is read, so
+    neither may clear an open publish marker."""
+    _store_unresolved(valid_record, container="container_A")
+    with pytest.raises(ValueError, match="does not mean the container failed to publish"):
+        ig_state.mark_publish_settled("42", "container_A", status)
+    assert ig_state.get_pending_upload()["publish_attempted_at"] is not None
+    ig_state.mark_failed("42")
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+@pytest.mark.parametrize("status", ["FINISHED", "ERROR"])
+def test_clearing_a_quarantine_on_a_not_yet_published_status_is_refused(status):
+    ig_state.record_publish_reconciliation(
+        "container_abc", project_name="kitchen_remodel", idempotency_key="42"
+    )
+    with pytest.raises(ValueError, match="not a definitive container status"):
+        ig_state.clear_publish_reconciliation("container_abc", status)
+    assert ig_state.has_unresolved_publish("42") is True
+
+
+def test_operator_override_clears_a_quarantine_but_cannot_settle_a_marker(valid_record):
+    """The override is a release, not an answer: accepted by clear_publish_reconciliation()
+    (the operator tool's verb), refused by mark_publish_settled()."""
+    _store_unresolved(valid_record, container="container_A")
+    with pytest.raises(ValueError):
+        ig_state.mark_publish_settled("42", "container_A", ig_state.OPERATOR_OVERRIDE)
+    ig_state.mark_failed("42")
+    assert ig_state.has_unresolved_publish("42") is True
+    assert ig_state.clear_publish_reconciliation("container_A", ig_state.OPERATOR_OVERRIDE)
+    assert ig_state.has_unresolved_publish("42") is False

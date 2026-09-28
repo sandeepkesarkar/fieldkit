@@ -187,11 +187,13 @@ def log_publish_unresolved(project_name: str, container_id: str) -> None:
 
 
 def log_publish_resolved(project_name: str, container_id: str, status: str) -> None:
-    """Append an IG_RESOLVED line when a quarantined container turns out never to have published.
+    """Append an IG_RESOLVED line when a quarantined container's key is released.
 
-    Closes the loop opened by IG_UNKNOWN. Carries the status_code Instagram finally
-    reported, because "never published" arrives in three different shapes (FINISHED,
-    ERROR, EXPIRED) and which one it was is the first thing anyone auditing this will ask.
+    Closes the loop opened by IG_UNKNOWN. Carries how it was closed, because that is the
+    first thing anyone auditing this will ask: EXPIRED (Instagram's definitive "never
+    published"), or instagram_state.OPERATOR_OVERRIDE — an operator released the key via
+    scripts/resolve_instagram_quarantine.py WITHOUT a definitive answer, accepting the
+    duplicate risk.
     """
     _validate_token(project_name, "project_name")
     _validate_token(container_id, "container_id")
