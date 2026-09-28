@@ -166,13 +166,34 @@ _REQUIRED_UPLOAD_KEYS = frozenset({
 # answer itself and _preserve_unresolved_obligation() would believe it.
 _PROVENANCE_KEYS = frozenset({"publish_attempted_at", "publish_settled_at"})
 
-# The Graph API container statuses that mean "this container did NOT publish". Settling an
-# open publish requires naming one of them, so the claim is carried BY THE CALL rather than
-# implied by where it was made — an alias or a refactored caller cannot settle by accident,
-# and PUBLISHED can never be mistaken for a settlement.
-_NON_PUBLISHED_STATUSES = frozenset({"FINISHED", "ERROR", "EXPIRED"})
+# The Graph API container statuses that mean "this container did NOT publish, and never
+# will". Settling an open publish requires naming one of them, so the claim is carried BY
+# THE CALL rather than implied by where it was made — an alias or a refactored caller
+# cannot settle by accident, and PUBLISHED can never be mistaken for a settlement.
+#
+# EXPIRED is the only one (issue #88). Meta's IG Container reference defines it as "The
+# container was not published within 24 hours and has expired" — a statement about the
+# past that cannot be undone. The others describe the present only:
+#   FINISHED — "ready to be published". Not published YET. Meta's content-publishing
+#              troubleshooting says that when media_publish returns no ID you should poll
+#              status_code "once per minute, for no more than 5 minutes", so a publish whose
+#              response was lost can still land after FINISHED has been read.
+#   ERROR    — "failed to complete the publishing process". Meta does not say it is
+#              terminal, so it is not treated as proof.
+# https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-container
+# https://developers.facebook.com/docs/instagram-platform/content-publishing
+_NON_PUBLISHED_STATUSES = frozenset({"EXPIRED"})
 # Every status that resolves a quarantine, in either direction.
 _DEFINITIVE_STATUSES = _NON_PUBLISHED_STATUSES | {"PUBLISHED"}
+
+# Operator release (scripts/resolve_instagram_quarantine.py). Accepted ONLY by
+# clear_publish_reconciliation(), never by mark_publish_settled(): the operator released the
+# key WITHOUT a definitive answer and explicitly accepted that re-approval may post a
+# duplicate Reel. Deliberately not a container status, so it can never be mistaken for one.
+# (There is no "operator deleted it" counterpart as in facebook_state: the IG Container
+# node does not support deletion.)
+OPERATOR_OVERRIDE = "operator_override_accepts_duplicate_risk"
+_CLEARABLE = _DEFINITIVE_STATUSES | {OPERATOR_OVERRIDE}
 
 _DEFAULTS = {
     "pending_instagram_upload": None,
@@ -1202,13 +1223,9 @@ def clear_share_cleanup(file_id: str) -> bool:
 # OUTSIDE the job record is what lets the two state modules stay aligned while
 # Instagram still satisfies FR-011.
 #
-# Facebook has the same latent exposure and is not addressed here. It cannot be
-# fixed this way AS facebook_api.py IS CURRENTLY WRITTEN — its one-shot multipart
-# upload knows no identifier until the response arrives, so there is no handle to
-# reconcile against afterwards. That is a limit of this implementation, NOT of
-# Meta's API: the sessionized video upload returns an upload_session_id and a
-# video_id before any bytes move, which is exactly the durable pre-known handle
-# this mechanism needs. Tracked as an urgent fast-follow in issue #78.
+# Facebook had the same exposure (issue #78). It was closed in PR #87 by moving
+# facebook_api onto Meta's sessionized upload, which yields a video_id before any
+# bytes move, and facebook_state now keeps its own pending_publish_reconciliations.
 
 
 def _unresolved_publish_entry(data: dict, idempotency_key: str) -> dict | None:
@@ -1248,7 +1265,8 @@ def mark_publish_settled(
 
     The counterpart to mark_publish_attempted(), and what keeps the invariant in
     _quarantine_unresolved_in_txn() honest in BOTH directions. A container reported as
-    FINISHED, ERROR or EXPIRED is definitively not live, so the question is answered and
+    EXPIRED is definitively not live and never will be (see _NON_PUBLISHED_STATUSES for
+    why FINISHED and ERROR are not accepted), so the question is answered and
     the record must stop looking like it has an open one — otherwise the next transaction
     to drop the record would quarantine it, blocking re-approval of a video Instagram has
     just confirmed was never posted.
@@ -1393,10 +1411,12 @@ def clear_publish_reconciliation(container_id: str, observed_status: str) -> boo
     """Drop container_id from the unresolved list once Instagram has been definitive.
 
     Call this ONLY on a definitive answer — PUBLISHED (record it via
-    record_recovered_publish() first), or FINISHED/ERROR/EXPIRED, all three of which mean
-    the container was never published. Clearing on anything less would release the
-    idempotency key while the Reel's fate is still unknown, which is the whole thing this
-    list exists to prevent.
+    record_recovered_publish() first) or EXPIRED (never published, and now never can be) —
+    or with OPERATOR_OVERRIDE, written only by scripts/resolve_instagram_quarantine.py when
+    an operator explicitly accepts the duplicate risk. FINISHED and ERROR are NOT accepted:
+    "not published right now" is not "never published" (see _NON_PUBLISHED_STATUSES).
+    Clearing on anything less would release the idempotency key while the Reel's fate is
+    still unknown, which is the whole thing this list exists to prevent.
 
     Requires the observed status for the same reason mark_publish_settled() does: lifting a
     block asserts that Instagram answered, and a call-site guard cannot see an aliased call.
@@ -1404,10 +1424,10 @@ def clear_publish_reconciliation(container_id: str, observed_status: str) -> boo
 
     Returns True if an entry was removed, False if there was nothing recorded for it.
     """
-    if observed_status not in _DEFINITIVE_STATUSES:
+    if observed_status not in _CLEARABLE:
         raise ValueError(
             f"clear_publish_reconciliation: {observed_status!r} is not a definitive "
-            f"container status; expected one of {sorted(_DEFINITIVE_STATUSES)}"
+            f"container status; expected one of {sorted(_CLEARABLE)}"
         )
     with _transaction() as txn:
         data = txn.data

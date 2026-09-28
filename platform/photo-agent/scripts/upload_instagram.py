@@ -68,8 +68,12 @@ Instagram-specific differences from upload_facebook.py:
     blocks its idempotency key against re-approval, is retried by
     _drain_publish_reconciliations() on every later tick, and clears only when
     Instagram is definitive — PUBLISHED (recorded, key retired permanently) or
-    FINISHED/ERROR/EXPIRED (never published, key released). A Telegram warning is
-    NOT the control here; it explains the control.
+    EXPIRED (never published and now never can be, key released). FINISHED and
+    ERROR after a publish attempt are NOT answers (issue #88): FINISHED only says
+    "not published yet", and Meta documents that a publish whose response was lost
+    can still land afterwards; ERROR is not documented as terminal. A Telegram
+    warning is NOT the control here; it explains the control. An entry that stays
+    stuck is settled with scripts/resolve_instagram_quarantine.py, never by hand.
 
     Note what this deliberately does NOT change: instagram_state.mark_failed()
     still discards the whole record, mirroring facebook_state.mark_failed()
@@ -77,20 +81,9 @@ Instagram-specific differences from upload_facebook.py:
     pending_share_cleanups — which is what lets the two state modules stay aligned
     while Instagram still satisfies FR-011.
 
-    Facebook has the SAME latent exposure and is NOT fixed here. If
-    facebook_api.upload_video()'s response is lost the video may be live with no
-    record of it, and a re-approval would post it twice. It cannot be fixed this
-    way AS facebook_api.py IS CURRENTLY WRITTEN: its one-shot multipart POST knows
-    no identifier until the response arrives, so there is nothing to reconcile
-    against afterwards and matching the Page's recent videos would be a heuristic
-    rather than an authority. That is a limit of this implementation, not of Meta's
-    API — Meta's sessionized video upload returns an upload_session_id AND a
-    video_id from its start phase, before any bytes move, which is exactly the
-    durable pre-known handle reconciliation needs (see Meta's official Python
-    Business SDK, facebook_business/video_uploader.py). Closing it therefore means
-    moving Facebook onto the sessionized upload: out of scope for this feature, and
-    tracked as an urgent fast-follow in issue #78 rather than left implied by an
-    Instagram-only fix.
+    Facebook had the same exposure (issue #78). PR #87 closed it by moving
+    upload_facebook.py onto Meta's sessionized upload, which yields a video_id
+    before any bytes move, and giving facebook_state its own quarantine.
 
   - Deleting the local video file is COORDINATED, not owned by either script. One
     approval produces one file with two independent consumers, so whichever enabled
@@ -418,7 +411,7 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         container_id = None
         if prior_container_id:
             outcome, observed_status = _classify_prior_container(
-                page_token, prior_container_id
+                page_token, prior_container_id, publish_attempted=prior_publish_attempted
             )
             if outcome == "published":
                 _log.warning(
@@ -435,16 +428,18 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
                     "project=%s container_id=%s", project_name, prior_container_id,
                 )
                 container_id = prior_container_id
-            # FINISHED ("reusable") and ERROR/EXPIRED ("restart") are all Instagram saying
-            # this container did NOT publish. That is authoritative, so the open question is
-            # settled — durably, not just in this function's local flag. Recording it is
-            # what lets the record later be pointed at a fresh container, or dropped, without
-            # instagram_state's chokepoint quarantining a container Instagram has already
-            # cleared; an erased marker and a settled one are deliberately not the same thing
-            # there. (The "published" case returned above and needs no settlement.)
-            instagram_state.mark_publish_settled(
-                idem_key, prior_container_id, observed_status
-            )
+            if prior_publish_attempted:
+                # Only EXPIRED gets here once a publish was attempted — anything else raised
+                # in _classify_prior_container(). EXPIRED is Instagram saying this container
+                # did NOT publish and never will, so the open question is settled — durably,
+                # not just in this function's local flag. Recording it is what lets the
+                # record later be pointed at a fresh container, or dropped, without
+                # instagram_state's chokepoint quarantining a container Instagram has
+                # already cleared; an erased marker and a settled one are deliberately not
+                # the same thing there. (The "published" case returned above.)
+                instagram_state.mark_publish_settled(
+                    idem_key, prior_container_id, observed_status
+                )
             publish_attempted = False
 
         if container_id is None:
@@ -589,7 +584,9 @@ def _safe_error(exc) -> str:
     return redact_secrets(str(exc))
 
 
-def _classify_prior_container(page_token: str, container_id: str) -> str:
+def _classify_prior_container(
+    page_token: str, container_id: str, *, publish_attempted: bool
+) -> tuple[str, str]:
     """Ask Instagram what became of a container left behind by an earlier attempt.
 
     This is the FR-011 duplicate-publication guard. publish_container() is the irreversible
@@ -599,14 +596,28 @@ def _classify_prior_container(page_token: str, container_id: str) -> str:
     Reel on a real client account cannot be taken back.
 
     The container's own status_code is the authority, because Meta is the only party that
-    knows what actually happened. Returns:
+    knows what actually happened. What a status proves depends on whether FieldKit ever
+    asked Meta to publish this container (publish_attempted). Returns:
 
       "published" — status_code PUBLISHED. The Reel is already live. Record it; never
                     publish again.
+      "restart"   — status_code EXPIRED ("not published within 24 hours and has expired",
+                    per Meta's IG Container reference). Never published, never can be, so
+                    a fresh container is safe.
+
+    and, ONLY when no publish was ever attempted from this container:
+
       "reusable"  — status_code FINISHED. Ingested, not yet published: publishing THIS
-                    container is the correct, duplicate-free way to finish the job.
-      "restart"   — status_code ERROR or EXPIRED. Definitively never published and no
-                    longer usable, so a fresh container is safe.
+                    container is the correct way to finish the job.
+      "restart"   — status_code ERROR. Ingest failed. Meta cannot have published a
+                    container it was never asked to publish, so a fresh one is safe.
+
+    Once a publish WAS attempted, FINISHED and ERROR are not answers (issue #88). FINISHED
+    means "not published yet": Meta's troubleshooting guidance for a media_publish that
+    returned no ID is to keep polling status_code for up to 5 minutes, i.e. the lost
+    publish may still land. ERROR is not documented as terminal. Acting on either — a fresh
+    container, or publishing this one a second time while the first request may still be
+    in flight — could put a second Reel on the account. They raise like IN_PROGRESS does.
 
     Anything else — IN_PROGRESS, or a status_code this code does not recognise — raises
     InstagramUploadError and is handled as an ordinary retryable failure. That is the
@@ -627,13 +638,17 @@ def _classify_prior_container(page_token: str, container_id: str) -> str:
     status = instagram_api.get_container_status(page_token, container_id)
     if status == "PUBLISHED":
         return "published", status
-    if status == "FINISHED":
-        return "reusable", status
-    if status in ("ERROR", "EXPIRED"):
+    if status == "EXPIRED":
         return "restart", status
+    if not publish_attempted:
+        if status == "FINISHED":
+            return "reusable", status
+        if status == "ERROR":
+            return "restart", status
     raise InstagramUploadError(
-        f"Container {container_id} is in state {status!r}; refusing to create a second "
-        "container until its fate is known (FR-011)"
+        f"Container {container_id} is in state {status!r}, which does not establish whether "
+        "it published; refusing to publish anything for this video until its fate is known "
+        "(FR-011)"
     )
 
 
@@ -743,8 +758,9 @@ def _settle_terminal_container(
 
     Returns:
       "published"   — Instagram reports PUBLISHED. The Reel is live; the caller records it.
-      "unpublished" — Instagram reports FINISHED, ERROR or EXPIRED. All three mean this
-                      container never published. The record's unresolved-publish marker is
+      "unpublished" — Instagram reports EXPIRED: this container never published and never
+                      can (FINISHED and ERROR do not establish that — see
+                      _classify_prior_container). The record's unresolved-publish marker is
                       cleared here, which is what stops the mark_failed() that follows from
                       quarantining a video Instagram has just confirmed was never posted.
       "unresolved"  — no definitive answer. The container is QUARANTINED durably, the
@@ -757,7 +773,9 @@ def _settle_terminal_container(
     if not container_id:
         return "unpublished"
     try:
-        outcome, observed_status = _classify_prior_container(page_token, container_id)
+        outcome, observed_status = _classify_prior_container(
+            page_token, container_id, publish_attempted=True
+        )
         if outcome == "published":
             return "published"
     except (InstagramTokenError, InstagramUploadError) as exc:
@@ -814,7 +832,9 @@ def _reconcile_quarantined_container(
     idem_key = entry.get("idempotency_key", "")
 
     try:
-        outcome, observed_status = _classify_prior_container(page_token, container_id)
+        outcome, observed_status = _classify_prior_container(
+            page_token, container_id, publish_attempted=True
+        )
     except (InstagramTokenError, InstagramUploadError) as exc:
         _log.error(
             "publish outcome still unresolved: project=%s container_id=%s error=%s",
@@ -838,8 +858,9 @@ def _reconcile_quarantined_container(
             _send_confirmation(chat_id, _recovered_message(project_name))
         return "published"
 
-    # "reusable" (FINISHED) and "restart" (ERROR/EXPIRED) all mean: never published. The
-    # raw status goes to both the state module and the log, so neither has to re-derive it.
+    # With publish_attempted=True the only other outcome is "restart" on EXPIRED: never
+    # published, and now never can be. The raw status goes to both the state module and
+    # the log, so neither has to re-derive it.
     instagram_state.clear_publish_reconciliation(container_id, observed_status)
     instagram_logger.log_publish_resolved(project_name, container_id, observed_status)
     if announce:
@@ -859,8 +880,13 @@ def _drain_publish_reconciliations(page_token: str, chat_id: str) -> None:
 
       - PUBLISHED: the Reel is live. Recorded via record_recovered_publish(), which also
         retires the idempotency key permanently, and the owner is told it is up.
-      - FINISHED / ERROR / EXPIRED: it never published. The quarantine lifts, the key is
+      - EXPIRED: it never published and now never can. The quarantine lifts, the key is
         released, and the owner is told it is safe to re-approve.
+
+    FINISHED and ERROR are not answers (issue #88) — see _classify_prior_container. A
+    FINISHED container that never publishes should read EXPIRED within 24 hours of its
+    creation (Meta's documented container lifetime), at which point this drain releases
+    it with no operator action.
 
     Anything else leaves the entry in place. That is the point. Nothing here ever drops an
     entry to keep the list short — an entry disappearing without an answer is the exact

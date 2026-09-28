@@ -386,12 +386,33 @@ So the container ID is persisted and **survives across attempts**, and no attemp
 publishes anything while a previous container's fate is unknown. Before acting, the
 script asks Instagram what became of it:
 
-| `status_code` | Action |
-|---|---|
-| `PUBLISHED` | Already live. Recorded via `record_recovered_publish()`, logged `IG_RECOVER`, owner told the Reel is up. **Never republished.** |
-| `FINISHED` | Ingested, not published. That same container is published — the duplicate-free way to finish. |
-| `ERROR`, `EXPIRED` | Definitively never published and unusable. A fresh container is safe. |
-| anything else, or unreachable | Treated as a retryable failure. Not knowing a container's fate is never grounds for creating a second one. |
+What a status proves depends on whether FieldKit ever asked Meta to **publish** that
+container (the `publish_attempted_at` marker):
+
+| `status_code` | No publish attempted yet | A publish was attempted |
+|---|---|---|
+| `PUBLISHED` | Already live. Recorded via `record_recovered_publish()`, logged `IG_RECOVER`, owner told the Reel is up. **Never republished.** | Same |
+| `EXPIRED` | Never published, never can be. A fresh container is safe. | Same: settled, and a fresh container is safe |
+| `FINISHED` | Ingested, not published. That same container is published. | **Not an answer.** Nothing is published. The attempt fails, and on the last attempt the container is quarantined |
+| `ERROR` | Ingest failed. A fresh container is safe. | **Not an answer.** Handled like `FINISHED` |
+| anything else, or unreachable | Retryable failure | Retryable failure |
+
+Why `FINISHED` and `ERROR` stop counting once a publish has been attempted (issue #88).
+Meta's [IG Container reference](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-container)
+defines them as:
+
+- `FINISHED`: "ready to be published"
+- `ERROR`: "failed to complete the publishing process"
+- `EXPIRED`: "not published within 24 hours and has expired"
+
+Only `EXPIRED` says anything final. The
+[content-publishing guide](https://developers.facebook.com/docs/instagram-platform/content-publishing)
+says that when `media_publish` returns no media ID, you should keep polling `status_code`
+"once per minute, for no more than 5 minutes". So a publish whose response was lost can
+still land after `FINISHED` has been read. Meta does not document `ERROR` as final.
+Treating either one as "never published" could put a second Reel on the account. Not
+knowing a container's fate is never grounds for creating a second one, or for publishing
+the same one again.
 
 The same check runs when the attempt budget is exhausted, because the final attempt
 can die after publishing exactly like any other — and by then the pending record is
@@ -424,8 +445,10 @@ So an unsettled container is **quarantined durably** in
   every tick, including ticks with no job and ticks where Instagram is no longer
   enabled for the client.
 - **clears only on a definitive answer.** `PUBLISHED` → recorded and the key retired
-  permanently; `FINISHED` / `ERROR` / `EXPIRED` → never published, quarantine lifted
-  (`IG_RESOLVED`), owner told it is safe to re-approve.
+  permanently; `EXPIRED` → never published, quarantine lifted (`IG_RESOLVED`), owner told
+  it is safe to re-approve. `FINISHED` and `ERROR` keep it quarantined (see above). A
+  container that really never published should read `EXPIRED` within 24 hours of its
+  creation, and the drain releases it then with no action needed.
 
 The entry is created **in the same locked state transaction** as the removal that
 makes it necessary — not afterwards by the caller. Leaving it to the caller meant a
@@ -436,8 +459,8 @@ The invariant, enforced in `tools/instagram_state.py`: **a pending record carrie
 unresolved-publish marker (`publish_attempted_at`, alongside its `container_id`) if and
 only if FieldKit asked Meta to publish that container and has not since established what
 happened.** `mark_publish_attempted()` sets it before the irreversible call;
-`mark_publish_settled()` clears it when Instagram reports the container as never
-published; `mark_published()` and `record_recovered_publish()` retire any quarantine for
+`mark_publish_settled()` clears it when Instagram reports the container as `EXPIRED`
+(the only status it accepts); `mark_published()` and `record_recovered_publish()` retire any quarantine for
 the key in the same transaction that records the publish, so a resolved obligation cannot
 outlive its own resolution.
 
@@ -532,44 +555,58 @@ on here.
 
 ### Resolving a quarantine by hand
 
-Normally you do nothing — the drain resolves entries by itself once Instagram answers.
-If one is stuck because the container has aged out of Meta's view entirely, an operator
-can settle it:
+Normally you do nothing. The drain resolves entries by itself once Instagram gives a
+definitive answer, which for a Reel that never published means `EXPIRED`, within 24 hours
+of the container's creation. For an entry that stays stuck, use the operator tool. **Do not
+edit `instagram_state.json` by hand.**
 
-1. Read the list: `pending_publish_reconciliations` in `instagram_state.json`. Each
-   entry names the `project_name`, the `container_id`, and `recorded_at`.
-2. Open the client's Instagram account and look for that project's Reel around
-   `recorded_at`.
-3. If it IS live, nothing needs re-posting — remove the entry.
-4. If it is NOT live, remove the entry; the video can then be re-approved normally.
+```bash
+cd platform/photo-agent
+python3 scripts/resolve_instagram_quarantine.py list
+python3 scripts/resolve_instagram_quarantine.py resolve <container_id>
+```
 
-Edit `instagram_state.json` only while no cron tick is running, and remove entries one
-at a time. Removing one you have not actually checked is the one way back to a
-duplicate Reel.
+`resolve` reads the container's `status_code` once:
+
+1. `PUBLISHED`: the Reel is live. The publish is recorded, the key is retired for good,
+   and the quarantine clears. Nothing will post it again.
+2. `EXPIRED`: it never published, and now never can. The key is released and the video
+   can be re-approved; it will be posted once.
+3. Anything else (`FINISHED`, `ERROR`, `IN_PROGRESS`, an unreadable container, a network
+   or token error): the quarantine stays and the tool exits 1. For `FINISHED`, it prints
+   the latest time Instagram should report `EXPIRED` if the Reel never publishes. Run
+   `resolve` again after that.
+
+**Not being on the account right now is never enough to release a key.** A container
+whose publish was accepted can still be processing and go live later. Unlike a Facebook
+video ([`../facebook/README.md`](../facebook/README.md)), an Instagram container cannot be
+deleted to force an answer: Meta's IG Container reference says deleting is "not
+supported". So Meta's own expiry is the only definitive "no".
+
+If `resolve` can never settle it (the container stays in `ERROR`, or Instagram will no
+longer answer about it at all), the only way out is an explicit override:
+
+```bash
+python3 scripts/resolve_instagram_quarantine.py override <container_id> --accept-duplicate-risk
+```
+
+This releases the key **without** a definitive answer. If the Reel was in fact published,
+re-approving will post it a second time. It refuses to run without the flag, and it is
+logged as `IG_RESOLVED ... status=operator_override_accepts_duplicate_risk`.
+
+The tool takes `upload_instagram.lock`, so it will not run while a cron tick is in progress
+(it exits 1, and you try again a minute later). The Page token is sent only in an
+`Authorization` header, and every error it prints is redacted.
 
 Note what it does **not** change: `instagram_state.mark_failed()` still discards the
 whole record, mirroring `facebook_state.mark_failed()` exactly (deviation note 1).
 Keeping the obligation *outside* the record is what lets the two state modules stay
 aligned while Instagram still satisfies FR-011.
 
-**Facebook has the same latent exposure, and it is not fixed here.** If
-`facebook_api.upload_video()`'s response is lost, the video may be live with no record
-of it, and a re-approval would post it twice.
-
-It cannot be closed the same way **as `facebook_api.py` is currently written**: the
-one-shot multipart POST at `facebook_api.py:174` knows no identifier until the response
-arrives, so there is nothing to reconcile against afterwards and matching the Page's
-recent videos would be a heuristic, not an authority. That is a limitation of this
-implementation, **not of Meta's API** — Meta's sessionized video upload returns both an
-`upload_session_id` and a `video_id` from its `start` phase, before any bytes are
-transferred, which is exactly the durable pre-known handle reconciliation needs. (See
-Meta's official Python Business SDK,
-[`video_uploader.py`](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/video_uploader.py).)
-
-Closing it therefore means moving Facebook onto the sessionized upload, which is out of
-scope for this feature and tracked as an **urgent fast-follow** in issue #78 — the
-exposure predates this change and this PR neither creates nor amplifies it, but Facebook
-is live in production and a duplicate post on a client Page is irreversible.
+Facebook had the same exposure (a lost upload response could leave a live video with no
+record of it). That was issue #78, fixed in PR #87: Facebook now uses Meta's sessionized
+upload, which returns a `video_id` before any bytes move, and quarantines an unknown
+outcome the same way. See [`../facebook/README.md`](../facebook/README.md).
 
 ### The account a job publishes to
 
@@ -596,7 +633,7 @@ as every other pipeline event, in the same pipe-delimited format:
 | `IG_PUBLISHED` | Reel published (with post ID) |
 | `IG_RECOVER` | A container was found **already published** after an interrupted run; recorded without republishing |
 | `IG_UNKNOWN` | A publish was attempted and its outcome could not be established — container quarantined, key blocked |
-| `IG_RESOLVED` | A quarantined container was finally confirmed as never published — quarantine lifted |
+| `IG_RESOLVED` | A quarantine was lifted: `status=EXPIRED` (Instagram confirmed it never published), or `status=operator_override_accepts_duplicate_risk` (an operator released it **without** an answer) |
 | `IG_BLOCKED` | An enqueue was **refused** because that video has an unresolved publish |
 | `IG_FAILED` | One attempt failed (retryable, with error detail) |
 | `IG_EXHAUSTED` | All 3 attempts consumed — terminal |
@@ -618,7 +655,9 @@ auditing:
 - `pending_publish_reconciliations` — publishes whose outcome is unknown. A
   non-empty list means a Reel **may** be live on the account with nothing recording
   it, and that its idempotency key is blocked against re-approval until Instagram
-  answers. Both empty is the healthy state.
+  answers. Both empty is the healthy state. Use
+  `scripts/resolve_instagram_quarantine.py` to inspect or settle entries; never edit the
+  list by hand.
 
 ---
 
@@ -633,10 +672,12 @@ documented here instead:
   invokes it; cron does.
 - `check_instagram_connection.py` is a one-time **admin** CLI, like
   `generate_auth_link.py` — also not a skill. The business owner never runs it.
+- `resolve_instagram_quarantine.py` (issue #88) is an **operator** CLI, like
+  `resolve_facebook_quarantine.py`. It is not a skill either.
 
 The only Hermes skills in the photo-agent are the ones an owner actually types:
-`process-photos`, `photo-approve`, `photo-reject`. Adding a skill for either
-script here would expose an operator tool as an owner-facing command.
+`process-photos`, `photo-approve`, `photo-reject`. Adding a skill for any of
+these scripts would expose an operator tool as an owner-facing command.
 
 ---
 
@@ -656,4 +697,5 @@ script here would expose an operator tool as an owner-facing command.
 | The same share-link alert arriving daily | Cleanup is still failing after many attempts. The `attempts` count in the alert says how many. Resolve it manually in Drive — the reminder stops as soon as the revoke succeeds |
 | Confirmation says "could not fetch the post link" | The Reel published, but the permalink lookup failed. Check the account directly; no retry is attempted since the post is already live |
 | Local video still on disk after a publish | Expected while the other platform's job for that approval is still pending — the last one to resolve deletes it |
+| A video can't be re-approved; `IG_BLOCKED` in the log | Its earlier publish is quarantined. Wait for the drain, or run `resolve_instagram_quarantine.py resolve <container_id>`. See "Resolving a quarantine by hand" |
 | Facebook posted but Instagram didn't (or vice versa) | Expected and by design — the two are independent (FR-013). Check the log for that platform's own events |
