@@ -1059,7 +1059,7 @@ def is_published(idempotency_key: str) -> bool:
 # public stays public whether or not anyone intends to publish another Reel.
 
 
-def record_share_intent(file_id: str, project_name: str) -> None:
+def record_share_intent(file_id: str, project_name: str, owner: str | None = None) -> None:
     """Register a cleanup obligation for a Drive file BEFORE it is made public.
 
     Called from drive.create_temporary_share_link()'s on_file_id hook, at the one moment
@@ -1077,6 +1077,11 @@ def record_share_intent(file_id: str, project_name: str) -> None:
 
     Idempotent: re-registering a file id that is already recorded leaves the existing
     entry, and its alert history, untouched.
+
+    owner is the token of the attempt's ownership fence (tools/share_cleanup.share_owner).
+    It is what lets a drain in EITHER cron worker tell an obligation whose attempt may still
+    grant or keep the permission — which it must never clear — from one whose attempt is
+    provably done. See tools/share_cleanup.py.
     """
     now = datetime.now(timezone.utc).isoformat()
     with _transaction() as txn:
@@ -1091,6 +1096,7 @@ def record_share_intent(file_id: str, project_name: str) -> None:
             "last_attempt_at": None,
             "last_alerted_at": None,
             "attempts": 0,
+            "owner": owner,
         })
         txn.commit()
     logger.info(
@@ -1169,8 +1175,12 @@ def record_share_cleanup(
 
 
 def list_share_cleanups() -> list[dict]:
-    """Return the Drive share links still awaiting revocation (oldest first)."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    """Return the Drive share links still awaiting revocation (oldest first).
+
+    Creates nothing: a missing directory or file simply means there is nothing to revoke.
+    upload_facebook.py calls this on every tick (via tools/share_cleanup.py) for clients
+    that may never have used Instagram at all, and must not leave Instagram files behind.
+    """
     try:
         with open(STATE_FILE, "r") as f:
             fcntl.flock(f, fcntl.LOCK_SH)

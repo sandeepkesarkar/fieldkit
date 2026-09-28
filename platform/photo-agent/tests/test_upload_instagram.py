@@ -16,6 +16,7 @@ alike where the behaviour is the same and differ only where Instagram's
 container flow and Drive share link genuinely differ.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -1584,7 +1585,9 @@ def test_the_cleanup_obligation_is_registered_before_the_file_is_shared(with_pen
     import scripts.upload_instagram as ui
     intent = mocker.patch.object(ui.instagram_state, "record_share_intent")
     main([])
-    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT, owner=mocker.ANY)
+    # ...fenced by this attempt's owner token (issue #80): see tools/share_cleanup.py.
+    assert re.fullmatch(r"[0-9a-f]{32}", intent.call_args.kwargs["owner"])
 
 
 def test_a_share_call_that_raises_after_creating_the_permission_is_still_revocable(
@@ -1606,7 +1609,9 @@ def test_a_share_call_that_raises_after_creating_the_permission_is_still_revocab
 
     ui.drive.create_temporary_share_link.side_effect = _share_then_lose_the_response
     main([])
-    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT)
+    intent.assert_called_once_with(_SHARE_FILE_ID, _PROJECT, owner=mocker.ANY)
+    # ...fenced by this attempt's owner token (issue #80): see tools/share_cleanup.py.
+    assert re.fullmatch(r"[0-9a-f]{32}", intent.call_args.kwargs["owner"])
     ui.drive.revoke_share_link.assert_called_once_with(_SHARE_FILE_ID)
 
 

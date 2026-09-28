@@ -48,8 +48,11 @@ Instagram-specific differences from upload_facebook.py:
     this pre-registration plus the per-tick drain IS the time bound: at worst one
     attempt plus one cron tick while this cron keeps running, even if this process is
     killed at the worst moment; and if it never runs again, upload_facebook.py's drain
-    revokes the orphaned link once it is share_cleanup.ORPHANED_INTENT_AFTER_SECONDS
-    old (it cannot tell sooner that no live attempt is still using it).
+    revokes it on its next tick. What makes that safe is the ownership fence each
+    attempt holds (share_cleanup.share_owner, around _process_upload): no drain in
+    either worker retires an obligation until the attempt that registered it is
+    provably finished or dead, so an attempt that stalls and then grants its
+    permission late still has an obligation behind it. See tools/share_cleanup.py.
 
   - Duplicate-publish reconciliation (FR-011). publish_container() is the
     irreversible external side effect; mark_published() is the durable record of
@@ -125,8 +128,9 @@ One deliberate, narrow exception: upload_facebook.py also drains
 instagram_state's pending_share_cleanups (tools/share_cleanup.py), so a public Drive link
 is revoked even if this cron stops (issue #80). It touches only that list, only through
 instagram_state's own transactional functions, never the Instagram job record or
-upload_instagram.lock, and it only ever takes the drain lock non-blocking — so neither
-worker's publish can be blocked or delayed by the other's drain.
+upload_instagram.lock, it only ever takes the drain lock non-blocking, and it runs only
+after the Facebook publish path — so neither worker's publish can be blocked or delayed
+by the other's drain.
 
 No new credential is introduced: Instagram Graph API calls reuse
 FB_PAGE_ACCESS_TOKEN from Feature 003. FB_APP_SECRET is never read here.
@@ -316,13 +320,21 @@ def main(argv=None) -> None:
             _log.debug("no pending instagram upload — exiting")
             return
 
-        _process_upload(record, page_token, ig_account_id, chat_id)
+        # The ownership fence for any share link this attempt creates (issue #80). Held
+        # until _process_upload() returns — after its last revoke — or until this process
+        # dies, and it is what stops a drain in either worker from retiring an obligation
+        # this attempt could still act on. See tools/share_cleanup.py.
+        with share_cleanup.share_owner() as share_owner:
+            _process_upload(record, page_token, ig_account_id, chat_id, share_owner)
     finally:
         fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
 
 
-def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: str) -> None:
+def _process_upload(
+    record: dict, page_token: str, ig_account_id: str, chat_id: str,
+    share_owner: str | None = None,
+) -> None:
     """Claim and attempt to publish the Reel described by record.
 
     record is only a snapshot (from main()'s get_pending_upload()) used for its immutable
@@ -418,7 +430,7 @@ def _process_upload(record: dict, page_token: str, ig_account_id: str, chat_id: 
         """
         nonlocal share_file_id
         share_file_id = file_id
-        instagram_state.record_share_intent(file_id, project_name)
+        instagram_state.record_share_intent(file_id, project_name, owner=share_owner)
 
     try:
         container_id = None
@@ -1108,11 +1120,14 @@ def _drain_share_cleanups(chat_id: str) -> None:
     enabled at all.
 
     The drain itself is tools/share_cleanup.py, shared with upload_facebook.py so that
-    revocation survives this worker stopping (issue #80). This caller holds
-    upload_instagram.lock and has not started an attempt yet, so no live attempt can be
-    using any recorded link: it drains every entry, including bare intents a killed
-    attempt left behind. If upload_facebook.py's drain holds the drain lock this tick, this
-    one skips — it does not wait, so the publish below is never delayed by it.
+    revocation survives this worker stopping (issue #80). An entry is retired only once the
+    attempt that registered it is provably finished or dead (its ownership fence is
+    released); an earlier attempt killed mid-flight has released its fence, so its link is
+    revoked and retired here at once. holds_instagram_lock=True matters only for entries
+    written before owner tokens existed: while this caller holds upload_instagram.lock, no
+    writer of such an entry can be running. If upload_facebook.py's drain holds the drain
+    lock this tick, this one skips — it does not wait, so the publish below is never
+    delayed by it.
 
     An entry that fails again stays recorded with its attempt count bumped, and the admin
     is re-alerted on the schedule instagram_state.record_share_cleanup() decides — so a

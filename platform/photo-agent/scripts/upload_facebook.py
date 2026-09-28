@@ -81,12 +81,13 @@ video publicly readable on Drive, and the obligation to revoke that link is reco
 instagram_state's pending_share_cleanups. This script drains that list too, every tick,
 through tools/share_cleanup.py — so a link is still revoked, and a link that cannot be
 revoked is still re-alerted daily, if upload_instagram.py dies mid-attempt or its cron is
-removed. Revoking needs Drive credentials only, so the drain runs before the Facebook
-config gate and regardless of Instagram being configured or of there being a Facebook
-job. It is isolated from this script's own work: it only takes its own drain lock,
-non-blocking, and any error in it is logged and swallowed (see _drain_share_cleanups).
-Which entries it may revoke — only those no live Instagram attempt can still be using —
-is explained in tools/share_cleanup.py.
+removed. Revoking needs Drive credentials only, so the drain runs on every tick regardless
+of Instagram being configured, of a Meta token, or of there being a Facebook job. It is
+isolated from this script's own work: it runs only AFTER the Facebook publish path has
+finished (so a slow or failing Drive never delays a Facebook post), it only takes its own
+drain lock, non-blocking, it creates nothing for a client with no Instagram state, and any
+error in it is logged and swallowed (see _drain_share_cleanups). Which entries it may
+revoke, and which it may retire, is explained in tools/share_cleanup.py.
 
 FB_APP_SECRET is never read here (used only by generate_auth_link.py).
 """
@@ -246,11 +247,20 @@ def main(argv=None) -> None:
     # this platform's behalf, and check_approval.py before queueing a job for it.
     worker_health.record_heartbeat(upload_cleanup.FACEBOOK)
 
-    # Instagram share-link cleanup (issue #80), ahead of every Facebook gate below: it needs
-    # Drive credentials only, and a public link stays public whether or not Facebook is
-    # configured, has a job, or has another tick of this script already running.
-    _drain_share_cleanups(chat_id)
+    # Instagram share-link cleanup (issue #80) runs AFTER this tick's Facebook work, in a
+    # finally: Facebook publishing must never wait on Instagram cleanup, and a Drive outage
+    # can make each revoke take tens of seconds. The finally is what still runs it on every
+    # other kind of tick — no job, Facebook unconfigured (sys.exit), another Facebook tick
+    # holding the upload lock — because it needs Drive credentials only, and a public link
+    # stays public whatever Facebook is doing.
+    try:
+        _run_facebook_tick(page_token, page_id, chat_id)
+    finally:
+        _drain_share_cleanups(chat_id)
 
+
+def _run_facebook_tick(page_token: str, page_id: str, chat_id: str) -> None:
+    """This tick's Facebook work: config gate, upload lock, sweep, reconciliation, publish."""
     if not page_token or not page_id:
         _log.error("FB_PAGE_ACCESS_TOKEN and FB_PAGE_ID are required")
         sys.exit(1)
@@ -287,11 +297,12 @@ def main(argv=None) -> None:
 def _drain_share_cleanups(chat_id: str) -> None:
     """Revoke Instagram share links whose worker can no longer be relied on to (issue #80).
 
-    Delegates to tools/share_cleanup.drain() with holds_instagram_lock=False, so it acts
-    only on entries no live Instagram attempt can still be using — see that module for the
+    Delegates to tools/share_cleanup.drain() with holds_instagram_lock=False: it revokes a
+    link a live Instagram attempt may be using only once that link is overdue, and retires
+    an obligation only once its owning attempt is provably done — see that module for the
     rule and why. It never takes upload_instagram.lock, and skips (never waits) if the
     Instagram worker's drain is running, so it cannot block or be blocked by an Instagram
-    publish (FR-013).
+    publish (FR-013). main() calls it only after this tick's Facebook work.
 
     Never raises. This is a safety net running inside the Facebook worker, and a failure
     in it — a Drive outage, or an unreadable instagram_state.json, which raises by design
