@@ -20,6 +20,7 @@ from tools.video_generator import (
     FFmpegVideoGenerator,
     VideoConfig,
     VideoGenerationError,
+    _escape_filtergraph_path,
 )
 
 
@@ -41,6 +42,42 @@ def get_filter_complex(cmd: list[str]) -> str:
     """Extract the -filter_complex value from the command list."""
     idx = cmd.index("-filter_complex")
     return cmd[idx + 1]
+
+
+def _unescape_split(text: str, separators: str) -> list[str]:
+    """Split text on unescaped separators, removing one level of backslash escaping.
+
+    Mirrors how ffmpeg consumes one level of filtergraph escaping ("\\x" -> "x").
+    """
+    parts, current, i = [], [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            current.append(text[i + 1])
+            i += 2
+        elif ch in separators:
+            parts.append("".join(current))
+            current = []
+            i += 1
+        else:
+            current.append(ch)
+            i += 1
+    parts.append("".join(current))
+    return parts
+
+
+def get_drawtext_options(fc: str) -> dict[str, str]:
+    """Return the drawtext filter's options as ffmpeg would see them after both escaping levels."""
+    # Level 2: the filtergraph description (chains separated by ;)
+    segment = next(seg for seg in _unescape_split(fc, ";") if "drawtext=" in seg)
+    body = re.sub(r"^\[\w+\]drawtext=", "", segment)
+    body = re.sub(r"\[\w+\]$", "", body)
+    # Level 1: the option list (options separated by :)
+    options = {}
+    for item in _unescape_split(body, ":"):
+        key, _, value = item.partition("=")
+        options[key] = value
+    return options
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +540,30 @@ def test_generate_raises_on_empty_output(tmp_path, gen, mock_ffmpeg_ok):
 # Watermark (CLIENT_DISPLAY_NAME)
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def mock_ffmpeg_capture_textfile(mock_ffmpeg_ok):
+    """Like mock_ffmpeg_ok, but records the watermark textfile while FFmpeg "runs".
+
+    generate() deletes the textfile when it returns, so its path and raw bytes
+    are captured inside the mocked subprocess.run call and exposed as
+    mock.textfile_path / mock.textfile_bytes (None when no drawtext is present).
+    """
+    base_run = mock_ffmpeg_ok.side_effect
+    mock_ffmpeg_ok.textfile_path = None
+    mock_ffmpeg_ok.textfile_bytes = None
+
+    def _run(cmd, **kwargs):
+        fc = get_filter_complex(cmd)
+        if "drawtext" in fc:
+            path = Path(get_drawtext_options(fc)["textfile"])
+            mock_ffmpeg_ok.textfile_path = path
+            mock_ffmpeg_ok.textfile_bytes = path.read_bytes()
+        return base_run(cmd, **kwargs)
+
+    mock_ffmpeg_ok.side_effect = _run
+    return mock_ffmpeg_ok
+
+
 def test_watermark_absent_when_watermark_text_is_none(tmp_path, gen, mock_ffmpeg_ok):
     """When watermark_text is None, no drawtext filter appears in the command."""
     cfg = VideoConfig(watermark_text=None)
@@ -512,68 +573,126 @@ def test_watermark_absent_when_watermark_text_is_none(tmp_path, gen, mock_ffmpeg
     assert "drawtext" not in fc
 
 
-def test_watermark_present_when_watermark_text_is_set_single_photo(tmp_path, gen, mock_ffmpeg_ok):
+def test_watermark_present_when_watermark_text_is_set_single_photo(
+    tmp_path, gen, mock_ffmpeg_capture_textfile
+):
     """For N=1 with watermark_text set, drawtext filter is present between [v0] and freeze."""
+    mock_ffmpeg_ok = mock_ffmpeg_capture_textfile
     cfg = VideoConfig(watermark_text="Demo Client", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    # Round 2 fix: Text is now wrapped in SINGLE QUOTES with spaces protected
-    assert "text='Demo Client'" in fc
+    # Issue #86: text reaches drawtext through textfile=, never inline text=
+    assert "text" not in get_drawtext_options(fc)
+    assert mock_ffmpeg_ok.textfile_bytes == b"Demo Client"
     assert "[v0]drawtext=" in fc
     # Map should target [vout] (freeze output), not [vwm] directly
     assert cmd[cmd.index("-map") + 1] == "[vout]"
 
 
-def test_watermark_present_when_watermark_text_is_set_multi_photo(tmp_path, gen, mock_ffmpeg_ok):
+def test_watermark_present_when_watermark_text_is_set_multi_photo(
+    tmp_path, gen, mock_ffmpeg_capture_textfile
+):
     """For N=2 with watermark_text set, drawtext filter is present after xfade."""
+    mock_ffmpeg_ok = mock_ffmpeg_capture_textfile
     cfg = VideoConfig(watermark_text="Construction Co", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 2), cfg, tmp_path / "out.mp4")
     cmd = get_cmd(mock_ffmpeg_ok)
     fc = get_filter_complex(cmd)
     assert "drawtext" in fc
-    # Round 2 fix: Text is now wrapped in SINGLE QUOTES with spaces protected
-    assert "text='Construction Co'" in fc
+    # Issue #86: text reaches drawtext through textfile=, never inline text=
+    assert "text" not in get_drawtext_options(fc)
+    assert mock_ffmpeg_ok.textfile_bytes == b"Construction Co"
     assert "[xout]drawtext=" in fc
     # Map should target [vout] (freeze output), not [vwm] directly
     assert cmd[cmd.index("-map") + 1] == "[vout]"
 
 
-def test_watermark_escapes_special_characters(tmp_path, gen, mock_ffmpeg_ok):
-    """Watermark text with drawtext metacharacters is escaped correctly (ROUNDS 2 & 3 FIX)."""
-    # Test string contains: colon, single quote, backslash, percent, spaces
-    # This is the exact string that failed in rounds 1 and 2 of reviewer reports
-    cfg = VideoConfig(watermark_text="Foo's Bar: 100% \\Cool\\", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+@pytest.mark.parametrize("text", [
+    "Foo's Bar: 100% \\Cool\\",
+    "100%",
+    "50%% off",
+    "Open %{pts} now",
+    "Hours: 9:00-5:00",
+    "Joe's",
+    "C:\\path\\",
+    "  leading and trailing spaces  ",
+    "[a],b;c",
+    "Café Ünïcode",
+])
+def test_watermark_text_written_verbatim_to_textfile(tmp_path, gen, mock_ffmpeg_capture_textfile, text):
+    """The textfile drawtext reads holds exactly the configured text — nothing escaped or dropped (issue #86)."""
+    cfg = VideoConfig(watermark_text=text, watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
-    cmd = get_cmd(mock_ffmpeg_ok)
-    fc = get_filter_complex(cmd)
-    # Expected escaping (wrapped in single quotes with TWO-LAYER aware escaping):
-    # Value wrapped in quotes: text='...'
-    # Inside quotes: \ → \\, : → \:, ' → '\''
-    # Spaces and % are protected by quotes (no escaping needed)
-    # "Foo's Bar: 100% \Cool\" → text='Foo'\''s Bar\: 100% \\Cool\\'
-    # Check each component separately for clarity
-    assert "text='Foo" in fc  # Opening quote
-    assert "\\''" in fc  # Escaped apostrophe (close quote, escaped quote, reopen)
-    assert "s Bar\\:" in fc  # Colon escaped even inside quotes
-    assert "100% " in fc  # Percent and space protected by quotes
-    assert "\\\\Cool\\\\" in fc  # Backslashes doubled
-    # ROUND 3/4: expansion=none disables %{...} expansion in drawtext
-    assert "expansion=none" in fc
+    assert mock_ffmpeg_capture_textfile.textfile_bytes == text.encode("utf-8")
 
 
 def test_watermark_includes_expansion_none(tmp_path, gen, mock_ffmpeg_ok):
-    """expansion=none is present to disable %{...} expansion (ROUND 3/4 FIX)."""
-    cfg = VideoConfig(watermark_text="100%", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    """drawtext gets expansion=none as its own option, so %{...} and \\ in the text stay literal."""
+    cfg = VideoConfig(watermark_text="Foo's Bar: 100%", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
-    cmd = get_cmd(mock_ffmpeg_ok)
-    fc = get_filter_complex(cmd)
-    # Must include expansion=none (NOT text_expansion) to prevent drawtext
-    # from interpreting % as the start of a %{...} metadata expansion sequence
-    assert "expansion=none" in fc
-    # The literal % character should be present in the text value
-    assert "100%" in fc
+    options = get_drawtext_options(get_filter_complex(get_cmd(mock_ffmpeg_ok)))
+    # Parsed as a separate option (on main an apostrophe in text= swallowed it — issue #86)
+    assert options["expansion"] == "none"
+
+
+def test_watermark_textfile_removed_after_success(tmp_path, gen, mock_ffmpeg_capture_textfile):
+    """The temporary watermark textfile and its directory are deleted once generate() returns."""
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    textfile = mock_ffmpeg_capture_textfile.textfile_path
+    assert textfile is not None
+    assert not textfile.exists()
+    assert not textfile.parent.exists()
+
+
+def test_watermark_textfile_removed_after_ffmpeg_failure(tmp_path, gen, mock_ffmpeg_ok):
+    """The temporary watermark textfile is deleted even when FFmpeg exits non-zero."""
+    seen = {}
+
+    def _fail(cmd, **kwargs):
+        seen["path"] = Path(get_drawtext_options(get_filter_complex(cmd))["textfile"])
+        assert seen["path"].is_file()
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+
+    mock_ffmpeg_ok.side_effect = _fail
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    with pytest.raises(VideoGenerationError):
+        gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    assert not seen["path"].parent.exists()
+
+
+def test_watermark_textfile_removed_after_timeout(tmp_path, gen, mock_ffmpeg_ok):
+    """The temporary watermark textfile is deleted when FFmpeg times out."""
+    seen = {}
+
+    def _timeout(cmd, **kwargs):
+        seen["path"] = Path(get_drawtext_options(get_filter_complex(cmd))["textfile"])
+        raise subprocess.TimeoutExpired(cmd, 600)
+
+    mock_ffmpeg_ok.side_effect = _timeout
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    with pytest.raises(VideoGenerationError, match="timed out"):
+        gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
+    assert not seen["path"].parent.exists()
+
+
+def test_watermark_textfile_not_under_output_or_photo_dirs(tmp_path, gen, mock_ffmpeg_capture_textfile):
+    """The watermark textfile lives in the system temp dir, not next to client output or photos."""
+    out_dir = tmp_path / "client_out"
+    out_dir.mkdir()
+    cfg = VideoConfig(watermark_text="Demo", watermark_font_path="/System/Library/Fonts/Helvetica.ttc")
+    gen.generate(make_photos(tmp_path, 1), cfg, out_dir / "out.mp4")
+    textfile = mock_ffmpeg_capture_textfile.textfile_path
+    assert tmp_path not in textfile.parents
+
+
+def test_escape_filtergraph_path_matches_ffmpeg_docs_example():
+    """Two-level escaping reproduces the worked example in ffmpeg-filters(1) "Notes on filtergraph escaping"."""
+    raw = "this is a 'string': may contain one, or more, special characters"
+    expected = r"this is a \\\'string\\\'\\: may contain one\, or more\, special characters"
+    assert _escape_filtergraph_path(raw) == expected
 
 
 def test_watermark_skipped_when_font_file_missing(tmp_path, gen, mock_ffmpeg_ok, caplog):
@@ -638,21 +757,15 @@ def test_watermark_skipped_when_font_path_is_directory(tmp_path, gen, mock_ffmpe
     assert "skipping watermark" in caplog.text
 
 
-def test_watermark_escapes_font_path_with_colon_and_space(tmp_path, gen, mock_ffmpeg_ok):
-    """Font path containing : and space is escaped correctly (ROUND 2 FIX)."""
-    # Create a font file with problematic characters in the path
-    font_dir = tmp_path / "fonts with: colons"
+def test_watermark_escapes_font_path_with_special_characters(tmp_path, gen, mock_ffmpeg_ok):
+    """A font path with filtergraph-special characters parses back to the exact path (issue #86)."""
+    font_dir = tmp_path / "fonts with: colons, 'quotes' [x];y \\z"
     font_dir.mkdir()
     font_file = font_dir / "Test Font.ttc"
     font_file.write_bytes(b"fake-font")  # Create a fake font file
 
     cfg = VideoConfig(watermark_text="Demo", watermark_font_path=str(font_file))
     gen.generate(make_photos(tmp_path, 1), cfg, tmp_path / "out.mp4")
-    cmd = get_cmd(mock_ffmpeg_ok)
-    fc = get_filter_complex(cmd)
-    assert "drawtext" in fc
-    # Font path wrapped in single quotes with colon escaped (spaces protected by quotes)
-    assert "fontfile='" in fc  # value is quoted
-    assert "\\:" in fc  # colon is escaped even inside quotes (empirically required)
-    # Spaces are protected by quotes, NOT escaped to \
-    assert "with: colons" in fc or "with\\: colons" in fc  # path contains the dir name
+    options = get_drawtext_options(get_filter_complex(get_cmd(mock_ffmpeg_ok)))
+    assert options["fontfile"] == str(font_file)
+    assert options["expansion"] == "none"
