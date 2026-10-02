@@ -46,14 +46,14 @@ Example: for a new photo agent spec in the demo client →
 **Platform Feature 002 — Photo-Agent Migration: IMPLEMENTATION COMPLETE (T001–T048).**
 Tasks: [`platform/.specify/002-photo-agent/tasks.md`](platform/.specify/002-photo-agent/tasks.md)
 Branch: `001-platform-photo-agent`
-Status: 368 tests passing. `clients/_construction_co` scaffolded (credentials pending). Remaining: T040–T042 (live two-client isolation run), T050 (adversarial review).
+Status: `clients/_construction_co` scaffolded (credentials pending). Remaining: T040–T042 (live two-client isolation run), T050 (adversarial review). Test counts on `main` as of 2026-10-02: `platform/photo-agent` 1660 passed / 2 skipped, `platform/email-agent` 84 passed (run each package's `tests/` separately — a bare `pytest` from the repo root errors collecting `platform/photo-agent/scripts/run_e2e_test.py`).
 
 Permanent clients:
 - `_demo` — full pipeline (video → Telegram approval → Facebook)
 - `_construction_co` — scoped pipeline (video → Telegram approval only, no Facebook)
 
-**_demo Feature 005 — Instagram Video Upload: IMPLEMENTATION COMPLETE, READY FOR HUMAN MERGE (T000–T021).**
-Spec/tasks: [`clients/_demo/.specify/005-instagram-video-upload/`](clients/_demo/.specify/005-instagram-video-upload/) (on branch `002-instagram-video-upload`, not yet merged to `main`)
-**PR**: https://github.com/sandeepkesarkar/fieldkit/pull/72 (open)
-Status: Implemented by claude_code, cross-reviewed by codex (different vendor) across 3 rounds — 3 blocking findings (cross-platform file-deletion race, Drive share-link revocation-failure-swallowed, invalid Instagram permalink) all fixed and re-verified; final verdict PASS. 936 tests collected / 917 passing on the branch vs. 580/561 on `main`, zero regressions. Orchestration record: `.polly/registry.json`. Started ahead of the original "next after Platform 002 adversarial review passes" ordering, per explicit human decision on 2026-08-31; Platform 002 closeout (T040–T042 live two-client isolation run, T050 adversarial review) remains outstanding and untouched by this feature. Human action needed: review and merge PR #72.
+**_demo Feature 005 — Instagram Video Upload: MERGED to `main` (T000–T021).**
+Spec/tasks: [`clients/_demo/.specify/005-instagram-video-upload/`](clients/_demo/.specify/005-instagram-video-upload/)
+**PR**: https://github.com/sandeepkesarkar/fieldkit/pull/72 (merged 2026-09-25)
+Status: Implemented by claude_code, cross-reviewed by codex (different vendor); all blocking findings fixed before merge. Orchestration record: `.polly/registry.json`. Post-merge hardening landed via #85/#87/#90/#92/#94 (Facebook sessioned upload #78, Instagram quarantine resolution #88, watermark escaping #86, installer fixes #81/#89). Open follow-up: PR #95 (Instagram share-link cleanup drained from both cron workers, #80). Platform 002 closeout (T040–T042, T050) remains outstanding.
 <!-- SPECKIT END -->
